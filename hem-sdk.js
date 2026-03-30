@@ -142,35 +142,116 @@ export class HEM {
     const headers = { 'Content-Type': 'application/json' };
     if (token) headers['Authorization'] = 'Bearer ' + token;
 
-    const opts = { method, headers };
-    if (body !== null) opts.body = JSON.stringify(body);
+    const bodyStr = body !== null ? JSON.stringify(body) : null;
 
-    if (this.#debug) console.debug('[HEM] ->', method, url, body ?? '');
-
-    let res;
-    try {
-      res = await fetch(url, opts);
-    } catch (e) {
-      throw new HemError(`Network error: ${e.message}`, { code: 'network' });
+    if (this.#debug) {
+      console.debug('[HEM] ->', method, url);
+      console.debug('[HEM] req headers:', JSON.stringify(headers));
+      console.debug('[HEM] req body:', bodyStr ?? '(none)');
     }
 
-    let data;
-    const ct = res.headers.get('content-type') ?? '';
-    if (ct.includes('json')) {
-      try { data = await res.json(); } catch { data = null; }
+    // In Node.js, undici (built-in fetch) uses chunked transfer encoding by
+    // default, which some embedded devices reject with HTTP 411.
+    // Detect Node.js and use https.request directly to set Content-Length.
+    const isNode = typeof process !== 'undefined' && process.versions?.node;
+
+    let status, resHeaders, data;
+
+    if (isNode && bodyStr !== null) {
+      ({ status, headers: resHeaders, data } = await this.#reqNode(method, url, headers, bodyStr));
     } else {
-      data = await res.text();
+      const opts = { method, headers };
+      if (bodyStr !== null) opts.body = bodyStr;
+
+      let res;
+      try {
+        res = await fetch(url, opts);
+      } catch (e) {
+        throw new HemError(`Network error: ${e.message}`, { code: 'network' });
+      }
+
+      status = res.status;
+      resHeaders = Object.fromEntries(res.headers.entries());
+      const ct = res.headers.get('content-type') ?? '';
+      if (ct.includes('json')) {
+        try { data = await res.json(); } catch { data = null; }
+      } else {
+        data = await res.text();
+      }
     }
 
-    if (this.#debug) console.debug('[HEM] <-', res.status, data);
+    if (this.#debug) {
+      console.debug('[HEM] <- status:', status);
+      console.debug('[HEM] res headers:', JSON.stringify(resHeaders));
+      console.debug('[HEM] res body:', JSON.stringify(data));
+    }
 
-    if (!res.ok) {
+    if (status < 200 || status >= 300) {
       throw new HemError(
-        `HEM ${method} ${url} -> HTTP ${res.status}`,
-        { code: `http_${res.status}`, status: res.status, data }
+        `HEM ${method} ${url} -> HTTP ${status}`,
+        { code: `http_${status}`, status, data }
       );
     }
     return data;
+  }
+
+  // Node.js-specific HTTP request using https.request (sets Content-Length explicitly)
+  async #reqNode(method, url, headers, bodyStr) {
+    const { default: https } = await import('node:https');
+    const { default: http } = await import('node:http');
+    const { URL: NodeURL } = await import('node:url');
+
+    const parsed = new NodeURL(url);
+    const reqHeaders = {
+      ...headers,
+      'Content-Length': Buffer.byteLength(bodyStr, 'utf8').toString(),
+    };
+
+    if (this.#debug) {
+      console.debug('[HEM] reqNode headers sent:', JSON.stringify(reqHeaders));
+    }
+
+    return new Promise((resolve, reject) => {
+      const lib = parsed.protocol === 'https:' ? https : http;
+      const req = lib.request({
+        method,
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        headers: reqHeaders,
+        agent: false,   // fresh TLS connection per request (HSM doesn't pool)
+        timeout: 15000,
+      }, (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', chunk => {
+          if (this.#debug) console.debug('[HEM] res chunk:', chunk);
+          raw += chunk;
+        });
+        res.on('end', () => {
+          if (this.#debug) console.debug('[HEM] res status:', res.statusCode, 'raw:', raw);
+          const resHeaders = res.headers;
+          let data;
+          const ct = res.headers['content-type'] ?? '';
+          if (ct.includes('json')) {
+            try { data = JSON.parse(raw); } catch { data = raw; }
+          } else {
+            data = raw;
+          }
+          resolve({ status: res.statusCode, headers: resHeaders, data });
+        });
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new HemError('Request timeout', { code: 'timeout' }));
+      });
+      req.on('error', e => {
+        if (this.#debug) console.debug('[HEM] req error:', e.message);
+        reject(new HemError(`Network error: ${e.message}`, { code: 'network' }));
+      });
+      req.write(bodyStr, 'utf8');
+      req.end();
+    });
   }
 
   // -- eJWT generation (PBKDF2 + X25519 ECDH + HMAC-SHA256) -------------------
@@ -413,7 +494,9 @@ export class HEM {
    * @returns {Promise<{kid: string}>}
    */
   async createKeyPair(token, label, type, descr) { // label max 32 chars, descr base64-encoded (max 64 chars)
-    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/create`, { label, type, descr }, token);
+    const MODE = { ED25519: 'ExDSA', CURVE25519: 'ECDH' };
+    const mode = MODE[type] ?? type;
+    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/create`, { mode, type, label, descr }, token);
   }
 
   /**
@@ -479,6 +562,49 @@ export class HEM {
   }
 
   /**
+   * Sign arbitrary binary data with an EdDSA key stored in the HSM.
+   * Like exdsaSign but accepts Uint8Array directly (no UTF-8 conversion).
+   * Use this for cryptographic protocols (OpenPGP, TLS, etc.) that sign raw bytes.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex)
+   * @param {Uint8Array} data   Raw bytes to sign
+   * @param {string}     [alg='Ed25519']
+   * @param {string|null} [ctx=null]
+   * @returns {Promise<Uint8Array>}  Raw 64-byte Ed25519 signature (R || S)
+   */
+  async exdsaSignBytes(token, kid, data, alg = 'Ed25519', ctx = null) {
+    const body = { kid, alg, msg: toB64(data) };
+    if (ctx !== null) body.ctx = ctx;
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/sign`, body, token);
+    if (!ret.sign) throw new HemError('No sign in exdsa/sign response', { code: 'sign_error' });
+    return fromB64(ret.sign);
+  }
+
+  /**
+   * Perform a Curve25519 ECDH operation on the HSM.
+   * The private key never leaves the device — only the 32-byte shared secret is returned.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string} token             Bearer JWT
+   * @param {string} kid               Key ID (32-char hex) of the X25519 private key in HSM
+   * @param {string} peerPubKeyBase64  Peer's raw 32-byte X25519 public key in standard base64
+   * @returns {Promise<Uint8Array>}    Raw 32-byte shared secret
+   */
+  async ecdh(token, kid, peerPubKeyBase64) {
+    const ret = await this.#req(
+      'POST', `${this.#baseUrl}/api/crypto/ecdh`,
+      { kid, pubkey: peerPubKeyBase64 },
+      token
+    );
+    if (!ret.ecdh) throw new HemError('No ecdh in response', { code: 'ecdh_error' });
+    return fromB64(ret.ecdh);
+  }
+
+  /**
    * Search keys in the HSM repository by pattern.
    * Returns the same shape as listKeys.
    *
@@ -491,10 +617,11 @@ export class HEM {
    * @returns {Promise<Array<{kid:string, label:string, type:string, description:Uint8Array|null}>>}
    */
   async searchKeys(token, descr, _offset = 0, _limit = 50) { // TODO: pass _offset/_limit in path once HSM API is fixed
+    const descrB64 = '^' + btoa(unescape(encodeURIComponent(descr)));
     const data = await this.#req(
       // TODO: restore /${offset}/${limit} path params once HSM API is fixed
       'POST', `${this.#baseUrl}/api/keymgmt/search`,
-      { descr }, token
+      { descr: descrB64 }, token
     );
     return (data.list ?? []).map(entry => ({
       kid: entry.kid,
