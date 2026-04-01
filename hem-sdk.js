@@ -500,6 +500,24 @@ export class HEM {
   }
 
   /**
+   * Import an external public key into the HSM repository.
+   *
+   * Required scope: 'keymgmt:imp'
+   *
+   * @param {string}      token       Bearer JWT (must have keymgmt:imp scope)
+   * @param {string}      label       Key label (max 32 chars)
+   * @param {string}      type        Key type, e.g. 'ED25519', 'CURVE25519'
+   * @param {Uint8Array}  pubKeyBytes Raw public key bytes (32 bytes for Ed25519/X25519)
+   * @param {string|null} [descr]     Optional base64-encoded description (128-byte field)
+   * @returns {Promise<{kid: string}>}
+   */
+  async importPublicKey(token, label, type, pubKeyBytes, descr = null) {
+    const body = { type, label, pubkey: toB64(pubKeyBytes) };
+    if (descr !== null) body.descr = descr;
+    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/import`, body, token);
+  }
+
+  /**
    * Get public key metadata (type, pubkey) for a given KID.
    *
    * Required scope: 'keymgmt:use:<KID>'
@@ -581,6 +599,25 @@ export class HEM {
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/sign`, body, token);
     if (!ret.sign) throw new HemError('No sign in exdsa/sign response', { code: 'sign_error' });
     return fromB64(ret.sign);
+  }
+
+  /**
+   * Verify an EdDSA/ECDSA signature on the HSM using an imported public key.
+   * Returns true if valid; throws HemError (code 'verify_failed') if signature is invalid (HTTP 406).
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex) of the public key in HSM
+   * @param {Uint8Array} data   Raw bytes that were signed
+   * @param {Uint8Array} sig    Raw signature bytes (64 bytes for Ed25519)
+   * @param {string}     [alg='Ed25519']
+   * @returns {Promise<true>}   Resolves to true on success, throws on invalid signature
+   */
+  async exdsaVerify(token, kid, data, sig, alg = 'Ed25519') {
+    await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/verify`,
+      { kid, alg, msg: toB64(data), sign: toB64(sig) }, token);
+    return true;
   }
 
   /**
