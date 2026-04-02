@@ -668,6 +668,19 @@ class HEM {
     }));
   }
 
+  /**
+   * Delete a key from the HSM.
+   *
+   * Required scope: 'keymgmt:del'
+   *
+   * @param {string} token  Bearer JWT (must have keymgmt:del scope)
+   * @param {string} kid    Key ID to delete (32 hex chars)
+   * @returns {Promise<void>}
+   */
+  async deleteKey(token, kid) {
+    await this.#req('DELETE', `${this.#baseUrl}/api/keymgmt/delete/${kid}`, null, token);
+  }
+
 }
 
 export { HEM, HemError };
