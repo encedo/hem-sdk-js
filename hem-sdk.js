@@ -98,6 +98,7 @@ export class HEM {
   #broker;
   #debug;
   #tokenCache = [];
+  #derivedKeys = null;   // { privKey: CryptoKey (non-extractable), pubkeyB64: string }
 
   /**
    * @param {string} hsmUrl   Base URL of the Encedo HEM device (e.g. 'https://abc.ence.do')
@@ -109,6 +110,19 @@ export class HEM {
     this.#baseUrl = hsmUrl.replace(/\/+$/, '');
     this.#broker = broker.replace(/\/+$/, '');
     this.#debug = debug;
+  }
+
+  // -- Key Cache ---------------------------------------------------------------
+
+  /**
+   * Discard cached derived keys (e.g. on logout).
+   * Expired JWT tokens are also purged.
+   * The CryptoKey object will be garbage-collected; there is no explicit destroy
+   * in Web Crypto API — non-extractable keys cannot be read back from memory by JS.
+   */
+  clearKeys() {
+    this.#derivedKeys = null;
+    this.#tokenCache = [];
   }
 
   // -- Token Cache -------------------------------------------------------------
@@ -262,16 +276,21 @@ export class HEM {
    */
   async #deriveX25519(password, salt) {
     // PBKDF2 -> 32-byte seed
+    // Convert password to bytes first so we can zero it immediately after importKey
+    const passBytes = strToBytes(password);
     const passKey = await crypto.subtle.importKey(
-      'raw', strToBytes(password), 'PBKDF2', false, ['deriveBits']
+      'raw', passBytes, 'PBKDF2', false, ['deriveBits']
     );
+    passBytes.fill(0);   // zero UTF-8 bytes of password; CryptoKey holds no reference to them
+
     const seedBytes = new Uint8Array(await crypto.subtle.deriveBits(
       { name: 'PBKDF2', salt: strToBytes(salt), iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
       passKey, 256
     ));
 
-    // Import seed as X25519 private key via PKCS8 wrapper
+    // Import seed as X25519 private key (non-extractable), then zero the raw seed
     const privKey = await x25519PrivKey(seedBytes);
+    seedBytes.fill(0);   // seed no longer needed; privKey is non-extractable CryptoKey
 
     // Derive public key: X25519(seed, basePoint=9) -- no JWK export needed
     const pubKeyBytes = await x25519(privKey, X25519_BASE_POINT);
@@ -323,12 +342,20 @@ export class HEM {
     const cached = this.#cacheFind(scope);
     if (cached) return cached;
 
-    // Phase 1 -- get challenge
+    // Phase 1 -- get challenge (always needed for fresh jti + spk)
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
-    // { eid: string (salt), spk: base64 (device X25519 pubkey), jti: string }
+    // { eid: string (stable salt), spk: base64 (device X25519 pubkey), jti: string (nonce) }
 
-    // Derive X25519 key from password (PBKDF2, salt = challenge.eid)
-    const { privKey, pubkeyB64 } = await this.#deriveX25519(password, challenge.eid);
+    // Derive X25519 keys from password and cache them, or reuse cached keys
+    if (password) {
+      this.#derivedKeys = await this.#deriveX25519(password, challenge.eid);
+      // Note: JS strings are immutable — the password primitive cannot be zeroed here.
+      // The caller should not hold a long-lived reference to it.
+    }
+    if (!this.#derivedKeys) {
+      throw new HemError('Password required (no cached keys)', { code: 'auth_password_required' });
+    }
+    const { privKey, pubkeyB64 } = this.#derivedKeys;
 
     // Build JWT payload
     const iat = Math.floor(Date.now() / 1000) - 5;   // -5s for clock drift
