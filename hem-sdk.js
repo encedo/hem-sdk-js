@@ -665,7 +665,9 @@ export class HEM {
       token
     );
     if (!ret.ecdh) throw new HemError('No ecdh in response', { code: 'ecdh_error' });
-    return fromB64(ret.ecdh);
+    const result = fromB64(ret.ecdh);
+    if (result.length !== 32) throw new HemError(`ECDH result length invalid: expected 32, got ${result.length}`, { code: 'ecdh_error' });
+    return result;
   }
 
   /**
@@ -681,7 +683,7 @@ export class HEM {
    * @returns {Promise<Array<{kid:string, label:string, type:string, description:Uint8Array|null}>>}
    */
   async searchKeys(token, descr, _offset = 0, _limit = 50) { // TODO: pass _offset/_limit in path once HSM API is fixed
-    const descrB64 = '^' + btoa(unescape(encodeURIComponent(descr)));
+    const descrB64 = '^' + toB64(new TextEncoder().encode(descr));
     const data = await this.#req(
       // TODO: restore /${offset}/${limit} path params once HSM API is fixed
       'POST', `${this.#baseUrl}/api/keymgmt/search`,
