@@ -31,6 +31,9 @@ export declare class HEM {
   /** Provision a factory-fresh device. masterkey/userkey are derived automatically. */
   initialize(adminPassword: string, userPassword: string, cfg?: Record<string, unknown>): Promise<unknown>;
 
+  /** Get broker MAC data to list the device's paired external authenticators. */
+  getExtAuthMac(token: string): Promise<{ nonce: string; mac: string; eid: string }>;
+
   /** Pair a mobile external authenticator. token needs the 'system:config' scope. */
   registerExtAuth(token: string, opts?: {
     /**
@@ -75,7 +78,6 @@ export declare class HEM {
   getStatus(): Promise<Record<string, unknown>>;
   getConfig(token: string): Promise<Record<string, unknown>>;
   setConfig(token: string, cfg: Record<string, unknown>): Promise<{ updated: boolean }>;
-  getProvisioning(token: string): Promise<Record<string, unknown>>;
   reboot(token: string): Promise<unknown>;
   shutdown(token: string): Promise<unknown>;
   selftest(token: string): Promise<unknown>;

@@ -101,6 +101,16 @@ await hem.registerExtAuth(token, {
 });
 ```
 
+### List paired authenticators
+
+`getExtAuthMac` returns the MAC data used to query the notification broker for
+the list of external authenticators paired with the device.
+
+```js
+const token = await hem.authorizePassword('my-password', 'system:config');
+const { nonce, mac, eid } = await hem.getExtAuthMac(token);
+```
+
 ---
 
 ## 3. Key management
@@ -228,7 +238,6 @@ const status  = await hem.getStatus();
 const token = await hem.authorizePassword('my-password', 'system:config');
 const config = await hem.getConfig(token);
 await hem.setConfig(token, { user: 'New Name' });          // { updated: true }
-const provisioning = await hem.getProvisioning(token);
 
 // Device attestation — any valid token is accepted
 const attestation = await hem.getAttestation(token);       // { genuine, ... }

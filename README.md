@@ -50,10 +50,10 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | Group | Operations |
 |-------|------------|
 | **Checkin** | `hemCheckin` — connection test + clock sync (call once, first) |
-| **Authentication** | `authorizePassword`, `authorizeRemote` (mobile push), `initialize` (device provisioning), `registerExtAuth` (pair a mobile authenticator) |
+| **Authentication** | `authorizePassword`, `authorizeRemote` (mobile push), `initialize` (device provisioning), `registerExtAuth` (pair a mobile authenticator), `getExtAuthMac` (list paired authenticators) |
 | **Key management** | `listKeys`, `searchKeys`, `getPubKey`, `createKeyPair`, `deriveKey`, `importPublicKey`, `updateKey`, `deleteKey` |
 | **Cryptography** | `exdsaSign(Bytes)`/`exdsaVerify` (EdDSA/ECDSA), `ecdh`, `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt`, `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum) |
-| **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `getProvisioning`, `getAttestation`, `reboot`, `shutdown`, `selftest` |
+| **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `getAttestation`, `reboot`, `shutdown`, `selftest` |
 | **Upgrade** | `usbMode`, `uploadFirmware`/`checkFirmware`/`installFirmware`, `uploadUi`/`checkUi`/`installUi` |
 | **Storage** | `lockStorage`, `unlockStorage` |
 | **Audit log** | `getLoggerKey`, `listLog`, `getLogEntry` |

@@ -680,6 +680,29 @@ class HEM {
     return this.#req('POST', `${this.#broker}/notify/register/finalise/${rid}`, confirmation);
   }
 
+  /**
+   * Obtain MAC data that authenticates this device to the notification broker.
+   * The returned MAC is used to query the broker for the list of external
+   * authenticators currently paired with the device.
+   *
+   * Fetches the device `eid`, opens a broker session for an ephemeral key, then
+   * calls POST /api/auth/ext/mac — same broker handshake as registerExtAuth().
+   *
+   * Required scope: 'system:config' (or 'auth:ext:pair')
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<{nonce: string, mac: string, eid: string}>}
+   */
+  async getExtAuthMac(token) {
+    const config = await this.#req('GET', `${this.#baseUrl}/api/system/config`, null, token);
+    if (!config.eid) throw new HemError('No eid in device config', { code: 'ext_register_error' });
+
+    const session = await this.#req('POST', `${this.#broker}/notify/session`, { eid: config.eid });
+    if (!session.epk) throw new HemError('No epk from broker', { code: 'broker_error' });
+
+    return this.#req('POST', `${this.#baseUrl}/api/auth/ext/mac`, { epk: session.epk }, token);
+  }
+
   // -- Key Management ----------------------------------------------------------
 
   /**
@@ -1146,18 +1169,6 @@ class HEM {
    */
   async setConfig(token, cfg) {
     return this.#req('POST', `${this.#baseUrl}/api/system/config`, cfg, token);
-  }
-
-  /**
-   * Fetch device provisioning data (e.g. the CSR generated during initialization).
-   *
-   * Required scope: 'system:config'
-   *
-   * @param {string} token  Bearer JWT
-   * @returns {Promise<object>}
-   */
-  async getProvisioning(token) {
-    return this.#req('GET', `${this.#baseUrl}/api/system/config/provisioning`, null, token);
   }
 
   /**
