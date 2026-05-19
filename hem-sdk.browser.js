@@ -152,16 +152,28 @@ class HEM {
 
   // -- HTTP --------------------------------------------------------------------
 
-  async #req(method, url, body = null, token = null) {
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = 'Bearer ' + token;
+  async #req(method, url, body = null, token = null, opts = {}) {
+    const { binary = false, filename = null } = opts;
 
-    const bodyStr = body !== null ? JSON.stringify(body) : null;
+    // Binary uploads (firmware / UI images) go out as application/octet-stream
+    // carrying the raw bytes; every other request is JSON.
+    let headers, payload;
+    if (binary) {
+      headers = { 'Content-Type': 'application/octet-stream' };
+      if (filename) headers['Content-Disposition'] = `attachment; filename="${filename}"`;
+      payload = body;                                    // Uint8Array — sent as-is
+    } else {
+      headers = { 'Content-Type': 'application/json' };
+      payload = body !== null ? JSON.stringify(body) : null;
+    }
+    if (token) headers['Authorization'] = 'Bearer ' + token;
 
     if (this.#debug) {
       console.debug('[HEM] ->', method, url);
       console.debug('[HEM] req headers:', JSON.stringify(headers));
-      console.debug('[HEM] req body:', bodyStr ?? '(none)');
+      console.debug('[HEM] req body:', binary
+        ? `(binary, ${payload?.length ?? 0} bytes)`
+        : (payload ?? '(none)'));
     }
 
     // In Node.js, undici (built-in fetch) uses chunked transfer encoding by
@@ -171,15 +183,15 @@ class HEM {
 
     let status, resHeaders, data;
 
-    if (isNode && bodyStr !== null) {
-      ({ status, headers: resHeaders, data } = await this.#reqNode(method, url, headers, bodyStr));
+    if (isNode && payload !== null) {
+      ({ status, headers: resHeaders, data } = await this.#reqNode(method, url, headers, payload));
     } else {
-      const opts = { method, headers };
-      if (bodyStr !== null) opts.body = bodyStr;
+      const fetchOpts = { method, headers };
+      if (payload !== null) fetchOpts.body = payload;
 
       let res;
       try {
-        res = await fetch(url, opts);
+        res = await fetch(url, fetchOpts);
       } catch (e) {
         throw new HemError(`Network error: ${e.message}`, { code: 'network' });
       }
@@ -210,15 +222,17 @@ class HEM {
   }
 
   // Node.js-specific HTTP request using https.request (sets Content-Length explicitly)
-  async #reqNode(method, url, headers, bodyStr) {
+  async #reqNode(method, url, headers, body) {
     const { default: https } = await import('node:https');
     const { default: http } = await import('node:http');
     const { URL: NodeURL } = await import('node:url');
 
     const parsed = new NodeURL(url);
+    // body is a JSON string or a Uint8Array (binary upload) — normalise to Buffer
+    const payloadBuf = typeof body === 'string' ? Buffer.from(body, 'utf8') : Buffer.from(body);
     const reqHeaders = {
       ...headers,
-      'Content-Length': Buffer.byteLength(bodyStr, 'utf8').toString(),
+      'Content-Length': payloadBuf.length.toString(),
     };
 
     if (this.#debug) {
@@ -263,7 +277,7 @@ class HEM {
         if (this.#debug) console.debug('[HEM] req error:', e.message);
         reject(new HemError(`Network error: ${e.message}`, { code: 'network' }));
       });
-      req.write(bodyStr, 'utf8');
+      req.write(payloadBuf);
       req.end();
     });
   }
@@ -507,6 +521,165 @@ class HEM {
     return resp.token;
   }
 
+  // -- Initialization (TOE provisioning) ---------------------------------------
+
+  /**
+   * Initialize (provision) a factory-fresh HEM device.
+   *
+   * Two-step flow, mirrors PHP T-2:
+   *   1. GET  /api/auth/init  -> challenge { eid, spk, jti, exp }
+   *   2. POST /api/auth/init  { init: eJWT } -> result
+   *
+   * The eJWT carries a `cfg` block and is signed with the ADMIN key.
+   * Both the admin and user X25519 key pairs are derived from their
+   * passwords (PBKDF2, salt = challenge.eid); their public keys are written
+   * into `cfg` as `masterkey` / `userkey` automatically.
+   *
+   * @param {string} adminPassword  Master/admin passphrase
+   * @param {string} userPassword   Local user passphrase
+   * @param {object} [cfg]          Device config: { user, email, hostname,
+   *                                trusted_ts, trusted_backend, allow_keysearch,
+   *                                gen_csr, origin, ... }. masterkey/userkey are
+   *                                filled in automatically and override any value
+   *                                passed here.
+   * @returns {Promise<object>}     Initialization result from the device
+   */
+  async initialize(adminPassword, userPassword, cfg = {}) {
+    // Phase 1 -- challenge
+    const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/init`);
+    // { eid: string (salt), spk: base64 (device X25519 pubkey), jti, exp }
+
+    // Derive both key pairs (PBKDF2 salt = challenge.eid)
+    const admin = await this.#deriveX25519(adminPassword, challenge.eid);
+    const user  = await this.#deriveX25519(userPassword,  challenge.eid);
+
+    const payload = {
+      jti: challenge.jti,
+      aud: challenge.spk,
+      exp: challenge.exp,
+      iat: Math.floor(Date.now() / 1000),
+      iss: admin.pubkeyB64,
+      cfg: {
+        ...cfg,
+        masterkey: admin.pubkeyB64,
+        userkey: user.pubkeyB64,
+      },
+    };
+
+    // eJWT signed with the ADMIN key
+    const ejwt = await this.#buildEjwt(admin.privKey, challenge.spk, payload);
+    return this.#req('POST', `${this.#baseUrl}/api/auth/init`, { init: ejwt });
+  }
+
+  // -- External Authenticator: Registration ------------------------------------
+
+  /**
+   * Register (pair) a new external authenticator (mobile app) with the device.
+   *
+   * Full flow, mirrors PHP T-5:
+   *   1. GET  /api/system/config              -> { eid, user, email, hostname }
+   *   2. POST {broker}/notify/session         -> { epk }
+   *   3. POST /api/auth/ext/init { epk }       -> challenge { eid, request }
+   *   4. POST {broker}/notify/register/init    -> { rid, link }
+   *   5. onQrCode(qrText, qrPayload) — caller renders the QR for the mobile app
+   *   6. Poll {broker}/notify/register/check/{rid}  (202 pending, 200 done)
+   *   7. POST /api/auth/ext/validate { pid, reply } -> confirmation
+   *   8. POST {broker}/notify/register/finalise/{rid} -> done
+   *
+   * @param {string} token  Bearer JWT with the 'system:config' scope
+   * @param {object} [opts]
+   * @param {Function} [opts.onQrCode]         Called with (qrText, qrPayload).
+   *   qrText is the exact JSON string to encode into the QR code (scanned by the
+   *   mobile authenticator); qrPayload is the same data as an object.
+   * @param {number}   [opts.pollInterval=5000]  Poll interval in ms
+   * @param {number}   [opts.pollTimeout=60000]  Max wait time in ms
+   * @param {Function} [opts.onPending]        Called each poll while waiting
+   * @param {AbortSignal} [opts.signal]        Cancels the polling loop
+   * @returns {Promise<object>}  Finalisation result from the broker
+   */
+  async registerExtAuth(token, {
+    onQrCode = null,
+    pollInterval = 5_000,
+    pollTimeout = 60_000,
+    onPending = null,
+    signal = null,
+  } = {}) {
+    // Step 1 -- device config (need eid + metadata for the QR)
+    const config = await this.#req('GET', `${this.#baseUrl}/api/system/config`, null, token);
+    if (!config.eid) throw new HemError('No eid in device config', { code: 'ext_register_error' });
+
+    // Step 2 -- broker session EPK
+    const session = await this.#req('POST', `${this.#broker}/notify/session`, { eid: config.eid });
+    const { epk } = session;
+    if (!epk) throw new HemError('No epk from broker', { code: 'broker_error' });
+
+    // Step 3 -- device ext-auth challenge
+    const challenge = await this.#req('POST', `${this.#baseUrl}/api/auth/ext/init`, { epk }, token);
+
+    // Step 4 -- broker registration session -> rid + QR link
+    const reg = await this.#req('POST', `${this.#broker}/notify/register/init`, {
+      epk,
+      eid: challenge.eid,
+      request: challenge.request,
+    });
+    const { rid, link } = reg;
+    if (!rid) throw new HemError('No rid from broker', { code: 'broker_error' });
+
+    // Step 5 -- build the QR payload and hand it to the caller to render.
+    // The payload MUST be byte-identical to the PHP tester: the mobile
+    // authenticator app scans this exact JSON. Key order (link, hash, user,
+    // email, hostname) matches PHP json_encode() of the source array.
+    // The SDK only produces the data; rendering the QR image is out of scope.
+    const qrPayload = {
+      link,
+      hash: 'not_implemented_yet',
+      user: config.user,
+      email: config.email,
+      hostname: config.hostname,
+    };
+    if (onQrCode) onQrCode(JSON.stringify(qrPayload), qrPayload);
+
+    // Step 6 -- poll until the mobile app scans the QR
+    const deadline = Date.now() + pollTimeout;
+    let reply = null;
+
+    while (Date.now() < deadline) {
+      await new Promise((r, rej) => {
+        const t = setTimeout(r, pollInterval);
+        if (signal) {
+          if (signal.aborted) { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')); return; }
+          signal.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')); }, { once: true });
+        }
+      });
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (onPending) onPending();
+
+      let res;
+      try {
+        res = await fetch(`${this.#broker}/notify/register/check/${rid}`, signal ? { signal } : undefined);
+      } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') throw e;
+        throw new HemError(`Broker poll network error: ${e.message}`, { code: 'network' });
+      }
+
+      if (res.status === 202) continue;   // still pending
+      if (!res.ok) throw new HemError(`Broker poll HTTP ${res.status}`, { code: `http_${res.status}`, status: res.status });
+
+      reply = await res.json();
+      break;
+    }
+
+    if (!reply) throw new HemError('Ext authenticator registration timed out', { code: 'timeout' });
+    if (!reply.pid || !reply.reply) throw new HemError('Missing pid/reply from broker', { code: 'broker_error' });
+
+    // Step 7 -- validate the pairing on the device
+    const confirmation = await this.#req('POST', `${this.#baseUrl}/api/auth/ext/validate`,
+      { pid: reply.pid, reply: reply.reply }, token);
+
+    // Step 8 -- finalise the pairing on the broker
+    return this.#req('POST', `${this.#broker}/notify/register/finalise/${rid}`, confirmation);
+  }
+
   // -- Key Management ----------------------------------------------------------
 
   /**
@@ -542,6 +715,42 @@ class HEM {
     const body = { type, label, pubkey: toB64(pubKeyBytes) };
     if (descr !== null) body.descr = descr;
     return this.#req('POST', `${this.#baseUrl}/api/keymgmt/import`, body, token);
+  }
+
+  /**
+   * Derive a new key in the HSM from an existing ECDH key and a peer public key.
+   *
+   * Required scope: 'keymgmt:gen'
+   *
+   * @param {string} token        Bearer JWT
+   * @param {string} label        Human-readable key label (max 32 chars)
+   * @param {string} type         Key type of the derived key, e.g. 'ED25519'
+   * @param {string} descr        Base64-encoded description (128-byte field)
+   * @param {string} kid          KID of the existing ECDH key to derive from
+   * @param {string} peerPubKeyBase64  Peer's raw public key (standard base64)
+   * @returns {Promise<{kid: string}>}
+   */
+  async deriveKey(token, label, type, descr, kid, peerPubKeyBase64) {
+    const MODE = { ED25519: 'ExDSA', CURVE25519: 'ECDH' };
+    const mode = MODE[type] ?? type;
+    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/derive`,
+      { mode, type, label, descr, kid, pubkey: peerPubKeyBase64 }, token);
+  }
+
+  /**
+   * Update a key's metadata (label and description) in the HSM repository.
+   *
+   * Required scope: 'keymgmt:upd'
+   *
+   * @param {string} token  Bearer JWT
+   * @param {string} kid    Key ID to update
+   * @param {string} label  New label (max 32 chars)
+   * @param {string} descr  New base64-encoded description
+   * @returns {Promise<object>}
+   */
+  async updateKey(token, kid, label, descr) {
+    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/update`,
+      { kid, label, descr }, token);
   }
 
   /**
@@ -671,6 +880,187 @@ class HEM {
   }
 
   /**
+   * Compute an HMAC over arbitrary data using a symmetric key in the HSM.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex) of the HMAC key
+   * @param {Uint8Array} data   Raw bytes to authenticate
+   * @param {string|null} [alg=null]  Hash algorithm, e.g. 'SHA2-256' (device default if null)
+   * @returns {Promise<Uint8Array>}  Raw MAC bytes
+   */
+  async hmacHash(token, kid, data, alg = null) {
+    const body = { kid, msg: toB64(data) };
+    if (alg !== null) body.alg = alg;
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/hash`, body, token);
+    if (!ret.mac) throw new HemError('No mac in hmac/hash response', { code: 'hmac_error' });
+    return fromB64(ret.mac);
+  }
+
+  /**
+   * Verify an HMAC on the HSM. Resolves true on success; throws HemError if the
+   * MAC is invalid.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex) of the HMAC key
+   * @param {Uint8Array} data   Raw bytes that were authenticated
+   * @param {Uint8Array} mac    Raw MAC bytes to verify
+   * @param {string|null} [alg=null]  Hash algorithm (must match hmacHash)
+   * @returns {Promise<true>}
+   */
+  async hmacVerify(token, kid, data, mac, alg = null) {
+    const body = { kid, msg: toB64(data), mac: toB64(mac) };
+    if (alg !== null) body.alg = alg;
+    await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/verify`, body, token);
+    return true;
+  }
+
+  /**
+   * Encrypt data with a symmetric key stored in the HSM.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex) of the symmetric key
+   * @param {Uint8Array} data   Plaintext bytes (for ECB the length must be a
+   *                            multiple of the 16-byte AES block size)
+   * @param {string}     alg    Cipher + mode, e.g. 'AES256-CBC', 'AES256-GCM', 'AES256-ECB'
+   * @returns {Promise<Uint8Array>}  Ciphertext bytes
+   */
+  async cipherEncrypt(token, kid, data, alg) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/encrypt`,
+      { kid, msg: toB64(data), alg }, token);
+    if (!ret.ciphertext) throw new HemError('No ciphertext in encrypt response', { code: 'cipher_error' });
+    return fromB64(ret.ciphertext);
+  }
+
+  /**
+   * Decrypt data with a symmetric key stored in the HSM.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token       Bearer JWT
+   * @param {string}     kid         Key ID (32-char hex) of the symmetric key
+   * @param {Uint8Array} ciphertext  Ciphertext bytes
+   * @param {string}     alg         Cipher + mode (must match cipherEncrypt)
+   * @returns {Promise<Uint8Array>}  Plaintext bytes
+   */
+  async cipherDecrypt(token, kid, ciphertext, alg) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/decrypt`,
+      { kid, msg: toB64(ciphertext), alg }, token);
+    if (!ret.plaintext) throw new HemError('No plaintext in decrypt response', { code: 'cipher_error' });
+    return fromB64(ret.plaintext);
+  }
+
+  /**
+   * Key-wrap: encrypt a key (KEK) with a wrapping key stored in the HSM.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex) of the wrapping key
+   * @param {string}     alg    Wrapping algorithm (key type, e.g. 'AES256')
+   * @param {Uint8Array} data   Key material to wrap
+   * @returns {Promise<Uint8Array>}  Wrapped key bytes
+   */
+  async cipherWrap(token, kid, alg, data) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/wrap`,
+      { kid, alg, msg: toB64(data) }, token);
+    if (!ret.wrapped) throw new HemError('No wrapped in wrap response', { code: 'cipher_error' });
+    return fromB64(ret.wrapped);
+  }
+
+  /**
+   * Key-unwrap: decrypt a wrapped key with a wrapping key stored in the HSM.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token    Bearer JWT
+   * @param {string}     kid      Key ID (32-char hex) of the wrapping key
+   * @param {string}     alg      Wrapping algorithm (must match cipherWrap)
+   * @param {Uint8Array} wrapped  Wrapped key bytes
+   * @returns {Promise<Uint8Array>}  Unwrapped key material
+   */
+  async cipherUnwrap(token, kid, alg, wrapped) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/unwrap`,
+      { kid, alg, msg: toB64(wrapped) }, token);
+    if (!ret.unwrapped) throw new HemError('No unwrapped in unwrap response', { code: 'cipher_error' });
+    return fromB64(ret.unwrapped);
+  }
+
+  /**
+   * ML-KEM (post-quantum) encapsulation against an ML-KEM key in the HSM.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string} token  Bearer JWT
+   * @param {string} kid    Key ID (32-char hex) of the ML-KEM key
+   * @returns {Promise<{ss: Uint8Array, ct: Uint8Array}>}
+   *          ss — shared secret, ct — ciphertext to send to the peer
+   */
+  async mlkemEncaps(token, kid) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mlkem/encaps`,
+      { kid }, token);
+    if (!ret.ss || !ret.ct) throw new HemError('Missing ss/ct in mlkem/encaps response', { code: 'pqc_error' });
+    return { ss: fromB64(ret.ss), ct: fromB64(ret.ct) };
+  }
+
+  /**
+   * ML-KEM (post-quantum) decapsulation with an ML-KEM key in the HSM.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex) of the ML-KEM key
+   * @param {Uint8Array} ct     Ciphertext from the peer's encapsulation
+   * @returns {Promise<Uint8Array>}  Shared secret
+   */
+  async mlkemDecaps(token, kid, ct) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mlkem/decaps`,
+      { kid, ct: toB64(ct) }, token);
+    if (!ret.ss) throw new HemError('No ss in mlkem/decaps response', { code: 'pqc_error' });
+    return fromB64(ret.ss);
+  }
+
+  /**
+   * ML-DSA (post-quantum) signature with an ML-DSA key in the HSM.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex) of the ML-DSA key
+   * @param {Uint8Array} data   Raw bytes to sign
+   * @returns {Promise<Uint8Array>}  Signature bytes
+   */
+  async mldsaSign(token, kid, data) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/sign`,
+      { kid, msg: toB64(data) }, token);
+    if (!ret.sign) throw new HemError('No sign in mldsa/sign response', { code: 'pqc_error' });
+    return fromB64(ret.sign);
+  }
+
+  /**
+   * ML-DSA (post-quantum) signature verification on the HSM. Resolves true on
+   * success; throws HemError if the signature is invalid.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string}     token  Bearer JWT
+   * @param {string}     kid    Key ID (32-char hex) of the ML-DSA key
+   * @param {Uint8Array} data   Raw bytes that were signed
+   * @param {Uint8Array} sign   Signature bytes
+   * @returns {Promise<true>}
+   */
+  async mldsaVerify(token, kid, data, sign) {
+    await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/verify`,
+      { kid, msg: toB64(data), sign: toB64(sign) }, token);
+    return true;
+  }
+
+  /**
    * Search keys in the HSM repository by pattern.
    * Returns the same shape as listKeys.
    *
@@ -708,6 +1098,273 @@ class HEM {
    */
   async deleteKey(token, kid) {
     await this.#req('DELETE', `${this.#baseUrl}/api/keymgmt/delete/${kid}`, null, token);
+  }
+
+  // -- System Management -------------------------------------------------------
+
+  /**
+   * Get device version information (hardware, bootloader, firmware).
+   * No authentication required.
+   *
+   * @returns {Promise<{hwv:string, blv:string, fwv:string, fws:string, conf:string}>}
+   */
+  async getVersion() {
+    return this.#req('GET', `${this.#baseUrl}/api/system/version`);
+  }
+
+  /**
+   * Get current device status (init state, failure-lockdown state, hostname, ...).
+   * No authentication required.
+   *
+   * @returns {Promise<object>}
+   */
+  async getStatus() {
+    return this.#req('GET', `${this.#baseUrl}/api/system/status`);
+  }
+
+  /**
+   * Read the device configuration.
+   *
+   * Required scope: 'system:config'
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}  Config object (eid, user, email, hostname, ...)
+   */
+  async getConfig(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/config`, null, token);
+  }
+
+  /**
+   * Update the device configuration. Only known fields are applied; unknown
+   * fields are ignored and reported back via `updated: false`.
+   *
+   * Required scope: 'system:config'
+   *
+   * @param {string} token  Bearer JWT
+   * @param {object} cfg    Partial config, e.g. { user }, { email }, { hostname }
+   * @returns {Promise<{updated: boolean}>}
+   */
+  async setConfig(token, cfg) {
+    return this.#req('POST', `${this.#baseUrl}/api/system/config`, cfg, token);
+  }
+
+  /**
+   * Fetch device provisioning data (e.g. the CSR generated during initialization).
+   *
+   * Required scope: 'system:config'
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async getProvisioning(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/config/provisioning`, null, token);
+  }
+
+  /**
+   * Reboot the device. Any valid token is accepted.
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async reboot(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/reboot`, null, token);
+  }
+
+  /**
+   * Shut the device down. Any valid token is accepted.
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async shutdown(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/shutdown`, null, token);
+  }
+
+  /**
+   * Run the device self-test suite.
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async selftest(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/selftest`, null, token);
+  }
+
+  // -- Firmware / UI Upgrade ---------------------------------------------------
+
+  /**
+   * Query the device USB upgrade mode.
+   *
+   * Required scope: 'system:upgrade'
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async usbMode(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/usbmode`, null, token);
+  }
+
+  /**
+   * Upload a firmware image to the device.
+   *
+   * The SDK takes the raw byte stream — obtaining it is the caller's job.
+   * Two common cases:
+   *
+   *   // a) From a local file (Node.js):
+   *   import { readFile } from 'node:fs/promises';
+   *   const bytes = new Uint8Array(await readFile('./encedo_fw.hex'));
+   *   await hem.uploadFirmware(token, bytes);
+   *
+   *   // b) From a URL or a file picker (browser):
+   *   const bytes = new Uint8Array(await (await fetch(fwUrl)).arrayBuffer());
+   *   // or from <input type="file">:
+   *   // const bytes = new Uint8Array(await fileInput.files[0].arrayBuffer());
+   *   await hem.uploadFirmware(token, bytes);
+   *
+   * Required scope: 'system:upgrade'
+   *
+   * @param {string}     token       Bearer JWT
+   * @param {Uint8Array} bytes       Raw firmware image bytes
+   * @param {string}     [filename='firmware.bin']  Upload filename
+   * @returns {Promise<object>}
+   */
+  async uploadFirmware(token, bytes, filename = 'firmware.bin') {
+    return this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_fw`,
+      bytes, token, { binary: true, filename });
+  }
+
+  /**
+   * Verify the firmware image previously uploaded with uploadFirmware().
+   *
+   * Required scope: 'system:upgrade'
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async checkFirmware(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_fw`, null, token);
+  }
+
+  /**
+   * Install the verified firmware image. The device reboots afterwards.
+   *
+   * Required scope: 'system:upgrade'
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async installFirmware(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/install_fw`, null, token);
+  }
+
+  /**
+   * Upload a UI bundle image to the device.
+   * See uploadFirmware() for how to obtain the byte stream from a local file
+   * or a URL — the SDK takes the raw bytes either way.
+   *
+   * Required scope: 'system:upgrade'
+   *
+   * @param {string}     token       Bearer JWT
+   * @param {Uint8Array} bytes       Raw UI bundle bytes
+   * @param {string}     [filename='ui.bin']  Upload filename
+   * @returns {Promise<object>}
+   */
+  async uploadUi(token, bytes, filename = 'ui.bin') {
+    return this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_ui`,
+      bytes, token, { binary: true, filename });
+  }
+
+  /**
+   * Verify the UI bundle previously uploaded with uploadUi().
+   *
+   * Required scope: 'system:upgrade'
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async checkUi(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_ui`, null, token);
+  }
+
+  /**
+   * Install the verified UI bundle.
+   *
+   * Required scope: 'system:upgrade'
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async installUi(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/install_ui`, null, token);
+  }
+
+  // -- Storage -----------------------------------------------------------------
+
+  /**
+   * Lock an embedded storage disk. The disk (disk0 / disk1) and access mode are
+   * selected by the token's scope — e.g. a token scoped to 'storage:disk0:rw'
+   * locks disk0.
+   *
+   * Required scope: 'storage:disk<N>:rw'
+   *
+   * @param {string} token  Bearer JWT scoped to a specific disk
+   * @returns {Promise<object>}
+   */
+  async lockStorage(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/storage/lock`, null, token);
+  }
+
+  /**
+   * Unlock an embedded storage disk. The disk is selected by the token's scope.
+   *
+   * Required scope: 'storage:disk<N>:rw'
+   *
+   * @param {string} token  Bearer JWT scoped to a specific disk
+   * @returns {Promise<object>}
+   */
+  async unlockStorage(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/storage/unlock`, null, token);
+  }
+
+  // -- Logger / Audit Log ------------------------------------------------------
+
+  /**
+   * Get the Ed25519 public key the device uses to sign audit-log entries.
+   * Use it to verify log integrity (rotating HMAC chain + entry signatures).
+   *
+   * Required scope: 'logger:get'
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<object>}
+   */
+  async getLoggerKey(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/logger/key`, null, token);
+  }
+
+  /**
+   * List audit-log entries starting at an offset.
+   *
+   * Required scope: 'logger:get'
+   *
+   * @param {string} token   Bearer JWT
+   * @param {number} [offset=0]
+   * @returns {Promise<object>}
+   */
+  async listLog(token, offset = 0) {
+    return this.#req('GET', `${this.#baseUrl}/api/logger/list/${offset}`, null, token);
+  }
+
+  /**
+   * Fetch a single audit-log entry by id.
+   *
+   * Required scope: 'logger:get'
+   *
+   * @param {string} token        Bearer JWT
+   * @param {string|number} id    Log entry id
+   * @returns {Promise<object>}
+   */
+  async getLogEntry(token, id) {
+    return this.#req('GET', `${this.#baseUrl}/api/logger/${id}`, null, token);
   }
 
 }
