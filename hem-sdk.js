@@ -729,14 +729,18 @@ export class HEM {
    *
    * @param {string}      token       Bearer JWT (must have keymgmt:imp scope)
    * @param {string}      label       Key label (max 32 chars)
-   * @param {string}      type        Key type, e.g. 'ED25519', 'CURVE25519'
-   * @param {Uint8Array}  pubKeyBytes Raw public key bytes (32 bytes for Ed25519/X25519)
+   * @param {string}      type        Key type, e.g. 'ED25519', 'CURVE25519', 'SECP384R1'
+   * @param {Uint8Array}  pubKeyBytes Public key bytes: raw 32/56/57 B for 25519/448 types,
+   *                                  compressed SEC1 point (0x02/0x03||X) for SECP* types
    * @param {string|null} [descr]     Optional base64-encoded description (128-byte field)
+   * @param {string|null} [mode]      Optional usage constraint for NIST ECC keys:
+   *                                  'ECDH', 'ExDSA' or 'ECDH,ExDSA'
    * @returns {Promise<{kid: string}>}
    */
-  async importPublicKey(token, label, type, pubKeyBytes, descr = null) {
+  async importPublicKey(token, label, type, pubKeyBytes, descr = null, mode = null) {
     const body = { type, label, pubkey: toB64(pubKeyBytes) };
     if (descr !== null) body.descr = descr;
+    if (mode !== null) body.mode = mode;
     return this.#req('POST', `${this.#baseUrl}/api/keymgmt/import`, body, token);
   }
 

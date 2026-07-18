@@ -54,7 +54,7 @@ export declare class HEM {
   searchKeys(token: string, descrBase64: string, offset?: number, limit?: number): Promise<HemKey[]>;
   getPubKey(token: string, kid: string): Promise<string>;
   createKeyPair(token: string, label: string, type: string, descr: string): Promise<{ kid: string }>;
-  importPublicKey(token: string, label: string, type: string, pubKeyBytes: Uint8Array, descr?: string | null): Promise<{ kid: string }>;
+  importPublicKey(token: string, label: string, type: string, pubKeyBytes: Uint8Array, descr?: string | null, mode?: string | null): Promise<{ kid: string }>;
   deriveKey(token: string, label: string, type: string, descr: string, kid: string, peerPubKeyBase64: string): Promise<{ kid: string }>;
   updateKey(token: string, kid: string, label: string, descr: string): Promise<unknown>;
   exdsaSignBytes(token: string, kid: string, data: Uint8Array, alg?: string, ctx?: string | null): Promise<string>;

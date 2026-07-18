@@ -142,6 +142,11 @@ const impToken = await hem.authorizePassword('my-password', 'keymgmt:imp');
 const imported = await hem.importPublicKey(impToken, 'Peer key', 'ED25519',
   rawPubKeyBytes /* Uint8Array */, btoa('peer'));
 
+// NIST ECC (SECP256R1/384R1/521R1, SECP256K1) additionally REQUIRE a usage mode
+// ('ECDH', 'ExDSA' or 'ECDH,ExDSA') and take a COMPRESSED SEC1 point (0x02/0x03||X):
+const nist = await hem.importPublicKey(impToken, 'Peer P-384', 'SECP384R1',
+  compressedPoint /* Uint8Array, 49 B */, btoa('peer'), 'ECDH');
+
 // Update label/description (scope: keymgmt:upd)
 const updToken = await hem.authorizePassword('my-password', 'keymgmt:upd');
 await hem.updateKey(updToken, kid, 'Renamed key', btoa('new description'));
