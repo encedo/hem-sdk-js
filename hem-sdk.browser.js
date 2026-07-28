@@ -907,6 +907,31 @@ class HEM {
   }
 
   /**
+   * Curve25519 ECDH between two keys that already live in the HSM: my private
+   * key (`kid`) and a peer public key imported into the HSM (`extKid`). Both
+   * operands stay in-device — only the 32-byte shared secret is returned.
+   * The two-KID counterpart of {@link ecdh} (which takes a raw peer pubkey).
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string} token   Bearer JWT
+   * @param {string} kid     Key ID (32-char hex) of my X25519 private key in HSM
+   * @param {string} extKid  Key ID of the peer's X25519 public key in HSM
+   * @returns {Promise<Uint8Array>}  Raw 32-byte shared secret
+   */
+  async ecdhKid(token, kid, extKid) {
+    const ret = await this.#req(
+      'POST', `${this.#baseUrl}/api/crypto/ecdh`,
+      { kid, ext_kid: extKid },
+      token
+    );
+    if (!ret.ecdh) throw new HemError('No ecdh in response', { code: 'ecdh_error' });
+    const result = fromB64(ret.ecdh);
+    if (result.length !== 32) throw new HemError(`ECDH result length invalid: expected 32, got ${result.length}`, { code: 'ecdh_error' });
+    return result;
+  }
+
+  /**
    * Compute an HMAC over arbitrary data using a symmetric key in the HSM.
    *
    * Required scope: 'keymgmt:use:<KID>'

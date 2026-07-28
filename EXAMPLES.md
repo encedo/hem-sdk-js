@@ -192,6 +192,10 @@ const sig3 = await hem.exdsaSignBytes(token, kid, data, 'Ed25519ctx', btoa('ctx'
 ```js
 // Curve25519 ECDH on the device — returns the raw 32-byte shared secret.
 const secret = await hem.ecdh(token, kid, peerPubKeyBase64);       // Uint8Array
+
+// Two-KID variant: the peer public key is already imported in the HSM (extKid);
+// both operands stay in-device, only the 32-byte shared secret comes back.
+const secret2 = await hem.ecdhKid(token, kid, extKid);            // Uint8Array
 ```
 
 ### HMAC

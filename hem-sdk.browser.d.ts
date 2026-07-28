@@ -59,7 +59,8 @@ export declare class HEM {
   updateKey(token: string, kid: string, label: string, descr: string): Promise<unknown>;
   exdsaSignBytes(token: string, kid: string, data: Uint8Array, alg?: string, ctx?: string | null): Promise<string>;
   exdsaVerify(token: string, kid: string, data: Uint8Array, sig: string, alg?: string): Promise<boolean>;
-  ecdh(token: string, kid: string, peerPubKeyBase64: string): Promise<string>;
+  ecdh(token: string, kid: string, peerPubKeyBase64: string): Promise<Uint8Array>;
+  ecdhKid(token: string, kid: string, extKid: string): Promise<Uint8Array>;
 
   hmacHash(token: string, kid: string, data: Uint8Array, alg?: string | null): Promise<Uint8Array>;
   hmacVerify(token: string, kid: string, data: Uint8Array, mac: Uint8Array, alg?: string | null): Promise<true>;
