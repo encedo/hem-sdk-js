@@ -33,6 +33,18 @@ updated separately. **Always make SDK changes here**, never in a downstream copy
   - Default: JSON request (`application/json`, body `JSON.stringify`d).
   - `opts = { binary: true, filename }` → `application/octet-stream` upload of
     a raw `Uint8Array` (used by firmware/UI upgrade).
+  - `opts = { timeoutMs, signal }` → the request is **cancelled**, not merely
+    stopped being awaited. This matters more than it looks: the alternative a
+    caller reaches for is racing the promise against a timer, which leaves the
+    HTTP request running — a page polling an absent device that way accumulates
+    one open connection per attempt, and they all land at once when the device
+    appears. `AbortSignal.timeout` becomes `code: 'timeout'` and an external
+    abort `code: 'aborted'`, so a caller can tell "cancelled" from "unreachable".
+    Honoured on **both** transports (`fetch` and `#reqNode`), or the same call
+    would be cancellable in a browser and not in Node.
+  - Only `getVersion` / `getStatus` expose it so far — they are what a login
+    screen probes with. Any other method needs one more parameter, no new
+    machinery.
   - In Node.js, requests with a body go through `#reqNode` (`https.request`
     with an explicit `Content-Length`) — embedded devices reject `undici`'s
     chunked encoding with HTTP 411. `#reqNode` accepts a string or `Uint8Array`.

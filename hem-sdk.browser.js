@@ -153,7 +153,7 @@ class HEM {
   // -- HTTP --------------------------------------------------------------------
 
   async #req(method, url, body = null, token = null, opts = {}) {
-    const { binary = false, filename = null } = opts;
+    const { binary = false, filename = null, signal = null, timeoutMs = 0 } = opts;
 
     // Binary uploads (firmware / UI images) go out as application/octet-stream
     // carrying the raw bytes; every other request is JSON.
@@ -184,15 +184,22 @@ class HEM {
     let status, resHeaders, data;
 
     if (isNode && payload !== null) {
-      ({ status, headers: resHeaders, data } = await this.#reqNode(method, url, headers, payload));
+      ({ status, headers: resHeaders, data } = await this.#reqNode(method, url, headers, payload, { signal, timeoutMs }));
     } else {
       const fetchOpts = { method, headers };
       if (payload !== null) fetchOpts.body = payload;
+      const abort = HEM.#abortSignal(signal, timeoutMs);
+      if (abort) fetchOpts.signal = abort;
 
       let res;
       try {
         res = await fetch(url, fetchOpts);
       } catch (e) {
+        // A cancelled request is not an unreachable device, and a caller that
+        // cannot tell them apart will report the wrong thing to a user. Without
+        // this they all arrive as `network`.
+        if (e?.name === 'TimeoutError') throw new HemError(`Request timeout after ${timeoutMs} ms`, { code: 'timeout' });
+        if (e?.name === 'AbortError') throw new HemError('Request aborted', { code: 'aborted' });
         throw new HemError(`Network error: ${e.message}`, { code: 'network' });
       }
 
@@ -221,8 +228,24 @@ class HEM {
     return data;
   }
 
+  /**
+   * The signal a request should run under: the caller's, a deadline, or both.
+   *
+   * `timeoutMs` exists because the alternative callers reach for is racing the
+   * promise against a timer — which stops WAITING for the request without
+   * stopping the request. A page that polls an absent device that way
+   * accumulates one open connection per attempt, and they all complete at once
+   * when the device appears.
+   */
+  static #abortSignal(signal, timeoutMs) {
+    if (!timeoutMs) return signal ?? null;
+    const deadline = AbortSignal.timeout(timeoutMs);
+    if (!signal) return deadline;
+    return typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, deadline]) : signal;
+  }
+
   // Node.js-specific HTTP request using https.request (sets Content-Length explicitly)
-  async #reqNode(method, url, headers, body) {
+  async #reqNode(method, url, headers, body, opts = {}) {
     const { default: https } = await import('node:https');
     const { default: http } = await import('node:http');
     const { URL: NodeURL } = await import('node:url');
@@ -248,7 +271,7 @@ class HEM {
         path: parsed.pathname + parsed.search,
         headers: reqHeaders,
         agent: false,   // fresh TLS connection per request (HSM doesn't pool)
-        timeout: 15000,
+        timeout: opts.timeoutMs || 15000,
       }, (res) => {
         let raw = '';
         res.setEncoding('utf8');
@@ -277,6 +300,15 @@ class HEM {
         if (this.#debug) console.debug('[HEM] req error:', e.message);
         reject(new HemError(`Network error: ${e.message}`, { code: 'network' }));
       });
+      // The caller's signal has to reach the socket here as well, or the same
+      // call is cancellable in a browser and not in Node.
+      const { signal } = opts;
+      if (signal) {
+        const onAbort = () => { req.destroy(); reject(new HemError('Request aborted', { code: 'aborted' })); };
+        if (signal.aborted) { onAbort(); return; }
+        signal.addEventListener('abort', onAbort, { once: true });
+        req.on('close', () => signal.removeEventListener('abort', onAbort));
+      }
       req.write(payloadBuf);
       req.end();
     });
@@ -1158,20 +1190,31 @@ class HEM {
    * Get device version information (hardware, bootloader, firmware).
    * No authentication required.
    *
+   * Cheap and unauthenticated, which makes it the natural "is a device there at
+   * all" probe — so it is the first method to take a budget. Bound it, or a
+   * caller watching for a device that is not plugged in has no way to stop
+   * waiting without leaving the request open.
+   *
+   * @param   {object}      [opts]
+   * @param   {number}      [opts.timeoutMs]  Cancel the request after this long
+   * @param   {AbortSignal} [opts.signal]     Cancel it from outside
    * @returns {Promise<{hwv:string, blv:string, fwv:string, fws:string, conf:string}>}
    */
-  async getVersion() {
-    return this.#req('GET', `${this.#baseUrl}/api/system/version`);
+  async getVersion(opts = {}) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/version`, null, null, opts);
   }
 
   /**
    * Get current device status (init state, failure-lockdown state, hostname, ...).
    * No authentication required.
    *
+   * @param   {object}      [opts]
+   * @param   {number}      [opts.timeoutMs]
+   * @param   {AbortSignal} [opts.signal]
    * @returns {Promise<object>}
    */
-  async getStatus() {
-    return this.#req('GET', `${this.#baseUrl}/api/system/status`);
+  async getStatus(opts = {}) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/status`, null, null, opts);
   }
 
   /**

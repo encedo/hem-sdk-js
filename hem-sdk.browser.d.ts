@@ -75,8 +75,8 @@ export declare class HEM {
 
   deleteKey(token: string, kid: string): Promise<void>;
 
-  getVersion(): Promise<{ hwv: string; blv: string; fwv: string; fws: string; conf: string }>;
-  getStatus(): Promise<Record<string, unknown>>;
+  getVersion(opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ hwv: string; blv: string; fwv: string; fws: string; conf: string }>;
+  getStatus(opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<Record<string, unknown>>;
   getConfig(token: string): Promise<Record<string, unknown>>;
   setConfig(token: string, cfg: Record<string, unknown>): Promise<{ updated: boolean }>;
   reboot(token: string): Promise<unknown>;
