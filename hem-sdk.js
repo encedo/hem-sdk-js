@@ -91,6 +91,51 @@ export class HemError extends Error {
   }
 }
 
+// --- /api/crypto/* shared options ---------------------------------------------
+
+// Device limits. Exceeding either surfaces as an opaque HTTP 400, so the SDK
+// checks them where the caller can still see which argument was at fault.
+const MAX_CRYPTO_MSG = 2048;
+const MAX_CRYPTO_CTX = 64;
+
+/**
+ * Write the ext_kid / pubkey selector into a request body.
+ *
+ * Both name a peer public key and turn the operation into an indirect one: the
+ * device runs ECDH between `kid` and the peer key and uses the shared secret as
+ * the operation's key, so the key actually in use never exists outside the HEM.
+ * Naming the key's *own* public key is legal and yields a self-ECDH key — the
+ * construction the config-free WireGuard client uses to authenticate its
+ * configuration. The peer key must be of the same type as `kid`.
+ */
+function applyPeerKey(body, opts, op) {
+  const { extKid = null, pubkey = null } = opts;
+  if (extKid && pubkey) {
+    throw new HemError(`${op}: pass extKid or pubkey, not both`, { code: 'invalid_arg' });
+  }
+  if (extKid) body.ext_kid = extKid;
+  else if (pubkey) body.pubkey = pubkey instanceof Uint8Array ? toB64(pubkey) : pubkey;
+}
+
+/** Write the optional HKDF context, which domain-separates a derived key. */
+function applyCtx(body, opts, op) {
+  const { ctx = null } = opts;
+  if (ctx === null || ctx === undefined) return;
+  const bytes = ctx instanceof Uint8Array ? ctx : strToBytes(ctx);
+  if (bytes.length > MAX_CRYPTO_CTX) {
+    throw new HemError(`${op}: ctx is ${bytes.length} bytes, max ${MAX_CRYPTO_CTX}`,
+      { code: 'invalid_arg' });
+  }
+  body.ctx = toB64(bytes);
+}
+
+function checkMsgSize(op, data) {
+  if (data.length > MAX_CRYPTO_MSG) {
+    throw new HemError(`${op}: message is ${data.length} bytes, max ${MAX_CRYPTO_MSG}`,
+      { code: 'invalid_arg' });
+  }
+}
+
 // --- Main class ---------------------------------------------------------------
 
 export class HEM {
@@ -917,31 +962,29 @@ export class HEM {
 
   /**
    * Perform a Curve25519 ECDH operation on the HSM.
-   * The private key never leaves the device — only the 32-byte shared secret is returned.
+   * The private key never leaves the device — only the shared secret is returned.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
    * @param {string} token             Bearer JWT
    * @param {string} kid               Key ID (32-char hex) of the X25519 private key in HSM
    * @param {string} peerPubKeyBase64  Peer's raw 32-byte X25519 public key in standard base64
-   * @returns {Promise<Uint8Array>}    Raw 32-byte shared secret
+   * @param {object} [opts]
+   * @param {string|null} [opts.alg=null]  Hash applied to the shared secret
+   *                       ('SHA2-256'…'SHA3-512'). Omit for the raw secret —
+   *                       that is what a Noise handshake needs.
+   * @returns {Promise<Uint8Array>}    Shared secret: raw 32 bytes, or the digest when alg is set
    */
-  async ecdh(token, kid, peerPubKeyBase64) {
-    const ret = await this.#req(
-      'POST', `${this.#baseUrl}/api/crypto/ecdh`,
-      { kid, pubkey: peerPubKeyBase64 },
-      token
-    );
-    if (!ret.ecdh) throw new HemError('No ecdh in response', { code: 'ecdh_error' });
-    const result = fromB64(ret.ecdh);
-    if (result.length !== 32) throw new HemError(`ECDH result length invalid: expected 32, got ${result.length}`, { code: 'ecdh_error' });
-    return result;
+  async ecdh(token, kid, peerPubKeyBase64, { alg = null } = {}) {
+    const body = { kid, pubkey: peerPubKeyBase64 };
+    if (alg) body.alg = alg;
+    return this.#ecdhCall(body, token, alg);
   }
 
   /**
    * Curve25519 ECDH between two keys that already live in the HSM: my private
    * key (`kid`) and a peer public key imported into the HSM (`extKid`). Both
-   * operands stay in-device — only the 32-byte shared secret is returned.
+   * operands stay in-device — only the shared secret is returned.
    * The two-KID counterpart of {@link ecdh} (which takes a raw peer pubkey).
    *
    * Required scope: 'keymgmt:use:<KID>'
@@ -949,22 +992,34 @@ export class HEM {
    * @param {string} token   Bearer JWT
    * @param {string} kid     Key ID (32-char hex) of my X25519 private key in HSM
    * @param {string} extKid  Key ID of the peer's X25519 public key in HSM
-   * @returns {Promise<Uint8Array>}  Raw 32-byte shared secret
+   * @param {object} [opts]
+   * @param {string|null} [opts.alg=null]  Hash applied to the shared secret; omit for raw
+   * @returns {Promise<Uint8Array>}  Shared secret: raw 32 bytes, or the digest when alg is set
    */
-  async ecdhKid(token, kid, extKid) {
-    const ret = await this.#req(
-      'POST', `${this.#baseUrl}/api/crypto/ecdh`,
-      { kid, ext_kid: extKid },
-      token
-    );
+  async ecdhKid(token, kid, extKid, { alg = null } = {}) {
+    const body = { kid, ext_kid: extKid };
+    if (alg) body.alg = alg;
+    return this.#ecdhCall(body, token, alg);
+  }
+
+  async #ecdhCall(body, token, alg) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/ecdh`, body, token);
     if (!ret.ecdh) throw new HemError('No ecdh in response', { code: 'ecdh_error' });
     const result = fromB64(ret.ecdh);
-    if (result.length !== 32) throw new HemError(`ECDH result length invalid: expected 32, got ${result.length}`, { code: 'ecdh_error' });
+    // Only the raw secret has a known length; a hashed result is as long as the digest.
+    if (!alg && result.length !== 32) {
+      throw new HemError(`ECDH result length invalid: expected 32, got ${result.length}`,
+        { code: 'ecdh_error' });
+    }
     return result;
   }
 
   /**
-   * Compute an HMAC over arbitrary data using a symmetric key in the HSM.
+   * Compute an HMAC over arbitrary data using a key in the HSM (max 2048 bytes).
+   *
+   * With `extKid` or `pubkey` the MAC key is not the key at `kid` but the ECDH
+   * shared secret between the two, so pointing at `kid`'s own public key gives a
+   * MAC key that never exists outside the device.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
@@ -972,11 +1027,16 @@ export class HEM {
    * @param {string}     kid    Key ID (32-char hex) of the HMAC key
    * @param {Uint8Array} data   Raw bytes to authenticate
    * @param {string|null} [alg=null]  Hash algorithm, e.g. 'SHA2-256' (device default if null)
+   * @param {object} [opts]
+   * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
+   * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
    * @returns {Promise<Uint8Array>}  Raw MAC bytes
    */
-  async hmacHash(token, kid, data, alg = null) {
+  async hmacHash(token, kid, data, alg = null, opts = {}) {
+    checkMsgSize('hmacHash', data);
     const body = { kid, msg: toB64(data) };
     if (alg !== null) body.alg = alg;
+    applyPeerKey(body, opts, 'hmacHash');
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/hash`, body, token);
     if (!ret.mac) throw new HemError('No mac in hmac/hash response', { code: 'hmac_error' });
     return fromB64(ret.mac);
@@ -984,7 +1044,10 @@ export class HEM {
 
   /**
    * Verify an HMAC on the HSM. Resolves true on success; throws HemError if the
-   * MAC is invalid.
+   * MAC is invalid — the comparison happens inside the device, so the caller
+   * never has to write a constant-time compare.
+   *
+   * `alg` and `opts` must match the hmacHash call that produced the MAC.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
@@ -993,17 +1056,25 @@ export class HEM {
    * @param {Uint8Array} data   Raw bytes that were authenticated
    * @param {Uint8Array} mac    Raw MAC bytes to verify
    * @param {string|null} [alg=null]  Hash algorithm (must match hmacHash)
+   * @param {object} [opts]
+   * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
+   * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
    * @returns {Promise<true>}
    */
-  async hmacVerify(token, kid, data, mac, alg = null) {
+  async hmacVerify(token, kid, data, mac, alg = null, opts = {}) {
+    checkMsgSize('hmacVerify', data);
     const body = { kid, msg: toB64(data), mac: toB64(mac) };
     if (alg !== null) body.alg = alg;
+    applyPeerKey(body, opts, 'hmacVerify');
     await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/verify`, body, token);
     return true;
   }
 
   /**
-   * Encrypt data with a symmetric key stored in the HSM.
+   * Encrypt data with a symmetric key stored in the HSM (max 2048 bytes).
+   * The IV is generated by the device and returned alongside the ciphertext;
+   * GCM modes also return the authentication tag. All three are needed to
+   * decrypt, so the result is an object rather than a bare byte array.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
@@ -1012,17 +1083,32 @@ export class HEM {
    * @param {Uint8Array} data   Plaintext bytes (for ECB the length must be a
    *                            multiple of the 16-byte AES block size)
    * @param {string}     alg    Cipher + mode, e.g. 'AES256-CBC', 'AES256-GCM', 'AES256-ECB'
-   * @returns {Promise<Uint8Array>}  Ciphertext bytes
+   * @param {object} [opts]
+   * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
+   * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
+   * @param {Uint8Array|null} [opts.aad=null]  Additional authenticated data (GCM only)
+   * @param {Uint8Array|string|null} [opts.ctx=null]  HKDF context, max 64 bytes
+   * @returns {Promise<{ciphertext: Uint8Array, iv: Uint8Array, tag: Uint8Array|null}>}
    */
-  async cipherEncrypt(token, kid, data, alg) {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/encrypt`,
-      { kid, msg: toB64(data), alg }, token);
+  async cipherEncrypt(token, kid, data, alg, opts = {}) {
+    checkMsgSize('cipherEncrypt', data);
+    const body = { kid, msg: toB64(data), alg };
+    applyPeerKey(body, opts, 'cipherEncrypt');
+    applyCtx(body, opts, 'cipherEncrypt');
+    if (opts.aad) body.aad = toB64(opts.aad);
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/encrypt`, body, token);
     if (!ret.ciphertext) throw new HemError('No ciphertext in encrypt response', { code: 'cipher_error' });
-    return fromB64(ret.ciphertext);
+    return {
+      ciphertext: fromB64(ret.ciphertext),
+      iv: ret.iv ? fromB64(ret.iv) : null,
+      tag: ret.tag ? fromB64(ret.tag) : null,
+    };
   }
 
   /**
-   * Decrypt data with a symmetric key stored in the HSM.
+   * Decrypt data with a symmetric key stored in the HSM. `opts.iv` is required
+   * for CBC and GCM and `opts.tag` for GCM — pass back what cipherEncrypt
+   * returned, along with the same peer key, aad and ctx.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
@@ -1030,35 +1116,60 @@ export class HEM {
    * @param {string}     kid         Key ID (32-char hex) of the symmetric key
    * @param {Uint8Array} ciphertext  Ciphertext bytes
    * @param {string}     alg         Cipher + mode (must match cipherEncrypt)
+   * @param {object} [opts]  As cipherEncrypt, plus:
+   * @param {Uint8Array|null} [opts.iv=null]   IV returned by cipherEncrypt
+   * @param {Uint8Array|null} [opts.tag=null]  GCM tag returned by cipherEncrypt
    * @returns {Promise<Uint8Array>}  Plaintext bytes
    */
-  async cipherDecrypt(token, kid, ciphertext, alg) {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/decrypt`,
-      { kid, msg: toB64(ciphertext), alg }, token);
+  async cipherDecrypt(token, kid, ciphertext, alg, opts = {}) {
+    checkMsgSize('cipherDecrypt', ciphertext);
+    const body = { kid, msg: toB64(ciphertext), alg };
+    applyPeerKey(body, opts, 'cipherDecrypt');
+    applyCtx(body, opts, 'cipherDecrypt');
+    if (opts.iv) body.iv = toB64(opts.iv);
+    if (opts.tag) body.tag = toB64(opts.tag);
+    if (opts.aad) body.aad = toB64(opts.aad);
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/decrypt`, body, token);
     if (!ret.plaintext) throw new HemError('No plaintext in decrypt response', { code: 'cipher_error' });
     return fromB64(ret.plaintext);
   }
 
   /**
-   * Key-wrap: encrypt a key (KEK) with a wrapping key stored in the HSM.
+   * Key-wrap: encrypt key material with a key-encryption key held in the HSM
+   * (NIST AES key wrap — deterministic, 32 bytes in, 40 bytes out).
+   *
+   * With `extKid` or `pubkey` the KEK is the ECDH shared secret rather than the
+   * key at `kid`; `ctx` then domain-separates that KEK from other wrap uses of
+   * the same key and must be repeated verbatim on unwrap.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
    * @param {string}     token  Bearer JWT
    * @param {string}     kid    Key ID (32-char hex) of the wrapping key
    * @param {string}     alg    Wrapping algorithm (key type, e.g. 'AES256')
-   * @param {Uint8Array} data   Key material to wrap
+   * @param {Uint8Array} data   Key material to wrap (max 2048 bytes)
+   * @param {object} [opts]
+   * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
+   * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
+   * @param {Uint8Array|string|null} [opts.ctx=null]     HKDF context, max 64 bytes
+   * @param {Uint8Array|null} [opts.iv=null]             Explicit IV; omit for the default
    * @returns {Promise<Uint8Array>}  Wrapped key bytes
    */
-  async cipherWrap(token, kid, alg, data) {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/wrap`,
-      { kid, alg, msg: toB64(data) }, token);
+  async cipherWrap(token, kid, alg, data, opts = {}) {
+    checkMsgSize('cipherWrap', data);
+    const body = { kid, alg, msg: toB64(data) };
+    applyPeerKey(body, opts, 'cipherWrap');
+    applyCtx(body, opts, 'cipherWrap');
+    if (opts.iv) body.iv = toB64(opts.iv);
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/wrap`, body, token);
     if (!ret.wrapped) throw new HemError('No wrapped in wrap response', { code: 'cipher_error' });
     return fromB64(ret.wrapped);
   }
 
   /**
-   * Key-unwrap: decrypt a wrapped key with a wrapping key stored in the HSM.
+   * Key-unwrap: recover key material wrapped by {@link cipherWrap}. Every option
+   * must match the wrap call — a differing `ctx` derives a different KEK and the
+   * unwrap fails.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
@@ -1066,11 +1177,16 @@ export class HEM {
    * @param {string}     kid      Key ID (32-char hex) of the wrapping key
    * @param {string}     alg      Wrapping algorithm (must match cipherWrap)
    * @param {Uint8Array} wrapped  Wrapped key bytes
+   * @param {object} [opts]  Same shape as cipherWrap; must match it
    * @returns {Promise<Uint8Array>}  Unwrapped key material
    */
-  async cipherUnwrap(token, kid, alg, wrapped) {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/unwrap`,
-      { kid, alg, msg: toB64(wrapped) }, token);
+  async cipherUnwrap(token, kid, alg, wrapped, opts = {}) {
+    checkMsgSize('cipherUnwrap', wrapped);
+    const body = { kid, alg, msg: toB64(wrapped) };
+    applyPeerKey(body, opts, 'cipherUnwrap');
+    applyCtx(body, opts, 'cipherUnwrap');
+    if (opts.iv) body.iv = toB64(opts.iv);
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/unwrap`, body, token);
     if (!ret.unwrapped) throw new HemError('No unwrapped in unwrap response', { code: 'cipher_error' });
     return fromB64(ret.unwrapped);
   }
@@ -1145,28 +1261,44 @@ export class HEM {
   }
 
   /**
-   * Search keys in the HSM repository by pattern.
-   * Returns the same shape as listKeys.
+   * Search the key repository by the description field.
    *
-   * Required scope: 'keymgmt:list'
+   * The pattern is matched as a prefix. The '^' anchor the device expects goes
+   * on the base64 text, not on the bytes, so the SDK adds it after encoding —
+   * pass the plain value. A Uint8Array pattern lets a caller search binary
+   * descriptions; a string is UTF-8 encoded. Only prefix matching is available:
+   * a '$' suffix anchor appears in neither the API reference nor the
+   * certification suite, so it is left out until the firmware is checked.
    *
-   * @param {string} token    Bearer JWT
-   * @param {string} descr    Search pattern matched against description (regex)
-   * @param {number} [offset=0]
-   * @param {number} [limit=50]
-   * @returns {Promise<Array<{kid:string, label:string, type:string, description:Uint8Array|null}>>}
+   * The device returns at most `limit` entries (its own default is 15) starting
+   * at `offset`. Paginate by adding the page length to `offset` until a page
+   * comes back shorter than `limit`.
+   *
+   * Pass token=null for anonymous access, which the device permits when
+   * `allow_keysearch` is configured and the pattern is at least 6 bytes.
+   *
+   * Required scope: 'keymgmt:search' (or 'keymgmt:list' + 'auth:ext:pair')
+   *
+   * @param {string|null} token  Bearer JWT, or null for an anonymous search
+   * @param {string|Uint8Array} descr  Pattern the description must start with
+   * @param {number} [offset=0]  Entries to skip
+   * @param {number} [limit=0]   Max entries; <= 0 leaves the device default (15)
+   * @returns {Promise<Array<{kid:string, label:string, type:string, created:number|null, updated:number|null, description:Uint8Array|null}>>}
    */
-  async searchKeys(token, descr, _offset = 0, _limit = 50) { // TODO: pass _offset/_limit in path once HSM API is fixed
-    const descrB64 = '^' + toB64(new TextEncoder().encode(descr));
+  async searchKeys(token, descr, offset = 0, limit = 0) {
+    const bytes = descr instanceof Uint8Array ? descr : strToBytes(descr);
+    const body = { descr: '^' + toB64(bytes), offset: Math.max(0, offset) };
+    if (limit > 0) body.limit = limit;
     const data = await this.#req(
-      // TODO: restore /${offset}/${limit} path params once HSM API is fixed
       'POST', `${this.#baseUrl}/api/keymgmt/search`,
-      { descr: descrB64 }, token
+      body, token
     );
     return (data.list ?? []).map(entry => ({
       kid: entry.kid,
       label: entry.label ?? '',
       type: entry.type ?? '',
+      created: entry.created ?? null,
+      updated: entry.updated ?? null,
       description: entry.descr ? fromB64(entry.descr) : null,
     }));
   }

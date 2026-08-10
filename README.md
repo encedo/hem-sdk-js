@@ -67,7 +67,8 @@ Every JWT is issued for a scope that authorizes a class of operations:
 
 | Scope | Authorizes |
 |-------|------------|
-| `keymgmt:list` | `listKeys`, `searchKeys` |
+| `keymgmt:list` | `listKeys` |
+| `keymgmt:search` | `searchKeys` (or `keymgmt:list` + `auth:ext:pair`; no token at all when the device is configured with `allow_keysearch` and the pattern is ≥ 6 bytes) |
 | `keymgmt:gen` | `createKeyPair`, `deriveKey` |
 | `keymgmt:imp` | `importPublicKey` |
 | `keymgmt:upd` | `updateKey` |
