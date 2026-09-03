@@ -69,7 +69,8 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | Group | Operations |
 |-------|------------|
 | **Checkin** | `hemCheckin` — connection test + clock sync (call once, first); returns `newfws` / `newuis` when an update is available |
-| **Authentication** | `authorizePassword`, `authorizeRemote` (mobile push; cancelling withdraws the event), `initialize` (device initialisation) |
+| **Authentication** | `authorizePassword`, `authorizeRemote` (mobile push; cancelling withdraws the event), `authorizeMaster` (the 24 words), `initialize` (device initialisation) |
+| **Master secret** | `generateMnemonic`, `entropyToMnemonic`, `mnemonicToEntropy`, `validateMnemonic` — BIP39, where the entropy *is* the master key |
 | **Mobile authenticators** | `registerExtAuth` (pair; hands the QR payload to the caller), `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `getExtAuthMac` |
 | **Provisioning and domains** | `provision` / `installProvisioning` (device certificate), `registerDomain` (`<prefix>.ence.do` + TLS) |
 | **Key management** | `listKeys`, `searchKeys`, `getPubKey`, `createKeyPair`, `deriveKey`, `importPublicKey`, `updateKey`, `deleteKey` |
@@ -81,6 +82,20 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | **Cache** | `clearCache`, `clearKeys` |
 | **Broker** (`hem.broker`) | `checkin`, `session`, `eventNew`/`eventCheck`/`eventDelete`/`waitEvent`, `registerInit`/`registerCheck`/`registerFinalise`/`waitRegistration`, `subscribersList`/`subscribersDelete`, `download`, `domainPredefs`/`domainTaken`/`domainRegister`, `provisioning`, `shareEmailPubkey` |
 | **Helpers** (exported functions) | `verifyLog` (audit-log integrity, pure Web Crypto), `jwtParse` |
+
+### The master secret
+
+A HEM's master identity is 256 bits of entropy from the CSPRNG. Those 32 bytes
+**are** the master X25519 private key, and the same 32 bytes are what the 24
+words encode — so the words on a Proof of Personalization are the key itself:
+any BIP39 implementation decodes them, and the checksum catches a mistyped
+word before anything reaches the device.
+
+```js
+const mnemonic = await generateMnemonic();          // show it, print it, never store it
+await hem.initialize({ mnemonic }, userPassword, { user: 'Ann', hostname: 'my.ence.do' });
+const token = await hem.authorizeMaster(mnemonic, 'system:config');
+```
 
 Full signatures are in [`hem-sdk.browser.d.ts`](./hem-sdk.browser.d.ts).
 

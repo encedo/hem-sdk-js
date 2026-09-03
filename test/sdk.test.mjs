@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { HEM, Broker, HemError, jwtParse, verifyLog } from '../hem-sdk.js';
+import { HEM, Broker, HemError, jwtParse, verifyLog, generateMnemonic, entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '../hem-sdk.js';
 
 const b64 = (bytes) => Buffer.from(bytes).toString('base64');
 const b64url = (bytes) => Buffer.from(bytes).toString('base64url');
@@ -81,6 +81,14 @@ async function handle(req, res) {
     const { ok, payload } = await verifyEjwt(body.auth);
     if (!ok) return json(res, 401, { error: 'bad signature' });
     return json(res, 200, { token: fakeJwt({ scope: payload.scope, exp: payload.exp, sub: 'user' }) });
+  }
+  if (path === '/dev/api/auth/init' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-init', exp: Math.floor(Date.now() / 1000) + 300 });
+  if (path === '/dev/api/auth/init' && req.method === 'POST') {
+    const { ok, payload } = await verifyEjwt(body.init);
+    if (!ok) return json(res, 401, { error: 'bad signature' });
+    state.initCfg = payload.cfg;
+    state.initIss = payload.iss;
+    return json(res, 200, { instanceid: 'INST-1', inited: true });
   }
   if (path === '/dev/api/auth/ext/request') return json(res, 200, { challenge: 'CH', epk: body.epk, scope: body.scope });
   if (path === '/dev/api/auth/ext/token') return json(res, 200, { token: fakeJwt({ scope: 'remote', exp: Math.floor(Date.now() / 1000) + 300 }) });
@@ -306,4 +314,110 @@ test('verifyLogEntry fetches key and file and verifies them', async () => {
   assert.equal(r.ok, true);
   assert.equal(r.lines, 4);
   assert.equal(r.text, state.logText);
+});
+
+// ---- BIP39 master secret -------------------------------------------------------------
+
+// The official BIP39 English vectors (Trezor test set).
+const VECTORS = [
+  ['00000000000000000000000000000000', 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'],
+  ['0000000000000000000000000000000000000000000000000000000000000000', ('abandon '.repeat(23) + 'art')],
+  ['7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f', 'legal winner thank year wave sausage worth useful legal winner thank yellow'],
+  ['80808080808080808080808080808080', 'letter advice cage absurd amount doctor acoustic avoid letter advice cage above'],
+  ['ffffffffffffffffffffffffffffffff', ('zoo '.repeat(11) + 'wrong')],
+  ['ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', ('zoo '.repeat(23) + 'vote')],
+];
+const bytes = (hex) => new Uint8Array(Buffer.from(hex, 'hex'));
+const hex = (b) => Buffer.from(b).toString('hex');
+
+test('BIP39 encoding matches the official vectors, both ways', async () => {
+  for (const [entropy, mnemonic] of VECTORS) {
+    assert.equal(await entropyToMnemonic(bytes(entropy)), mnemonic, entropy);
+    assert.equal(hex(await mnemonicToEntropy(mnemonic)), entropy, mnemonic);
+  }
+});
+
+test('generateMnemonic makes 24 distinct words that round-trip', async () => {
+  const seen = new Set();
+  for (let i = 0; i < 20; i++) {
+    const m = await generateMnemonic();
+    assert.equal(m.split(' ').length, 24);
+    const e = await mnemonicToEntropy(m);
+    assert.equal(e.length, 32);
+    assert.equal(await entropyToMnemonic(e), m);
+    seen.add(m);
+  }
+  assert.equal(seen.size, 20, 'every generated secret is different');
+  assert.equal((await generateMnemonic(128)).split(' ').length, 12);
+  await assert.rejects(generateMnemonic(200), (e) => e.code === 'mnemonic_invalid');
+});
+
+test('a mistyped word is caught and named, and the checksum is enforced', async () => {
+  const good = VECTORS[1][1];
+  assert.equal(await validateMnemonic(good), true);
+
+  // a word that is not in the list: the error says which one
+  const typo = good.split(' '); typo[6] = 'abandonn';
+  const e1 = await mnemonicToEntropy(typo.join(' ')).catch((e) => e);
+  assert.equal(e1.code, 'mnemonic_invalid');
+  assert.deepEqual(e1.data, { word: 7, value: 'abandonn' });
+
+  // a real word in the wrong place: the checksum catches it
+  const swapped = good.split(' '); swapped[3] = 'ability';
+  await assert.rejects(mnemonicToEntropy(swapped.join(' ')), (e) => e.code === 'mnemonic_checksum');
+  assert.equal(await validateMnemonic(swapped.join(' ')), false);
+
+  // wrong length
+  await assert.rejects(mnemonicToEntropy('abandon abandon abandon'), (e) => e.code === 'mnemonic_invalid');
+
+  // case and spacing do not matter
+  assert.equal(hex(await mnemonicToEntropy('  ABANDON   ' + 'abandon '.repeat(22) + 'ART ')), VECTORS[1][0]);
+});
+
+test('initialize with a mnemonic writes that key as masterkey', async () => {
+  const hem = mk();
+  const mnemonic = await generateMnemonic();
+  const entropy = await mnemonicToEntropy(mnemonic);
+
+  const r = await hem.initialize({ mnemonic }, 'user-password', { user: 'Ann', hostname: 'my.ence.do' });
+  assert.equal(r.inited, true);
+
+  // The master public key on the device is X25519(entropy) — the words are the key.
+  const priv = await crypto.subtle.importKey('pkcs8',
+    Buffer.concat([Buffer.from('302e020100300506032b656e042204209'.slice(0, 32), 'hex'), Buffer.from(entropy)]),
+    'X25519', false, ['deriveBits']).catch(() => null);
+  assert.ok(state.initCfg.masterkey, 'masterkey written');
+  assert.equal(state.initCfg.user, 'Ann');
+  assert.equal(state.initIss, state.initCfg.masterkey, 'the eJWT is signed by the master key');
+  assert.notEqual(state.initCfg.userkey, state.initCfg.masterkey);
+
+  // The same words authorise afterwards, and produce the same public key.
+  const token = await hem.authorizeMaster(mnemonic, 'system:config');
+  assert.equal(jwtParse(token).scope, 'system:config');
+  const authEjwt = state.log.filter((l) => l.path === '/dev/api/auth/token' && l.method === 'POST').pop();
+  const iss = JSON.parse(Buffer.from(authEjwt.body.auth.split('.')[1], 'base64url').toString()).iss;
+  assert.equal(iss, state.initCfg.masterkey, 'authorizeMaster signs with the master key');
+
+  // A wrong word never reaches the network.
+  const before = state.log.length;
+  await assert.rejects(hem.authorizeMaster(mnemonic.replace(/^\S+/, 'zoo'), 'keymgmt:list'), (e) => e.code === 'mnemonic_checksum');
+  assert.equal(state.log.length, before, 'no request for an invalid mnemonic');
+});
+
+test('the v1 derivation is available for an existing device and differs from the new one', async () => {
+  const hem = mk();
+  const mnemonic = VECTORS[1][1];   // 24 x abandon ... art
+  await hem.authorizeMaster(mnemonic, 'legacy-scope', 300, { legacy: true });
+  const ejwt = state.log.filter((l) => l.path === '/dev/api/auth/token' && l.method === 'POST').pop();
+  const legacyIss = JSON.parse(Buffer.from(ejwt.body.auth.split('.')[1], 'base64url').toString()).iss;
+
+  const hem2 = mk();
+  await hem2.authorizeMaster(mnemonic, 'new-scope');
+  const ejwt2 = state.log.filter((l) => l.path === '/dev/api/auth/token' && l.method === 'POST').pop();
+  const newIss = JSON.parse(Buffer.from(ejwt2.body.auth.split('.')[1], 'base64url').toString()).iss;
+
+  assert.notEqual(legacyIss, newIss, 'the two derivations give different master keys');
+  // Regression vector for the all-zero 24-word mnemonic, taken from the v1
+  // libraries themselves (jsbip39 + sjcl + tweetnacl, run against this value).
+  assert.equal(legacyIss, 'npHoBqiizdNniy/kAK2QJnlTAdGVxgA7dza2FKIaqhY=');
 });

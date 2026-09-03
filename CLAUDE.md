@@ -94,32 +94,28 @@ methods in the table, never make `broker` mandatory in the constructor, and
 keep `HemError.code` values stable. Re-check this table before a breaking
 change; extend it when a new consumer appears.
 
-## Planned: BIP39 master passphrase (Manager, dashboard stage)
+## The master secret (BIP39)
 
-The Manager keeps the 24-word master passphrase (printed on the Proof of
-Personalization PDF). Two additions, both pure Web Crypto plus an embedded
-English wordlist:
+256 bits from `crypto.getRandomValues` ARE the master X25519 private key, and
+the same 32 bytes are what the 24 words encode: `generateMnemonic` ->
+`initialize({ mnemonic }, userPassword, cfg)` -> `authorizeMaster(mnemonic,
+scope)`. Recovery is `mnemonicToEntropy`, which validates the checksum and
+names the offending word, so a wrong word never reaches the device. The English
+wordlist is embedded (2048 words, SHA-256 of the newline-joined list
+`2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda`); tests pin
+the official Trezor vectors.
 
-1. `initialize` variant taking a mnemonic (or a ready 32-byte admin seed) for
-   the admin key instead of `adminPassword`.
-2. `authorizeMaster(mnemonic, scope)` for the settings page.
+The v1 Manager derived the master key differently: the BIP39 *seed*
+(PBKDF2-HMAC-SHA512, 2048 rounds, salt "mnemonic") and then the 32 bytes
+starting one hex character in (`seedHex.substr(1, 64)`), so every key byte
+straddles two seed bytes. It loses no entropy, but no standard tool reproduces
+it and v1 never checked the checksum. `legacyMasterSeed` reproduces it byte for
+byte (cross-checked against jsbip39 + sjcl + tweetnacl), reachable only as
+`authorizeMaster(..., { legacy: true })`, for devices already in the field.
+Never derive a new master key that way.
 
-The v1 Manager derives the admin key as
-`nacl.box.keyPair.fromSecretKey(fromHex(seedHex.substr(1, 64)))` — one hex
-character INTO the BIP39 seed (`m.toSeed(words)` from jsbip39, PBKDF2-SHA512,
-2048 rounds, salt `mnemonic`). Devices in the field were personalised that way,
-and the master-passphrase login in the v1 Manager (core2 `settings_by_passphrase`)
-uses the same `substr(1, 64)`, so it is consistent end to end: the key is a
-32-byte window starting one nibble into the 64-byte seed, every byte
-straddling two seed bytes. Nobody remembers why; the likely cause is
-`substr(start, length)` written with 1-based `start` in mind (`substr(0, 64)`
-intended). It costs no entropy (256 uniformly random bits either way) but no
-standard BIP39/BIP32 tool derives the same key. Reproduce it exactly as the
-"master key v1" derivation, cover it with a test vector taken from a real
-personalisation, and never change it silently: a corrected derivation would
-need a marker in the device config and would apply to new personalisations
-only. `usbMode` is not used by the Manager (USB ACM
-uploads have their own webshell); keep the method for other callers.
+`usbMode` is not used by the Manager (USB ACM uploads have their own webshell);
+the method stays for other callers.
 
 ## API spec source
 

@@ -334,6 +334,263 @@ function bytesEqual(a, b) {
   return diff === 0;
 }
 
+/** A 32-byte seed -> X25519 key pair: non-extractable private key + base64 public key. */
+async function keysFromSeed(seed) {
+  const privKey = await x25519PrivKey(seed);
+  return { privKey, pubkeyB64: toB64(await x25519(privKey, X25519_BASE_POINT)) };
+}
+
+// --- BIP39: the master secret -------------------------------------------------
+//
+// The master secret of a HEM is 256 bits of entropy from the system CSPRNG.
+// Those 32 bytes ARE the master X25519 private key, and the same 32 bytes are
+// what the 24 words encode. So the words on a Proof of Personalization are the
+// key: any BIP39 implementation decodes them back to the entropy, the checksum
+// catches a mistyped word, and nothing else has to be kept.
+//
+// (The v1 Manager instead ran the words through the BIP39 seed function and
+// took a 32-byte window one hex character into the 512-bit result. It loses no
+// entropy, but no standard tool reproduces it, and recovery never checked the
+// checksum. `authorizeMaster` can still derive that way for a device
+// personalised by v1 -- see its `legacy` option.)
+
+const BIP39_ENGLISH = (
+  'abandon ability able about above absent absorb abstract absurd abuse access accident account ' +
+  'accuse achieve acid acoustic acquire across act action actor actress actual adapt add addict ' +
+  'address adjust admit adult advance advice aerobic affair afford afraid again age agent agree ' +
+  'ahead aim air airport aisle alarm album alcohol alert alien all alley allow almost alone alpha ' +
+  'already also alter always amateur amazing among amount amused analyst anchor ancient anger angle ' +
+  'angry animal ankle announce annual another answer antenna antique anxiety any apart apology ' +
+  'appear apple approve april arch arctic area arena argue arm armed armor army around arrange ' +
+  'arrest arrive arrow art artefact artist artwork ask aspect assault asset assist assume asthma ' +
+  'athlete atom attack attend attitude attract auction audit august aunt author auto autumn average ' +
+  'avocado avoid awake aware away awesome awful awkward axis baby bachelor bacon badge bag balance ' +
+  'balcony ball bamboo banana banner bar barely bargain barrel base basic basket battle beach bean ' +
+  'beauty because become beef before begin behave behind believe below belt bench benefit best ' +
+  'betray better between beyond bicycle bid bike bind biology bird birth bitter black blade blame ' +
+  'blanket blast bleak bless blind blood blossom blouse blue blur blush board boat body boil bomb ' +
+  'bone bonus book boost border boring borrow boss bottom bounce box boy bracket brain brand brass ' +
+  'brave bread breeze brick bridge brief bright bring brisk broccoli broken bronze broom brother ' +
+  'brown brush bubble buddy budget buffalo build bulb bulk bullet bundle bunker burden burger burst ' +
+  'bus business busy butter buyer buzz cabbage cabin cable cactus cage cake call calm camera camp ' +
+  'can canal cancel candy cannon canoe canvas canyon capable capital captain car carbon card cargo ' +
+  'carpet carry cart case cash casino castle casual cat catalog catch category cattle caught cause ' +
+  'caution cave ceiling celery cement census century cereal certain chair chalk champion change ' +
+  'chaos chapter charge chase chat cheap check cheese chef cherry chest chicken chief child chimney ' +
+  'choice choose chronic chuckle chunk churn cigar cinnamon circle citizen city civil claim clap ' +
+  'clarify claw clay clean clerk clever click client cliff climb clinic clip clock clog close cloth ' +
+  'cloud clown club clump cluster clutch coach coast coconut code coffee coil coin collect color ' +
+  'column combine come comfort comic common company concert conduct confirm congress connect ' +
+  'consider control convince cook cool copper copy coral core corn correct cost cotton couch ' +
+  'country couple course cousin cover coyote crack cradle craft cram crane crash crater crawl crazy ' +
+  'cream credit creek crew cricket crime crisp critic crop cross crouch crowd crucial cruel cruise ' +
+  'crumble crunch crush cry crystal cube culture cup cupboard curious current curtain curve cushion ' +
+  'custom cute cycle dad damage damp dance danger daring dash daughter dawn day deal debate debris ' +
+  'decade december decide decline decorate decrease deer defense define defy degree delay deliver ' +
+  'demand demise denial dentist deny depart depend deposit depth deputy derive describe desert ' +
+  'design desk despair destroy detail detect develop device devote diagram dial diamond diary dice ' +
+  'diesel diet differ digital dignity dilemma dinner dinosaur direct dirt disagree discover disease ' +
+  'dish dismiss disorder display distance divert divide divorce dizzy doctor document dog doll ' +
+  'dolphin domain donate donkey donor door dose double dove draft dragon drama drastic draw dream ' +
+  'dress drift drill drink drip drive drop drum dry duck dumb dune during dust dutch duty dwarf ' +
+  'dynamic eager eagle early earn earth easily east easy echo ecology economy edge edit educate ' +
+  'effort egg eight either elbow elder electric elegant element elephant elevator elite else embark ' +
+  'embody embrace emerge emotion employ empower empty enable enact end endless endorse enemy energy ' +
+  'enforce engage engine enhance enjoy enlist enough enrich enroll ensure enter entire entry ' +
+  'envelope episode equal equip era erase erode erosion error erupt escape essay essence estate ' +
+  'eternal ethics evidence evil evoke evolve exact example excess exchange excite exclude excuse ' +
+  'execute exercise exhaust exhibit exile exist exit exotic expand expect expire explain expose ' +
+  'express extend extra eye eyebrow fabric face faculty fade faint faith fall false fame family ' +
+  'famous fan fancy fantasy farm fashion fat fatal father fatigue fault favorite feature february ' +
+  'federal fee feed feel female fence festival fetch fever few fiber fiction field figure file film ' +
+  'filter final find fine finger finish fire firm first fiscal fish fit fitness fix flag flame ' +
+  'flash flat flavor flee flight flip float flock floor flower fluid flush fly foam focus fog foil ' +
+  'fold follow food foot force forest forget fork fortune forum forward fossil foster found fox ' +
+  'fragile frame frequent fresh friend fringe frog front frost frown frozen fruit fuel fun funny ' +
+  'furnace fury future gadget gain galaxy gallery game gap garage garbage garden garlic garment gas ' +
+  'gasp gate gather gauge gaze general genius genre gentle genuine gesture ghost giant gift giggle ' +
+  'ginger giraffe girl give glad glance glare glass glide glimpse globe gloom glory glove glow glue ' +
+  'goat goddess gold good goose gorilla gospel gossip govern gown grab grace grain grant grape ' +
+  'grass gravity great green grid grief grit grocery group grow grunt guard guess guide guilt ' +
+  'guitar gun gym habit hair half hammer hamster hand happy harbor hard harsh harvest hat have hawk ' +
+  'hazard head health heart heavy hedgehog height hello helmet help hen hero hidden high hill hint ' +
+  'hip hire history hobby hockey hold hole holiday hollow home honey hood hope horn horror horse ' +
+  'hospital host hotel hour hover hub huge human humble humor hundred hungry hunt hurdle hurry hurt ' +
+  'husband hybrid ice icon idea identify idle ignore ill illegal illness image imitate immense ' +
+  'immune impact impose improve impulse inch include income increase index indicate indoor industry ' +
+  'infant inflict inform inhale inherit initial inject injury inmate inner innocent input inquiry ' +
+  'insane insect inside inspire install intact interest into invest invite involve iron island ' +
+  'isolate issue item ivory jacket jaguar jar jazz jealous jeans jelly jewel job join joke journey ' +
+  'joy judge juice jump jungle junior junk just kangaroo keen keep ketchup key kick kid kidney kind ' +
+  'kingdom kiss kit kitchen kite kitten kiwi knee knife knock know lab label labor ladder lady lake ' +
+  'lamp language laptop large later latin laugh laundry lava law lawn lawsuit layer lazy leader ' +
+  'leaf learn leave lecture left leg legal legend leisure lemon lend length lens leopard lesson ' +
+  'letter level liar liberty library license life lift light like limb limit link lion liquid list ' +
+  'little live lizard load loan lobster local lock logic lonely long loop lottery loud lounge love ' +
+  'loyal lucky luggage lumber lunar lunch luxury lyrics machine mad magic magnet maid mail main ' +
+  'major make mammal man manage mandate mango mansion manual maple marble march margin marine ' +
+  'market marriage mask mass master match material math matrix matter maximum maze meadow mean ' +
+  'measure meat mechanic medal media melody melt member memory mention menu mercy merge merit merry ' +
+  'mesh message metal method middle midnight milk million mimic mind minimum minor minute miracle ' +
+  'mirror misery miss mistake mix mixed mixture mobile model modify mom moment monitor monkey ' +
+  'monster month moon moral more morning mosquito mother motion motor mountain mouse move movie ' +
+  'much muffin mule multiply muscle museum mushroom music must mutual myself mystery myth naive ' +
+  'name napkin narrow nasty nation nature near neck need negative neglect neither nephew nerve nest ' +
+  'net network neutral never news next nice night noble noise nominee noodle normal north nose ' +
+  'notable note nothing notice novel now nuclear number nurse nut oak obey object oblige obscure ' +
+  'observe obtain obvious occur ocean october odor off offer office often oil okay old olive ' +
+  'olympic omit once one onion online only open opera opinion oppose option orange orbit orchard ' +
+  'order ordinary organ orient original orphan ostrich other outdoor outer output outside oval oven ' +
+  'over own owner oxygen oyster ozone pact paddle page pair palace palm panda panel panic panther ' +
+  'paper parade parent park parrot party pass patch path patient patrol pattern pause pave payment ' +
+  'peace peanut pear peasant pelican pen penalty pencil people pepper perfect permit person pet ' +
+  'phone photo phrase physical piano picnic picture piece pig pigeon pill pilot pink pioneer pipe ' +
+  'pistol pitch pizza place planet plastic plate play please pledge pluck plug plunge poem poet ' +
+  'point polar pole police pond pony pool popular portion position possible post potato pottery ' +
+  'poverty powder power practice praise predict prefer prepare present pretty prevent price pride ' +
+  'primary print priority prison private prize problem process produce profit program project ' +
+  'promote proof property prosper protect proud provide public pudding pull pulp pulse pumpkin ' +
+  'punch pupil puppy purchase purity purpose purse push put puzzle pyramid quality quantum quarter ' +
+  'question quick quit quiz quote rabbit raccoon race rack radar radio rail rain raise rally ramp ' +
+  'ranch random range rapid rare rate rather raven raw razor ready real reason rebel rebuild recall ' +
+  'receive recipe record recycle reduce reflect reform refuse region regret regular reject relax ' +
+  'release relief rely remain remember remind remove render renew rent reopen repair repeat replace ' +
+  'report require rescue resemble resist resource response result retire retreat return reunion ' +
+  'reveal review reward rhythm rib ribbon rice rich ride ridge rifle right rigid ring riot ripple ' +
+  'risk ritual rival river road roast robot robust rocket romance roof rookie room rose rotate ' +
+  'rough round route royal rubber rude rug rule run runway rural sad saddle sadness safe sail salad ' +
+  'salmon salon salt salute same sample sand satisfy satoshi sauce sausage save say scale scan ' +
+  'scare scatter scene scheme school science scissors scorpion scout scrap screen script scrub sea ' +
+  'search season seat second secret section security seed seek segment select sell seminar senior ' +
+  'sense sentence series service session settle setup seven shadow shaft shallow share shed shell ' +
+  'sheriff shield shift shine ship shiver shock shoe shoot shop short shoulder shove shrimp shrug ' +
+  'shuffle shy sibling sick side siege sight sign silent silk silly silver similar simple since ' +
+  'sing siren sister situate six size skate sketch ski skill skin skirt skull slab slam sleep ' +
+  'slender slice slide slight slim slogan slot slow slush small smart smile smoke smooth snack ' +
+  'snake snap sniff snow soap soccer social sock soda soft solar soldier solid solution solve ' +
+  'someone song soon sorry sort soul sound soup source south space spare spatial spawn speak ' +
+  'special speed spell spend sphere spice spider spike spin spirit split spoil sponsor spoon sport ' +
+  'spot spray spread spring spy square squeeze squirrel stable stadium staff stage stairs stamp ' +
+  'stand start state stay steak steel stem step stereo stick still sting stock stomach stone stool ' +
+  'story stove strategy street strike strong struggle student stuff stumble style subject submit ' +
+  'subway success such sudden suffer sugar suggest suit summer sun sunny sunset super supply ' +
+  'supreme sure surface surge surprise surround survey suspect sustain swallow swamp swap swarm ' +
+  'swear sweet swift swim swing switch sword symbol symptom syrup system table tackle tag tail ' +
+  'talent talk tank tape target task taste tattoo taxi teach team tell ten tenant tennis tent term ' +
+  'test text thank that theme then theory there they thing this thought three thrive throw thumb ' +
+  'thunder ticket tide tiger tilt timber time tiny tip tired tissue title toast tobacco today ' +
+  'toddler toe together toilet token tomato tomorrow tone tongue tonight tool tooth top topic ' +
+  'topple torch tornado tortoise toss total tourist toward tower town toy track trade traffic ' +
+  'tragic train transfer trap trash travel tray treat tree trend trial tribe trick trigger trim ' +
+  'trip trophy trouble truck true truly trumpet trust truth try tube tuition tumble tuna tunnel ' +
+  'turkey turn turtle twelve twenty twice twin twist two type typical ugly umbrella unable unaware ' +
+  'uncle uncover under undo unfair unfold unhappy uniform unique unit universe unknown unlock until ' +
+  'unusual unveil update upgrade uphold upon upper upset urban urge usage use used useful useless ' +
+  'usual utility vacant vacuum vague valid valley valve van vanish vapor various vast vault vehicle ' +
+  'velvet vendor venture venue verb verify version very vessel veteran viable vibrant vicious ' +
+  'victory video view village vintage violin virtual virus visa visit visual vital vivid vocal ' +
+  'voice void volcano volume vote voyage wage wagon wait walk wall walnut want warfare warm warrior ' +
+  'wash wasp waste water wave way wealth weapon wear weasel weather web wedding weekend weird ' +
+  'welcome west wet whale what wheat wheel when where whip whisper wide width wife wild will win ' +
+  'window wine wing wink winner winter wire wisdom wise wish witness wolf woman wonder wood wool ' +
+  'word work world worry worth wrap wreck wrestle wrist write wrong yard year yellow you young ' +
+  'youth zebra zero zone zoo'
+).split(' ');
+
+const BIP39_INDEX = new Map(BIP39_ENGLISH.map((w, i) => [w, i]));
+
+/** Normalise as BIP39 requires: NFKD, lower case, single spaces. */
+function normaliseMnemonic(mnemonic) {
+  return String(mnemonic).normalize('NFKD').toLowerCase().trim().split(/\s+/).join(' ');
+}
+
+/**
+ * A fresh master secret: `strengthBits` of entropy from the CSPRNG, as words.
+ *
+ * @param {number} [strengthBits=256]  128-256, a multiple of 32 (256 -> 24 words)
+ * @returns {Promise<string>}  The mnemonic. Show it, print it, pass it to initialize().
+ */
+async function generateMnemonic(strengthBits = 256) {
+  if (strengthBits % 32 || strengthBits < 128 || strengthBits > 256) {
+    throw new HemError(`Strength must be 128-256 bits and a multiple of 32, got ${strengthBits}`, { code: 'mnemonic_invalid' });
+  }
+  return entropyToMnemonic(crypto.getRandomValues(new Uint8Array(strengthBits / 8)));
+}
+
+/**
+ * Entropy -> words. The last word carries a SHA-256 checksum of the entropy.
+ *
+ * @param {Uint8Array} entropy  16-32 bytes, length a multiple of 4
+ * @returns {Promise<string>}
+ */
+async function entropyToMnemonic(entropy) {
+  if (!(entropy instanceof Uint8Array) || entropy.length % 4 || entropy.length < 16 || entropy.length > 32) {
+    throw new HemError('Entropy must be 16-32 bytes and a multiple of 4', { code: 'mnemonic_invalid' });
+  }
+  const checksum = (await sha256(entropy))[0] >> (8 - entropy.length / 4);
+  let bits = '';
+  for (const b of entropy) bits += b.toString(2).padStart(8, '0');
+  bits += checksum.toString(2).padStart(entropy.length / 4, '0');
+
+  const words = [];
+  for (let i = 0; i < bits.length / 11; i++) words.push(BIP39_ENGLISH[parseInt(bits.slice(i * 11, i * 11 + 11), 2)]);
+  return words.join(' ');
+}
+
+/**
+ * Words -> entropy, checking the checksum. The error names the word that is not
+ * in the list, or says the checksum failed, so a caller can tell a person what
+ * to look at rather than "wrong passphrase".
+ *
+ * @param {string} mnemonic
+ * @returns {Promise<Uint8Array>}  The entropy -- for a master secret, the private key itself
+ */
+async function mnemonicToEntropy(mnemonic) {
+  const words = normaliseMnemonic(mnemonic).split(' ').filter(Boolean);
+  if (words.length < 12 || words.length > 24 || words.length % 3) {
+    throw new HemError(`A mnemonic is 12 to 24 words, in multiples of three; got ${words.length}`, { code: 'mnemonic_invalid', data: { words: words.length } });
+  }
+  let bits = '';
+  for (const [i, w] of words.entries()) {
+    const idx = BIP39_INDEX.get(w);
+    if (idx === undefined) {
+      throw new HemError(`Word ${i + 1} is not a BIP39 word: "${w}"`, { code: 'mnemonic_invalid', data: { word: i + 1, value: w } });
+    }
+    bits += idx.toString(2).padStart(11, '0');
+  }
+  const entropyBits = (words.length * 11 * 32) / 33;
+  const entropy = new Uint8Array(entropyBits / 8);
+  for (let i = 0; i < entropy.length; i++) entropy[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
+
+  const expected = (await sha256(entropy))[0] >> (8 - entropy.length / 4);
+  if (parseInt(bits.slice(entropyBits), 2) !== expected) {
+    throw new HemError('The mnemonic checksum does not match: a word is wrong or out of order', { code: 'mnemonic_checksum' });
+  }
+  return entropy;
+}
+
+/** Whether the words are a well-formed mnemonic with a matching checksum. */
+async function validateMnemonic(mnemonic) {
+  try { await mnemonicToEntropy(mnemonic); return true; } catch { return false; }
+}
+
+/**
+ * The v1 Manager's master-key derivation, for a device personalised by it:
+ * the BIP39 seed (PBKDF2-HMAC-SHA512, 2048 rounds, salt "mnemonic"), then the
+ * 32 bytes starting one hex character in. Kept only so an existing device can
+ * still be opened; never derive a NEW master key this way.
+ */
+async function legacyMasterSeed(mnemonic) {
+  const key = await crypto.subtle.importKey('raw', strToBytes(normaliseMnemonic(mnemonic)), 'PBKDF2', false, ['deriveBits']);
+  const seed = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: strToBytes('mnemonic'), iterations: 2048, hash: 'SHA-512' }, key, 512));
+  // The v1 code took seedHex.substr(1, 64): each byte is the low nibble of one
+  // seed byte and the high nibble of the next.
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) out[i] = ((seed[i] & 0x0f) << 4) | (seed[i + 1] >> 4);
+  return out;
+}
+
 // --- Broker (api.encedo.com) --------------------------------------------------
 //
 // Everything that talks to the Encedo backend lives here, and only here. The
@@ -813,9 +1070,47 @@ class HEM {
     if (!this.#derivedKeys) {
       throw new HemError('Password required (no cached keys)', { code: 'auth_password_required' });
     }
-    const { privKey, pubkeyB64 } = this.#derivedKeys;
+    return this.#authorizeWithKeys(this.#derivedKeys, challenge, scope, expSeconds);
+  }
 
-    // Build JWT payload
+  // -- Authorization: Master secret (the 24 words) ------------------------------
+
+  /**
+   * Authenticate with the master secret from the Proof of Personalization.
+   *
+   * The words decode to the 32 bytes that ARE the master private key, so this
+   * is the same two-step flow as authorizePassword with a different key source.
+   * A wrong word is caught before any request: mnemonicToEntropy throws
+   * `mnemonic_invalid` (naming the word) or `mnemonic_checksum`.
+   *
+   * The master key is the device's admin identity: it authorises anything,
+   * including a new user password. Do not cache the mnemonic anywhere.
+   *
+   * @param {string} mnemonic   12-24 BIP39 words
+   * @param {string} scope
+   * @param {number} [expSeconds=300]
+   * @param {object} [opts]
+   * @param {boolean} [opts.legacy=false]  Device personalised by the v1 Manager,
+   *   whose master key came from the BIP39 seed at a one-nibble offset.
+   * @returns {Promise<string>}  JWT token
+   */
+  async authorizeMaster(mnemonic, scope, expSeconds = 300, { legacy = false } = {}) {
+    const cached = this.#cacheFind(scope);
+    if (cached) return cached;
+
+    const seed = legacy ? await legacyMasterSeed(mnemonic) : await mnemonicToEntropy(mnemonic);
+    if (seed.length !== 32) {
+      throw new HemError('The master secret must be 24 words (256 bits)', { code: 'mnemonic_invalid', data: { bytes: seed.length } });
+    }
+    const keys = await keysFromSeed(seed);
+    seed.fill(0);
+
+    const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
+    return this.#authorizeWithKeys(keys, challenge, scope, expSeconds);
+  }
+
+  /** Sign the device's challenge with `keys` and exchange it for a scoped token. */
+  async #authorizeWithKeys({ privKey, pubkeyB64 }, challenge, scope, expSeconds) {
     const iat = Math.floor(Date.now() / 1000) - 5;   // -5s for clock drift
     const payload = {
       jti: challenge.jti,
@@ -826,7 +1121,6 @@ class HEM {
       scope,
     };
 
-    // Build eJWT and send
     const ejwt = await this.#buildEjwt(privKey, challenge.spk, payload);
     const resp = await this.#req('POST', `${this.#baseUrl}/api/auth/token`, { auth: ejwt });
 
@@ -968,12 +1262,17 @@ class HEM {
    *   1. GET  /api/auth/init  -> challenge { eid, spk, jti, exp }
    *   2. POST /api/auth/init  { init: eJWT } -> result
    *
-   * The eJWT carries a `cfg` block and is signed with the ADMIN key.
-   * Both the admin and user X25519 key pairs are derived from their
-   * passwords (PBKDF2, salt = challenge.eid); their public keys are written
-   * into `cfg` as `masterkey` / `userkey` automatically.
+   * The eJWT carries a `cfg` block and is signed with the ADMIN key. The public
+   * keys are written into `cfg` as `masterkey` / `userkey` automatically.
    *
-   * @param {string} adminPassword  Master/admin passphrase
+   * The admin (master) identity should be a BIP39 master secret: call
+   * generateMnemonic(), show the words, print them, and pass them here. Those
+   * 24 words decode to the 32 bytes that ARE the master private key, so any
+   * BIP39 tool can recover it and a mistyped word is caught by the checksum.
+   * A password string is still accepted (PBKDF2, salt = challenge.eid) for
+   * callers that want one.
+   *
+   * @param {string|{mnemonic: string}|{entropy: Uint8Array}} admin  Master secret
    * @param {string} userPassword   Local user passphrase
    * @param {object} [cfg]          Device config: { user, email, hostname,
    *                                trusted_ts, trusted_backend, allow_keysearch,
@@ -982,30 +1281,45 @@ class HEM {
    *                                passed here.
    * @returns {Promise<object>}     Initialization result from the device
    */
-  async initialize(adminPassword, userPassword, cfg = {}) {
+  async initialize(admin, userPassword, cfg = {}) {
     // Phase 1 -- challenge
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/init`);
     // { eid: string (salt), spk: base64 (device X25519 pubkey), jti, exp }
 
-    // Derive both key pairs (PBKDF2 salt = challenge.eid)
-    const admin = await this.#deriveX25519(adminPassword, challenge.eid);
-    const user  = await this.#deriveX25519(userPassword,  challenge.eid);
+    // The admin (master) identity: the 24 words, raw entropy, or a password.
+    let adminKeys;
+    if (typeof admin === 'string') {
+      adminKeys = await this.#deriveX25519(admin, challenge.eid);
+    } else if (admin?.mnemonic) {
+      const entropy = await mnemonicToEntropy(admin.mnemonic);
+      if (entropy.length !== 32) throw new HemError('The master secret must be 24 words (256 bits)', { code: 'mnemonic_invalid' });
+      adminKeys = await keysFromSeed(entropy);
+      entropy.fill(0);
+    } else if (admin?.entropy instanceof Uint8Array) {
+      if (admin.entropy.length !== 32) throw new HemError('The master secret must be 32 bytes', { code: 'mnemonic_invalid' });
+      adminKeys = await keysFromSeed(admin.entropy);
+    } else {
+      throw new HemError('initialize needs a master secret: { mnemonic }, { entropy } or a password string', { code: 'mnemonic_invalid' });
+    }
+
+    // The user identity is always a password (PBKDF2 salt = challenge.eid)
+    const user = await this.#deriveX25519(userPassword, challenge.eid);
 
     const payload = {
       jti: challenge.jti,
       aud: challenge.spk,
       exp: challenge.exp,
       iat: Math.floor(Date.now() / 1000),
-      iss: admin.pubkeyB64,
+      iss: adminKeys.pubkeyB64,
       cfg: {
         ...cfg,
-        masterkey: admin.pubkeyB64,
+        masterkey: adminKeys.pubkeyB64,
         userkey: user.pubkeyB64,
       },
     };
 
     // eJWT signed with the ADMIN key
-    const ejwt = await this.#buildEjwt(admin.privKey, challenge.spk, payload);
+    const ejwt = await this.#buildEjwt(adminKeys.privKey, challenge.spk, payload);
     return this.#req('POST', `${this.#baseUrl}/api/auth/init`, { init: ejwt });
   }
 
@@ -2051,5 +2365,5 @@ class HEM {
 
 }
 
-export { Broker, HEM, HemError, jwtParse, verifyLog };
+export { Broker, HEM, HemError, entropyToMnemonic, generateMnemonic, jwtParse, mnemonicToEntropy, validateMnemonic, verifyLog };
 //# sourceMappingURL=hem-sdk.browser.js.map

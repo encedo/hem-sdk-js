@@ -19,6 +19,16 @@ export interface LogVerification {
 /** Verify an audit-log file against the device's logger key (`key` from getLoggerKey()). */
 export declare function verifyLog(signerKey: string, logText: string): Promise<LogVerification>;
 
+/**
+ * BIP39 master secret. The entropy behind the words IS the master X25519
+ * private key, so the 24 words on a Proof of Personalization are the key.
+ */
+export declare function generateMnemonic(strengthBits?: number): Promise<string>;
+export declare function entropyToMnemonic(entropy: Uint8Array): Promise<string>;
+/** Throws HemError `mnemonic_invalid` (naming the word) or `mnemonic_checksum`. */
+export declare function mnemonicToEntropy(mnemonic: string): Promise<Uint8Array>;
+export declare function validateMnemonic(mnemonic: string): Promise<boolean>;
+
 export interface PollOpts {
   pollInterval?: number;
   pollTimeout?: number;
@@ -144,8 +154,15 @@ export declare class HEM {
 
   getAttestation(token: string): Promise<{ genuine: string; [key: string]: unknown }>;
 
-  /** Provision a factory-fresh device. masterkey/userkey are derived automatically. */
-  initialize(adminPassword: string, userPassword: string, cfg?: Record<string, unknown>): Promise<unknown>;
+  /**
+   * Provision a factory-fresh device. Pass the master secret as `{ mnemonic }`
+   * (from generateMnemonic) or `{ entropy }`; a password string still works.
+   * masterkey/userkey are written into cfg automatically.
+   */
+  initialize(admin: string | { mnemonic: string } | { entropy: Uint8Array }, userPassword: string, cfg?: Record<string, unknown>): Promise<unknown>;
+
+  /** Authenticate with the 24-word master secret. `legacy`: device personalised by the v1 Manager. */
+  authorizeMaster(mnemonic: string, scope: string, expSeconds?: number, opts?: { legacy?: boolean }): Promise<string>;
 
   /** Broker MAC data for the paired-authenticator calls; listExtAuth / deleteExtAuth do the round trip. */
   getExtAuthMac(token: string): Promise<ExtAuthMac>;

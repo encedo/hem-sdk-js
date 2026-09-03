@@ -108,13 +108,48 @@ Offer the phone only when one is paired — no token needed to ask:
 if (await hem.hasExtAuth()) startRemoteLogin(); else showPasswordForm();
 ```
 
-### Device initialization (provisioning)
+### The master secret
 
-One-time provisioning of a factory-fresh device. `masterkey` / `userkey` are
-derived from the passwords automatically — you only supply the metadata.
+A device's master identity is 256 bits from the CSPRNG. Those 32 bytes **are**
+the master X25519 private key, and the same 32 bytes are what the 24 words
+encode — so the words are the key, and any BIP39 tool decodes them back.
 
 ```js
-const result = await hem.initialize('admin-passphrase', 'user-passphrase', {
+import { generateMnemonic, mnemonicToEntropy, validateMnemonic } from './hem-sdk.js';
+
+const mnemonic = await generateMnemonic();     // 24 words; show them, print them
+// ... the person writes them down ...
+const token = await hem.authorizeMaster(mnemonic, 'system:config');
+```
+
+A mistyped word is caught before any request, and the error says which:
+
+```js
+try {
+  await hem.authorizeMaster(typed, 'system:config');
+} catch (e) {
+  if (e.code === 'mnemonic_invalid') showError(`Word ${e.data.word} is not a BIP39 word.`);
+  else if (e.code === 'mnemonic_checksum') showError('One of the words is wrong or out of order.');
+  else throw e;
+}
+```
+
+A device personalised by the **v1 Manager** has a master key derived the old
+way (the BIP39 seed at a one-nibble offset). Only for those:
+
+```js
+await hem.authorizeMaster(mnemonic, 'system:config', 300, { legacy: true });
+```
+
+### Device initialization (provisioning)
+
+One-time provisioning of a factory-fresh device. Pass the master secret as
+`{ mnemonic }`; `masterkey` / `userkey` are written into the config
+automatically — you only supply the metadata.
+
+```js
+const mnemonic = await generateMnemonic();
+const result = await hem.initialize({ mnemonic }, 'user-passphrase', {
   user: 'John Doe',
   email: 'john@example.com',
   hostname: 'abc.ence.do',
@@ -125,6 +160,9 @@ const result = await hem.initialize('admin-passphrase', 'user-passphrase', {
   origin: '*',
 });
 ```
+
+A password string is still accepted where a caller wants one:
+`hem.initialize('admin-passphrase', 'user-passphrase', cfg)`.
 
 ### Register a mobile authenticator (pairing)
 
@@ -492,7 +530,8 @@ try {
     // codes: network, timeout, aborted, http_<status>, checkin_error,
     //        broker_error, auth_failed, auth_password_required, denied,
     //        sign_error, verify_failed, ecdh_error, hmac_error, cipher_error,
-    //        pqc_error, ext_register_error, domain_error
+    //        pqc_error, ext_register_error, domain_error, mnemonic_invalid,
+    //        mnemonic_checksum
   } else {
     throw e;
   }
