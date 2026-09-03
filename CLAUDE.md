@@ -26,10 +26,19 @@ updated separately. **Always make SDK changes here**, never in a downstream copy
 
 ## Architecture
 
-- One class, `HEM`, plus a `HemError` error class. Both `export`ed.
+- Two classes, `HEM` (the device) and `Broker` (the backend at
+  api.encedo.com), plus `HemError`, plus the exported helpers `verifyLog` and
+  `jwtParse`. **Every call to api.encedo.com lives in `Broker`, one method per
+  endpoint.** `HEM` holds one (`hem.broker`, built from `opts.broker`, a URL or
+  an instance) and composes broker calls with device calls in the multi-step
+  flows (`hemCheckin`, `authorizeRemote`, `registerExtAuth`, `listExtAuth`,
+  `provision`, `registerDomain`). A device behind an air gap never needs the
+  broker: keep it that way — no device-only method may call it.
 - Private fields/methods use `#` (true private). Public methods are thin
-  wrappers over the private transport.
-- `#req(method, url, body, token, opts)` — the single HTTP entry point.
+  wrappers over the transport.
+- `httpRequest(method, url, opts)` — the single HTTP entry point, module-level,
+  shared by both classes; `HEM.#req` and `Broker.#req` are one-line wrappers
+  that add the base URL, the debug flag and a log tag.
   - Default: JSON request (`application/json`, body `JSON.stringify`d).
   - `opts = { binary: true, filename }` → `application/octet-stream` upload of
     a raw `Uint8Array` (used by firmware/UI upgrade).
@@ -45,6 +54,14 @@ updated separately. **Always make SDK changes here**, never in a downstream copy
   - Only `getVersion` / `getStatus` expose it so far — they are what a login
     screen probes with. Any other method needs one more parameter, no new
     machinery.
+  - `opts = { onProgress }` → the request goes through `XMLHttpRequest`
+    (browser only), the one transport with upload progress events. Used by
+    `uploadFirmware` / `uploadUi`.
+  - `opts = { bytes: true }` → the body comes back as a `Uint8Array`
+    (`Broker.download`). `opts = { withStatus: true }` → `{ status, headers,
+    data }`, so a poll can tell 202 "pending" from 200 "done".
+  - Cancellation is uniform: an aborted request, an aborted poll and an aborted
+    wait all reject with `HemError` code `aborted` (not a DOMException).
   - In Node.js, requests with a body go through `#reqNode` (`https.request`
     with an explicit `Content-Length`) — embedded devices reject `undici`'s
     chunked encoding with HTTP 411. `#reqNode` accepts a string or `Uint8Array`.
@@ -76,13 +93,19 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
 4. Document the **required scope** in the JSDoc.
 5. Multi-step / polling flows (broker interaction): model them on
    `authorizeRemote` / `registerExtAuth` — support `pollInterval`,
-   `pollTimeout`, `onPending`, `signal`.
-6. Keep it dependency-free and DOM-free. Visualization (e.g. rendering a QR
+   `pollTimeout`, `onPending`, `signal`. The loop itself is `Broker.#poll`;
+   add a `waitX()` on `Broker` and compose it from `HEM`. A flow that leaves
+   something pending on the broker when cancelled must withdraw it (see
+   `authorizeRemote` deleting its event).
+6. A new backend endpoint is a new `Broker` method, never a URL inside `HEM`.
+7. Keep it dependency-free and DOM-free. Visualization (e.g. rendering a QR
    code) stays out of the SDK — hand data to the caller via a callback.
+8. Cover it in `test/sdk.test.mjs`: extend the mock with the endpoint and add
+   a `test()` that drives the public method.
 
 ## After any change to `hem-sdk.js`
 
-1. `node --check hem-sdk.js` — syntax gate.
+1. `node --check hem-sdk.js` — syntax gate; then `node --test test/sdk.test.mjs`.
 2. Rebuild the browser bundle: `npx rollup -c rollup.browser.config.js`.
 3. Update `hem-sdk.browser.d.ts` with the new/changed signatures.
 4. Update `README.md` (group table) and `EXAMPLES.md` if the public API changed.
@@ -97,4 +120,12 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
   base64-encoded with a leading `^`. These mismatches silently break against a
   current device — see the methods for the exact shaping.
 - Storage lock/unlock has no disk argument: the disk is selected by the token
-  scope (`storage:disk<N>:rw`).
+  scope (`storage:disk<N>:rw`). The Manager v1 called `/unlock/ro` and
+  `/unlock/rw`; those sub-paths are legacy (hem-api-tester test_12 uses the
+  bare path).
+- The QR payload of `registerExtAuth` carries `hash = base64(SHA-256(request))`
+  over the device's ext-auth challenge; the phone checks it. Key order in the
+  JSON matters.
+- `domainTaken` reads the broker's 200 as "taken" and 404 as "free" (the v1
+  Manager treated any failure as free); confirm against the backend before
+  relying on it in a UI.

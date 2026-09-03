@@ -4,6 +4,75 @@ export declare class HemError extends Error {
   data: unknown;
 }
 
+/** Decode a JWT payload without verifying it. Returns null on malformed input. */
+export declare function jwtParse(jwt: string): Record<string, any> | null;
+
+export interface LogVerification {
+  ok: boolean;
+  /** Entries verified so far (all of them when ok). */
+  lines: number;
+  /** Counter of the first entry that failed. */
+  line?: number;
+  reason?: 'signature' | 'sequence' | 'no_key' | 'hmac';
+}
+
+/** Verify an audit-log file against the device's logger key (`key` from getLoggerKey()). */
+export declare function verifyLog(signerKey: string, logText: string): Promise<LogVerification>;
+
+export interface PollOpts {
+  pollInterval?: number;
+  pollTimeout?: number;
+  onPending?: () => void;
+  signal?: AbortSignal;
+}
+
+/** MAC data from HEM.getExtAuthMac(); what the broker's paired-authenticator calls take. */
+export interface ExtAuthMac {
+  nonce: string;
+  mac: string;
+  eid: string;
+  epk: string;
+}
+
+/**
+ * The Encedo backend (api.encedo.com). Every call to it lives here; a device
+ * behind an air gap never needs one. HEM composes these with device calls and
+ * exposes its instance as `hem.broker`.
+ */
+export declare class Broker {
+  constructor(url?: string, opts?: { debug?: boolean });
+  readonly url: string;
+
+  checkin(check: Record<string, unknown>): Promise<{ checked: string; [key: string]: unknown }>;
+  /** With eid: the device's session, { epk, paired }. Without: an ephemeral session for one remote authorisation. */
+  session(eid?: string | null): Promise<{ epk: string; paired?: boolean; [key: string]: unknown }>;
+
+  eventNew(challenge: Record<string, unknown>): Promise<{ eventid: string }>;
+  /** null while pending (HTTP 202). */
+  eventCheck(eventid: string, opts?: { signal?: AbortSignal }): Promise<Record<string, unknown> | null>;
+  eventDelete(eventid: string): Promise<unknown>;
+  waitEvent(eventid: string, opts?: PollOpts): Promise<{ authreply?: string; deny?: boolean; [key: string]: unknown }>;
+
+  registerInit(args: { epk: string; eid: string; request: string }): Promise<{ rid: string; link: string }>;
+  registerCheck(rid: string, opts?: { signal?: AbortSignal }): Promise<{ pid: string; reply: string } | null>;
+  registerFinalise(rid: string, confirmation: Record<string, unknown>): Promise<unknown>;
+  waitRegistration(rid: string, opts?: PollOpts): Promise<{ pid: string; reply: string }>;
+
+  subscribersList(mac: ExtAuthMac): Promise<Array<{ pid: string; [key: string]: unknown }>>;
+  subscribersDelete(mac: ExtAuthMac & { pid: string }): Promise<unknown>;
+
+  /** Image announced by hemCheckin() as `newfws` / `newuis`, as bytes. */
+  download(kind: 'firmware' | 'dashboard', version: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<Uint8Array>;
+
+  domainPredefs(): Promise<{ prefix: string[] }>;
+  /** true when `<prefix>.ence.do` is already registered (200); false on 404; other failures throw. */
+  domainTaken(prefix: string): Promise<boolean>;
+  domainRegister(prefix: string, args: { genuine: string; csr?: string | null; ip?: string | null }): Promise<{ emp: string; key: string; crt: string; [key: string]: unknown }>;
+
+  provisioning(args: { csr: string; key: string; genuine: string }): Promise<Record<string, unknown>>;
+  shareEmailPubkey(email: string, shareCode: Record<string, unknown>, auth?: string): Promise<unknown>;
+}
+
 export interface HemKey {
   kid: string;
   label: string;
@@ -49,18 +118,28 @@ export interface HemCipherResult {
 }
 
 export declare class HEM {
-  constructor(hsmUrl: string, opts?: { broker?: string; debug?: boolean });
+  constructor(hsmUrl: string, opts?: { broker?: string | Broker; debug?: boolean });
 
-  hemCheckin(): Promise<void>;
+  /** The Broker this instance uses for every api.encedo.com call. */
+  readonly broker: Broker;
+
+  /**
+   * 3-step check-in (device, broker, device). Resolves with the device's
+   * answer; `newfws` / `newuis` announce a newer firmware / UI image.
+   * Throws `broker_error` or `network` when the broker is unreachable.
+   */
+  hemCheckin(): Promise<{ status: string; newfws?: string; newuis?: string; [key: string]: unknown }>;
 
   /** Pass null or '' to reuse cached derived keys (set on first call with a real password). */
   authorizePassword(password: string | null, scope: string, expSeconds?: number): Promise<string>;
 
-  authorizeRemote(scope: string, opts?: {
-    pollInterval?: number;
-    pollTimeout?: number;
-    onPending?: () => void;
-    signal?: AbortSignal;
+  /**
+   * Mobile push authorisation. Cancelling (`signal`) or timing out withdraws
+   * the event from the broker; rejects with code `aborted`, `timeout` or `denied`.
+   */
+  authorizeRemote(scope: string, opts?: PollOpts & {
+    /** Called once with the broker event id. */
+    onEvent?: (eventid: string) => void;
   }): Promise<string>;
 
   getAttestation(token: string): Promise<{ genuine: string; [key: string]: unknown }>;
@@ -68,8 +147,14 @@ export declare class HEM {
   /** Provision a factory-fresh device. masterkey/userkey are derived automatically. */
   initialize(adminPassword: string, userPassword: string, cfg?: Record<string, unknown>): Promise<unknown>;
 
-  /** Get broker MAC data to list the device's paired external authenticators. */
-  getExtAuthMac(token: string): Promise<{ nonce: string; mac: string; eid: string }>;
+  /** Broker MAC data for the paired-authenticator calls; listExtAuth / deleteExtAuth do the round trip. */
+  getExtAuthMac(token: string): Promise<ExtAuthMac>;
+  /** Authenticators paired with the device. Scope: system:config. */
+  listExtAuth(token: string): Promise<Array<{ pid: string; [key: string]: unknown }>>;
+  /** Unpair one authenticator on the broker; its keychain entry ('RVhUQUlE' + pid) is deleted with deleteKey(). */
+  deleteExtAuth(token: string, pid: string): Promise<unknown>;
+  /** Whether any authenticator is paired. No token needed. */
+  hasExtAuth(): Promise<boolean>;
 
   /** Pair a mobile external authenticator. token needs the 'system:config' scope. */
   registerExtAuth(token: string, opts?: {
@@ -81,11 +166,7 @@ export declare class HEM {
       qrText: string,
       qrPayload: { link: string; hash: string; user?: string; email?: string; hostname?: string },
     ) => void;
-    pollInterval?: number;
-    pollTimeout?: number;
-    onPending?: () => void;
-    signal?: AbortSignal;
-  }): Promise<unknown>;
+  } & PollOpts): Promise<unknown>;
 
   listKeys(token: string, offset?: number, limit?: number): Promise<HemKey[]>;
   /**
@@ -127,10 +208,17 @@ export declare class HEM {
   selftest(token: string): Promise<unknown>;
 
   usbMode(token: string): Promise<unknown>;
-  uploadFirmware(token: string, bytes: Uint8Array, filename?: string): Promise<unknown>;
+  uploadFirmware(token: string, bytes: Uint8Array, filename?: string, opts?: {
+    /** (loaded, total) in bytes; browser only. */
+    onProgress?: (loaded: number, total: number) => void;
+    signal?: AbortSignal;
+  }): Promise<unknown>;
   checkFirmware(token: string): Promise<unknown>;
   installFirmware(token: string): Promise<unknown>;
-  uploadUi(token: string, bytes: Uint8Array, filename?: string): Promise<unknown>;
+  uploadUi(token: string, bytes: Uint8Array, filename?: string, opts?: {
+    onProgress?: (loaded: number, total: number) => void;
+    signal?: AbortSignal;
+  }): Promise<unknown>;
   checkUi(token: string): Promise<unknown>;
   installUi(token: string): Promise<unknown>;
 
@@ -140,6 +228,15 @@ export declare class HEM {
   getLoggerKey(token: string): Promise<Record<string, unknown>>;
   listLog(token: string, offset?: number): Promise<Record<string, unknown>>;
   getLogEntry(token: string, id: string | number): Promise<Record<string, unknown>>;
+
+  /** Install the certificate Broker.provisioning() issued. 403 on a provisioned device. */
+  installProvisioning(cert: Record<string, unknown>, token?: string | null): Promise<unknown>;
+  /** Provision if the attestation still carries a CSR; resolves null when already provisioned. */
+  provision(token?: string | null): Promise<Record<string, unknown> | null>;
+  /** Register `<prefix>.ence.do` and install the TLS block. Scope: system:config. */
+  registerDomain(token: string, prefix: string, opts?: { ip?: string | null; newCertificate?: boolean }): Promise<Record<string, unknown>>;
+  /** Fetch one log file and verify it with verifyLog(). Scope: logger:get. */
+  verifyLogEntry(token: string, id: string | number): Promise<LogVerification & { text: string }>;
 
   clearCache(): void;
 

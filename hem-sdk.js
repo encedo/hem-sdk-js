@@ -1,15 +1,19 @@
 /**
- * hem-sdk.js -- Encedo HEM Browser SDK
+ * hem-sdk.js -- Encedo HEM SDK (browser + Node.js)
  *
- * Implements a subset of the PHP HEM SDK for browser use (signin.html).
- * Covers the operations needed for the OIDC Trusted App flow (Faza 4):
- *   - Password-based auth (eJWT via PBKDF2 + X25519 ECDH)
- *   - Remote auth via broker polling (mobile push)
- *   - Key listing
- *   - Key-operation authorization (PIN or mobile)
- *   - Ed25519 signing
+ * A dependency-free client for the Encedo HEM hardware security device.
  *
- * Requires: Chrome 113+ / Firefox 130+ (X25519 in Web Crypto API)
+ *   HEM     -- the device: authentication (password, mobile push), provisioning,
+ *              pairing, key management, /api/crypto/*, system, upgrade, storage,
+ *              audit log. Everything a device behind an air gap can do works
+ *              without the broker.
+ *   Broker  -- the Encedo backend (api.encedo.com): check-in, push events,
+ *              pairing sessions, paired-authenticator lists, downloads, *.ence.do
+ *              domains and TLS, provisioning, key sharing. One method per
+ *              endpoint; HEM composes them with device calls.
+ *   verifyLog, jwtParse -- pure helpers.
+ *
+ * Requires: Chrome 113+ / Firefox 130+ (X25519 in Web Crypto API), Node.js 18+
  * Dependencies: none (pure Web Crypto + fetch)
  */
 
@@ -71,7 +75,8 @@ function strToBytes(s) {
 
 // --- JWT helpers --------------------------------------------------------------
 
-function jwtParse(jwt) {
+/** Decode a JWT payload without verifying it (scope, exp, sub...). Returns null on malformed input. */
+export function jwtParse(jwt) {
   try {
     const parts = jwt.split('.');
     if (parts.length !== 3) return null;
@@ -89,6 +94,523 @@ export class HemError extends Error {
     this.status = status;
     this.data = data;
   }
+}
+
+// --- HTTP transport -----------------------------------------------------------
+//
+// One entry point for every request the SDK makes, to the device and to the
+// broker alike. JSON in, JSON out by default. `binary` sends a raw Uint8Array as
+// application/octet-stream (firmware / UI upgrade); `bytes` returns the response
+// body as a Uint8Array (downloads). `signal` / `timeoutMs` cancel the request
+// itself, not merely the wait for it. `onProgress(loaded, total)` reports upload
+// progress -- browser only, through XMLHttpRequest, which fetch cannot do.
+// `withStatus` returns { status, headers, data } instead of `data`, so a caller
+// can tell a 202 "still pending" from a 200 "done" without a second request.
+// Non-2xx responses throw HemError.
+
+async function httpRequest(method, url, {
+  body = null, token = null, binary = false, filename = null, bytes = false,
+  signal = null, timeoutMs = 0, onProgress = null, withStatus = false,
+  debug = false, tag = 'HEM',
+} = {}) {
+  let headers, payload;
+  if (binary) {
+    headers = { 'Content-Type': 'application/octet-stream' };
+    if (filename) headers['Content-Disposition'] = `attachment; filename="${filename}"`;
+    payload = body;                                    // Uint8Array -- sent as-is
+  } else {
+    headers = { 'Content-Type': 'application/json' };
+    payload = body !== null ? JSON.stringify(body) : null;
+  }
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  if (debug) {
+    console.debug(`[${tag}] ->`, method, url);
+    console.debug(`[${tag}] req headers:`, JSON.stringify(headers));
+    console.debug(`[${tag}] req body:`, binary
+      ? `(binary, ${payload?.length ?? 0} bytes)`
+      : (payload ?? '(none)'));
+  }
+
+  // In Node.js, undici (built-in fetch) uses chunked transfer encoding by
+  // default, which some embedded devices reject with HTTP 411.
+  // Detect Node.js and use https.request directly to set Content-Length.
+  const isNode = typeof process !== 'undefined' && process.versions?.node;
+
+  let status, resHeaders, data;
+
+  if (isNode && payload !== null) {
+    ({ status, headers: resHeaders, data } = await requestNode(method, url, headers, payload, { signal, timeoutMs, debug, tag }));
+  } else if (onProgress && typeof XMLHttpRequest !== 'undefined') {
+    ({ status, headers: resHeaders, data } = await requestXhr(method, url, headers, payload, { signal, timeoutMs, onProgress, bytes }));
+  } else {
+    const fetchOpts = { method, headers };
+    if (payload !== null) fetchOpts.body = payload;
+    const abort = abortSignalFor(signal, timeoutMs);
+    if (abort) fetchOpts.signal = abort;
+
+    let res;
+    try {
+      res = await fetch(url, fetchOpts);
+    } catch (e) {
+      // A cancelled request is not an unreachable device, and a caller that
+      // cannot tell them apart will report the wrong thing to a user. Without
+      // this they all arrive as `network`.
+      if (e?.name === 'TimeoutError') throw new HemError(`Request timeout after ${timeoutMs} ms`, { code: 'timeout' });
+      if (e?.name === 'AbortError') throw new HemError('Request aborted', { code: 'aborted' });
+      throw new HemError(`Network error: ${e.message}`, { code: 'network' });
+    }
+
+    status = res.status;
+    resHeaders = Object.fromEntries(res.headers.entries());
+    const ct = res.headers.get('content-type') ?? '';
+    if (bytes && res.ok) {
+      data = new Uint8Array(await res.arrayBuffer());
+    } else if (ct.includes('json')) {
+      try { data = await res.json(); } catch { data = null; }
+    } else {
+      data = await res.text();
+    }
+  }
+
+  if (debug) {
+    console.debug(`[${tag}] <- status:`, status);
+    console.debug(`[${tag}] res headers:`, JSON.stringify(resHeaders));
+    console.debug(`[${tag}] res body:`, bytes && data instanceof Uint8Array ? `(binary, ${data.length} bytes)` : JSON.stringify(data));
+  }
+
+  if (status < 200 || status >= 300) {
+    throw new HemError(
+      `${tag} ${method} ${url} -> HTTP ${status}`,
+      { code: `http_${status}`, status, data }
+    );
+  }
+  return withStatus ? { status, headers: resHeaders, data } : data;
+}
+
+/**
+ * The signal a request should run under: the caller's, a deadline, or both.
+ *
+ * `timeoutMs` exists because the alternative callers reach for is racing the
+ * promise against a timer -- which stops WAITING for the request without
+ * stopping the request. A page that polls an absent device that way
+ * accumulates one open connection per attempt, and they all complete at once
+ * when the device appears.
+ */
+function abortSignalFor(signal, timeoutMs) {
+  if (!timeoutMs) return signal ?? null;
+  const deadline = AbortSignal.timeout(timeoutMs);
+  if (!signal) return deadline;
+  return typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, deadline]) : signal;
+}
+
+// Browser upload with progress. fetch() has no upload progress events, so a
+// firmware image going to the device over a slow link would sit behind a
+// spinner for minutes; XMLHttpRequest reports every chunk.
+function requestXhr(method, url, headers, payload, { signal = null, timeoutMs = 0, onProgress = null, bytes = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, url, true);
+    for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v);
+    if (timeoutMs) xhr.timeout = timeoutMs;
+    if (bytes) xhr.responseType = 'arraybuffer';
+    if (onProgress) xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
+    xhr.onload = () => {
+      const resHeaders = {};
+      for (const line of xhr.getAllResponseHeaders().trim().split(/[\r\n]+/)) {
+        const i = line.indexOf(':');
+        if (i > 0) resHeaders[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim();
+      }
+      let data;
+      if (bytes) {
+        data = new Uint8Array(xhr.response);
+      } else {
+        data = xhr.responseText;
+        if ((resHeaders['content-type'] ?? '').includes('json')) {
+          try { data = JSON.parse(data); } catch { data = null; }
+        }
+      }
+      resolve({ status: xhr.status, headers: resHeaders, data });
+    };
+    xhr.onerror = () => reject(new HemError('Network error', { code: 'network' }));
+    xhr.ontimeout = () => reject(new HemError(`Request timeout after ${timeoutMs} ms`, { code: 'timeout' }));
+    xhr.onabort = () => reject(new HemError('Request aborted', { code: 'aborted' }));
+    if (signal) {
+      if (signal.aborted) { reject(new HemError('Request aborted', { code: 'aborted' })); return; }
+      signal.addEventListener('abort', () => xhr.abort(), { once: true });
+    }
+    xhr.send(payload);
+  });
+}
+
+// Node.js-specific HTTP request using https.request (sets Content-Length explicitly)
+async function requestNode(method, url, headers, body, { signal = null, timeoutMs = 0, debug = false, tag = 'HEM' } = {}) {
+  const { default: https } = await import('node:https');
+  const { default: http } = await import('node:http');
+  const { URL: NodeURL } = await import('node:url');
+
+  const parsed = new NodeURL(url);
+  // body is a JSON string or a Uint8Array (binary upload) -- normalise to Buffer
+  const payloadBuf = typeof body === 'string' ? Buffer.from(body, 'utf8') : Buffer.from(body);
+  const reqHeaders = {
+    ...headers,
+    'Content-Length': payloadBuf.length.toString(),
+  };
+
+  if (debug) {
+    console.debug(`[${tag}] reqNode headers sent:`, JSON.stringify(reqHeaders));
+  }
+
+  return new Promise((resolve, reject) => {
+    const lib = parsed.protocol === 'https:' ? https : http;
+    const req = lib.request({
+      method,
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      headers: reqHeaders,
+      agent: false,   // fresh TLS connection per request (HSM doesn't pool)
+      timeout: timeoutMs || 15000,
+    }, (res) => {
+      let raw = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => {
+        if (debug) console.debug(`[${tag}] res chunk:`, chunk);
+        raw += chunk;
+      });
+      res.on('end', () => {
+        if (debug) console.debug(`[${tag}] res status:`, res.statusCode, 'raw:', raw);
+        const resHeaders = res.headers;
+        let data;
+        const ct = res.headers['content-type'] ?? '';
+        if (ct.includes('json')) {
+          try { data = JSON.parse(raw); } catch { data = raw; }
+        } else {
+          data = raw;
+        }
+        resolve({ status: res.statusCode, headers: resHeaders, data });
+      });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new HemError('Request timeout', { code: 'timeout' }));
+    });
+    req.on('error', e => {
+      if (debug) console.debug(`[${tag}] req error:`, e.message);
+      reject(new HemError(`Network error: ${e.message}`, { code: 'network' }));
+    });
+    // The caller's signal has to reach the socket here as well, or the same
+    // call is cancellable in a browser and not in Node.
+    if (signal) {
+      const onAbort = () => { req.destroy(); reject(new HemError('Request aborted', { code: 'aborted' })); };
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+      req.on('close', () => signal.removeEventListener('abort', onAbort));
+    }
+    req.write(payloadBuf);
+    req.end();
+  });
+}
+
+// Wait, unless the caller cancels first. Cancelling rejects with the same
+// `aborted` HemError a cancelled request produces, so one catch handles both.
+function sleep(ms, signal = null) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new HemError('Request aborted', { code: 'aborted' })); return; }
+    const onAbort = () => { clearTimeout(t); reject(new HemError('Request aborted', { code: 'aborted' })); };
+    const t = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function sha256(bytes) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+}
+
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+// --- Broker (api.encedo.com) --------------------------------------------------
+//
+// Everything that talks to the Encedo backend lives here, and only here. The
+// device does not need it: a HEM behind an air gap authorises with a password,
+// manages keys, unlocks storage and reads its log without one broker call.
+// The broker is needed for: the clock check-in, mobile push authorisation,
+// pairing and listing mobile authenticators, software downloads, `*.ence.do`
+// domains with their TLS certificates, device provisioning, and sharing a key
+// by e-mail.
+//
+// One method per endpoint, plus the two polling loops. HEM composes them with
+// device calls; a page that needs a broker-only call (a domain check while the
+// user types) reaches it through `hem.broker`.
+
+export class Broker {
+  #url;
+  #debug;
+
+  /**
+   * @param {string} [url='https://api.encedo.com']  Broker base URL
+   * @param {object} [opts]
+   * @param {boolean} [opts.debug=false]  Log requests to console
+   */
+  constructor(url = 'https://api.encedo.com', { debug = false } = {}) {
+    this.#url = url.replace(/\/+$/, '');
+    this.#debug = debug;
+  }
+
+  /** Broker base URL, without a trailing slash. */
+  get url() { return this.#url; }
+
+  #req(method, path, body = null, opts = {}) {
+    return httpRequest(method, `${this.#url}${path}`, { body, debug: this.#debug, tag: 'Broker', ...opts });
+  }
+
+  // -- Check-in ----------------------------------------------------------------
+
+  /** Step 2 of the check-in: the broker counter-signs the device's challenge. */
+  checkin(check) {
+    return this.#req('POST', '/checkin', check);
+  }
+
+  // -- Sessions ----------------------------------------------------------------
+
+  /**
+   * Open a broker session.
+   *
+   * With `eid` (the device id from its config or auth challenge) the session
+   * belongs to that device and the reply also says whether it has any paired
+   * authenticator: { epk, paired }. Without `eid` the session is an ephemeral
+   * key for one remote authorisation: { epk, ... } -- pass the whole object on
+   * to /api/auth/ext/request.
+   *
+   * @param {string|null} [eid]
+   * @returns {Promise<{epk: string, paired?: boolean}>}
+   */
+  session(eid = null) {
+    return eid
+      ? this.#req('POST', '/notify/session', { eid })
+      : this.#req('GET', '/notify/session');
+  }
+
+  // -- Remote authorisation events ---------------------------------------------
+
+  /** Publish a device challenge as a push event: { eventid }. */
+  eventNew(challenge) {
+    return this.#req('POST', '/notify/event/new', challenge);
+  }
+
+  /** One poll. Resolves null while the phone has not answered yet (HTTP 202). */
+  async eventCheck(eventid, { signal = null } = {}) {
+    const r = await this.#req('GET', `/notify/event/check/${eventid}`, null, { signal, withStatus: true });
+    return r.status === 202 ? null : r.data;
+  }
+
+  /** Withdraw a pending event, so the phone stops showing it. */
+  eventDelete(eventid) {
+    return this.#req('DELETE', `/notify/event/${eventid}`);
+  }
+
+  /**
+   * Poll an event until the phone answers, the caller cancels, or `pollTimeout`
+   * passes. Resolves with the broker's answer ({ authreply } or { deny }).
+   * Rejects with HemError `aborted` or `timeout`; the event is left as it is --
+   * HEM.authorizeRemote deletes it.
+   */
+  waitEvent(eventid, opts = {}) {
+    return this.#poll(() => this.eventCheck(eventid, opts), 'Remote auth timed out', opts);
+  }
+
+  // -- Pairing a mobile authenticator ------------------------------------------
+
+  /** Start a pairing: { rid, link }. `link` goes into the QR code. */
+  registerInit({ epk, eid, request }) {
+    return this.#req('POST', '/notify/register/init', { epk, eid, request });
+  }
+
+  /** One poll. Resolves null until the QR has been scanned (HTTP 202), then { pid, reply }. */
+  async registerCheck(rid, { signal = null } = {}) {
+    const r = await this.#req('GET', `/notify/register/check/${rid}`, null, { signal, withStatus: true });
+    return r.status === 202 ? null : r.data;
+  }
+
+  /** Close a pairing with the device's confirmation of the phone's reply. */
+  registerFinalise(rid, confirmation) {
+    return this.#req('POST', `/notify/register/finalise/${rid}`, confirmation);
+  }
+
+  /** Poll a pairing until the phone has scanned the QR code. */
+  waitRegistration(rid, opts = {}) {
+    return this.#poll(() => this.registerCheck(rid, opts), 'Ext authenticator registration timed out', opts);
+  }
+
+  // -- Paired authenticators ---------------------------------------------------
+  //
+  // Both take the object HEM.getExtAuthMac returns ({ nonce, mac, eid, epk }):
+  // the device proves to the broker that whoever asks holds a system:config
+  // token, and the broker answers for that device only.
+
+  /** Authenticators paired with the device: [{ pid, ... }]. */
+  subscribersList(mac) {
+    return this.#req('POST', '/notify/subscribers/list', mac);
+  }
+
+  /** Remove one paired authenticator; `mac.pid` names it. */
+  subscribersDelete(mac) {
+    return this.#req('POST', '/notify/subscribers/delete', mac);
+  }
+
+  // -- Software downloads ------------------------------------------------------
+
+  /**
+   * Download a firmware or UI image announced by the check-in.
+   *
+   * @param {'firmware'|'dashboard'} kind
+   * @param {string} version   `newfws` / `newuis` from HEM.hemCheckin(), verbatim
+   * @returns {Promise<Uint8Array>}  Image bytes, ready for HEM.uploadFirmware / uploadUi
+   */
+  download(kind, version, { signal = null, timeoutMs = 0 } = {}) {
+    const v = version.replace(/\//g, '_').replace(/\+/g, '-').replace(/=+$/, '');
+    const path = kind === 'firmware' ? `/download/firmware/${v}/bin` : `/download/dashboard/${v}`;
+    return this.#req('GET', path, null, { bytes: true, signal, timeoutMs });
+  }
+
+  // -- *.ence.do domains and TLS -----------------------------------------------
+
+  /** Prefixes the broker offers for `<prefix>.ence.do` hostnames: { prefix: [...] }. */
+  domainPredefs() {
+    return this.#req('GET', '/domain/predefs');
+  }
+
+  /**
+   * Whether `<prefix>.ence.do` is already registered.
+   *
+   * The broker answers 200 for a registered name and 404 for a free one; any
+   * other failure is thrown, because "unreachable" must not read as "free".
+   *
+   * @returns {Promise<boolean>}  true when taken
+   */
+  async domainTaken(prefix) {
+    try {
+      await this.#req('GET', `/domain/check/${encodeURIComponent(prefix)}`);
+      return true;
+    } catch (e) {
+      if (e instanceof HemError && e.status === 404) return false;
+      throw e;
+    }
+  }
+
+  /**
+   * Register (or re-register) `<prefix>.ence.do` for a device and obtain its
+   * TLS material: { emp, key, crt }, which goes to the device as
+   * setConfig(token, { tls }). `genuine` is the device attestation; `csr` and
+   * `ip` are given when a new certificate is requested.
+   */
+  domainRegister(prefix, { genuine, csr = null, ip = null }) {
+    const body = { genuine };
+    if (csr) body.csr = csr;
+    if (ip) body.ip = ip;
+    return this.#req('POST', `/domain/register/${encodeURIComponent(prefix)}`, body);
+  }
+
+  // -- Provisioning ------------------------------------------------------------
+
+  /**
+   * Turn a device's CSR into its certificate. Takes the { csr, key, genuine }
+   * fields of HEM.getAttestation() on an unprovisioned device; the result is
+   * installed with HEM.installProvisioning().
+   */
+  provisioning({ csr, key, genuine }) {
+    return this.#req('POST', '/provisioning', { csr, key, genuine });
+  }
+
+  // -- Sharing -----------------------------------------------------------------
+
+  /**
+   * E-mail a share code (the object HEM's key-share page builds) to someone.
+   *
+   * @param {string} email
+   * @param {object} shareCode   Sent as base64(JSON)
+   * @param {string} [auth='']
+   */
+  shareEmailPubkey(email, shareCode, auth = '') {
+    return this.#req('POST', '/share/emailpubkey', {
+      email,
+      msg: toB64(strToBytes(JSON.stringify(shareCode))),
+      auth,
+    });
+  }
+
+  // -- Polling -----------------------------------------------------------------
+
+  async #poll(step, timeoutMessage, { pollInterval = 2_000, pollTimeout = 60_000, onPending = null, signal = null } = {}) {
+    const deadline = Date.now() + pollTimeout;
+    while (Date.now() < deadline) {
+      await sleep(pollInterval, signal);
+      if (onPending) onPending();
+      const result = await step();
+      if (result !== null) return result;
+    }
+    throw new HemError(timeoutMessage, { code: 'timeout' });
+  }
+}
+
+// --- Audit log verification ---------------------------------------------------
+
+/**
+ * Verify an audit-log file against the device's logger key.
+ *
+ * The log is a text file, one entry per line, fields separated by `|`, the
+ * first field a hex counter. A line whose third and fourth fields are 0 is a
+ * key line: field 5 carries a fresh HMAC key (a nonce) and field 6 the logger
+ * key's Ed25519 signature over it. Every line, key lines included, ends with
+ * the first 16 bytes of HMAC-SHA256(current nonce, line up to and including
+ * the last `|`). Counters must run without gaps (a repeat is allowed).
+ * Comment lines start with `#`.
+ *
+ * Pure Web Crypto, no device call: pass what getLoggerKey() and getLogEntry()
+ * returned. Requires Ed25519 in Web Crypto (Chrome 137+ / Firefox 130+ / Node 18+).
+ *
+ * @param {string} signerKey  `key` from HEM.getLoggerKey(): base64 Ed25519 public key
+ * @param {string} logText    The log file
+ * @returns {Promise<{ok: boolean, lines: number, line?: number, reason?: 'signature'|'sequence'|'no_key'|'hmac'}>}
+ *          `line` and `reason` name the first entry that failed
+ */
+export async function verifyLog(signerKey, logText) {
+  const pubKey = await crypto.subtle.importKey('raw', fromB64(signerKey), { name: 'Ed25519' }, false, ['verify']);
+  let hmacKey = null;
+  let counter = 0;
+  let lines = 0;
+
+  for (const line of logText.split('\n')) {
+    if (!line || line[0] === '#' || line.length < 3) continue;
+
+    const f = line.split('|');
+    const n = parseInt(f[0], 16);
+
+    if (f[2] == 0 && f[3] == 0) {
+      // Key line: the nonce becomes the HMAC key for what follows.
+      const nonce = fromB64(f[4]);
+      const sig = fromB64(f[5]);
+      const ok = await crypto.subtle.verify({ name: 'Ed25519' }, pubKey, sig, nonce);
+      if (!ok) return { ok: false, lines, line: n, reason: 'signature' };
+      hmacKey = await crypto.subtle.importKey('raw', nonce, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      counter = n;
+    }
+
+    if (n !== counter + 1 && n !== counter) return { ok: false, lines, line: n, reason: 'sequence' };
+    counter = n;
+
+    if (!hmacKey) return { ok: false, lines, line: n, reason: 'no_key' };
+    const cut = line.lastIndexOf('|') + 1;
+    const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, strToBytes(line.slice(0, cut)))).subarray(0, 16);
+    if (!bytesEqual(mac, fromB64(line.slice(cut)))) return { ok: false, lines, line: n, reason: 'hmac' };
+    lines++;
+  }
+  return { ok: true, lines };
 }
 
 // --- /api/crypto/* shared options ---------------------------------------------
@@ -148,14 +670,17 @@ export class HEM {
   /**
    * @param {string} hsmUrl   Base URL of the Encedo HEM device (e.g. 'https://abc.ence.do')
    * @param {object} [opts]
-   * @param {string} [opts.broker='https://api.encedo.com']  Notification broker URL
+   * @param {string|Broker} [opts.broker='https://api.encedo.com']  Broker URL, or a Broker instance to share
    * @param {boolean} [opts.debug=false]  Log requests to console
    */
   constructor(hsmUrl, { broker = 'https://api.encedo.com', debug = false } = {}) {
     this.#baseUrl = hsmUrl.replace(/\/+$/, '');
-    this.#broker = broker.replace(/\/+$/, '');
+    this.#broker = broker instanceof Broker ? broker : new Broker(broker, { debug });
     this.#debug = debug;
   }
+
+  /** The Broker this instance uses for every api.encedo.com call. */
+  get broker() { return this.#broker; }
 
   // -- Key Cache ---------------------------------------------------------------
 
@@ -198,165 +723,7 @@ export class HEM {
   // -- HTTP --------------------------------------------------------------------
 
   async #req(method, url, body = null, token = null, opts = {}) {
-    const { binary = false, filename = null, signal = null, timeoutMs = 0 } = opts;
-
-    // Binary uploads (firmware / UI images) go out as application/octet-stream
-    // carrying the raw bytes; every other request is JSON.
-    let headers, payload;
-    if (binary) {
-      headers = { 'Content-Type': 'application/octet-stream' };
-      if (filename) headers['Content-Disposition'] = `attachment; filename="${filename}"`;
-      payload = body;                                    // Uint8Array — sent as-is
-    } else {
-      headers = { 'Content-Type': 'application/json' };
-      payload = body !== null ? JSON.stringify(body) : null;
-    }
-    if (token) headers['Authorization'] = 'Bearer ' + token;
-
-    if (this.#debug) {
-      console.debug('[HEM] ->', method, url);
-      console.debug('[HEM] req headers:', JSON.stringify(headers));
-      console.debug('[HEM] req body:', binary
-        ? `(binary, ${payload?.length ?? 0} bytes)`
-        : (payload ?? '(none)'));
-    }
-
-    // In Node.js, undici (built-in fetch) uses chunked transfer encoding by
-    // default, which some embedded devices reject with HTTP 411.
-    // Detect Node.js and use https.request directly to set Content-Length.
-    const isNode = typeof process !== 'undefined' && process.versions?.node;
-
-    let status, resHeaders, data;
-
-    if (isNode && payload !== null) {
-      ({ status, headers: resHeaders, data } = await this.#reqNode(method, url, headers, payload, { signal, timeoutMs }));
-    } else {
-      const fetchOpts = { method, headers };
-      if (payload !== null) fetchOpts.body = payload;
-      const abort = HEM.#abortSignal(signal, timeoutMs);
-      if (abort) fetchOpts.signal = abort;
-
-      let res;
-      try {
-        res = await fetch(url, fetchOpts);
-      } catch (e) {
-        // A cancelled request is not an unreachable device, and a caller that
-        // cannot tell them apart will report the wrong thing to a user. Without
-        // this they all arrive as `network`.
-        if (e?.name === 'TimeoutError') throw new HemError(`Request timeout after ${timeoutMs} ms`, { code: 'timeout' });
-        if (e?.name === 'AbortError') throw new HemError('Request aborted', { code: 'aborted' });
-        throw new HemError(`Network error: ${e.message}`, { code: 'network' });
-      }
-
-      status = res.status;
-      resHeaders = Object.fromEntries(res.headers.entries());
-      const ct = res.headers.get('content-type') ?? '';
-      if (ct.includes('json')) {
-        try { data = await res.json(); } catch { data = null; }
-      } else {
-        data = await res.text();
-      }
-    }
-
-    if (this.#debug) {
-      console.debug('[HEM] <- status:', status);
-      console.debug('[HEM] res headers:', JSON.stringify(resHeaders));
-      console.debug('[HEM] res body:', JSON.stringify(data));
-    }
-
-    if (status < 200 || status >= 300) {
-      throw new HemError(
-        `HEM ${method} ${url} -> HTTP ${status}`,
-        { code: `http_${status}`, status, data }
-      );
-    }
-    return data;
-  }
-
-  /**
-   * The signal a request should run under: the caller's, a deadline, or both.
-   *
-   * `timeoutMs` exists because the alternative callers reach for is racing the
-   * promise against a timer — which stops WAITING for the request without
-   * stopping the request. A page that polls an absent device that way
-   * accumulates one open connection per attempt, and they all complete at once
-   * when the device appears.
-   */
-  static #abortSignal(signal, timeoutMs) {
-    if (!timeoutMs) return signal ?? null;
-    const deadline = AbortSignal.timeout(timeoutMs);
-    if (!signal) return deadline;
-    return typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, deadline]) : signal;
-  }
-
-  // Node.js-specific HTTP request using https.request (sets Content-Length explicitly)
-  async #reqNode(method, url, headers, body, opts = {}) {
-    const { default: https } = await import('node:https');
-    const { default: http } = await import('node:http');
-    const { URL: NodeURL } = await import('node:url');
-
-    const parsed = new NodeURL(url);
-    // body is a JSON string or a Uint8Array (binary upload) — normalise to Buffer
-    const payloadBuf = typeof body === 'string' ? Buffer.from(body, 'utf8') : Buffer.from(body);
-    const reqHeaders = {
-      ...headers,
-      'Content-Length': payloadBuf.length.toString(),
-    };
-
-    if (this.#debug) {
-      console.debug('[HEM] reqNode headers sent:', JSON.stringify(reqHeaders));
-    }
-
-    return new Promise((resolve, reject) => {
-      const lib = parsed.protocol === 'https:' ? https : http;
-      const req = lib.request({
-        method,
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        headers: reqHeaders,
-        agent: false,   // fresh TLS connection per request (HSM doesn't pool)
-        timeout: opts.timeoutMs || 15000,
-      }, (res) => {
-        let raw = '';
-        res.setEncoding('utf8');
-        res.on('data', chunk => {
-          if (this.#debug) console.debug('[HEM] res chunk:', chunk);
-          raw += chunk;
-        });
-        res.on('end', () => {
-          if (this.#debug) console.debug('[HEM] res status:', res.statusCode, 'raw:', raw);
-          const resHeaders = res.headers;
-          let data;
-          const ct = res.headers['content-type'] ?? '';
-          if (ct.includes('json')) {
-            try { data = JSON.parse(raw); } catch { data = raw; }
-          } else {
-            data = raw;
-          }
-          resolve({ status: res.statusCode, headers: resHeaders, data });
-        });
-      });
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new HemError('Request timeout', { code: 'timeout' }));
-      });
-      req.on('error', e => {
-        if (this.#debug) console.debug('[HEM] req error:', e.message);
-        reject(new HemError(`Network error: ${e.message}`, { code: 'network' }));
-      });
-      // The caller's signal has to reach the socket here as well, or the same
-      // call is cancellable in a browser and not in Node.
-      const { signal } = opts;
-      if (signal) {
-        const onAbort = () => { req.destroy(); reject(new HemError('Request aborted', { code: 'aborted' })); };
-        if (signal.aborted) { onAbort(); return; }
-        signal.addEventListener('abort', onAbort, { once: true });
-        req.on('close', () => signal.removeEventListener('abort', onAbort));
-      }
-      req.write(payloadBuf);
-      req.end();
-    });
+    return httpRequest(method, url, { body, token, debug: this.#debug, tag: 'HEM', ...opts });
   }
 
   // -- eJWT generation (PBKDF2 + X25519 ECDH + HMAC-SHA256) -------------------
@@ -479,18 +846,27 @@ export class HEM {
    *   1. GET  /api/system/checkin          -> must have { check }
    *   2. POST {broker}/checkin             -> must have { checked }
    *   3. POST /api/system/checkin          -> must have { status }
+   *
+   * Resolves with the device's step-3 answer. Besides `status` it may carry
+   * `newfws` / `newuis`: a newer firmware / UI image is available, and the
+   * value is what Broker.download() takes.
+   *
+   * Without a reachable broker this throws `broker_error` (or `network`);
+   * a device behind an air gap still authorises with a password afterwards.
+   *
+   * @returns {Promise<{status: string, newfws?: string, newuis?: string, [key: string]: any}>}
    */
   async hemCheckin() {
     const step1 = await this.#req('GET', `${this.#baseUrl}/api/system/checkin`);
     if (!step1.check) throw new HemError('HSM checkin failed (no check field)', { code: 'checkin_error' });
 
-    const step2 = await this.#req('POST', `${this.#broker}/checkin`, step1);
+    const step2 = await this.#broker.checkin(step1);
     if (!step2.checked) throw new HemError('Broker checkin failed (no checked field)', { code: 'broker_error' });
 
     const step3 = await this.#req('POST', `${this.#baseUrl}/api/system/checkin`, step2);
     if (!step3.status) throw new HemError('HSM checkin step 3 failed (no status field)', { code: 'checkin_error' });
 
-    return true;
+    return step3;
   }
 
   // -- System: Attestation -----------------------------------------------------
@@ -521,24 +897,32 @@ export class HEM {
    *   4. Poll GET {broker}/notify/event/check/{eventid}  (202 = pending, 200 = done)
    *   5. POST /api/auth/ext/token { authreply } -> { token: JWT }
    *
+   * Cancelling (`signal`) or running out of time withdraws the event from the
+   * broker, so the phone stops showing a request nobody is waiting for. Both
+   * reject with HemError: code `aborted` or `timeout`; a refusal on the phone
+   * is `denied`.
+   *
    * @param {string} scope       e.g. 'keymgmt:list'
    * @param {object} [opts]
    * @param {number} [opts.pollInterval=2000]  Poll interval in ms
    * @param {number} [opts.pollTimeout=60000]  Max wait time in ms
    * @param {Function} [opts.onPending]        Called each poll while waiting (no args)
+   * @param {Function} [opts.onEvent]          Called once with the broker event id
+   * @param {AbortSignal} [opts.signal]        Cancels the wait
    * @returns {Promise<string>}  JWT token
    */
   async authorizeRemote(scope, {
     pollInterval = 2_000,
     pollTimeout = 60_000,
     onPending = null,
+    onEvent = null,
     signal = null,
   } = {}) {
     const cached = this.#cacheFind(scope);
     if (cached) return cached;
 
     // Step 1: broker session EPK
-    const session = await this.#req('GET', `${this.#broker}/notify/session`);
+    const session = await this.#broker.session();
 
     // Step 2: request auth from device (pass full session data + scope)
     const challenge = await this.#req('POST', `${this.#baseUrl}/api/auth/ext/request`, {
@@ -547,41 +931,18 @@ export class HEM {
     });
 
     // Step 3: forward challenge to broker -> eventid
-    const event = await this.#req('POST', `${this.#broker}/notify/event/new`, challenge);
-    const { eventid } = event;
+    const { eventid } = await this.#broker.eventNew(challenge);
     if (!eventid) throw new HemError('No eventid from broker', { code: 'broker_error' });
+    if (onEvent) onEvent(eventid);
 
-    // Step 4: poll
-    const deadline = Date.now() + pollTimeout;
-    let result = null;
-
-    while (Date.now() < deadline) {
-      await new Promise((r, rej) => {
-        const t = setTimeout(r, pollInterval);
-        if (signal) {
-          if (signal.aborted) { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')); return; }
-          signal.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')); }, { once: true });
-        }
-      });
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      if (onPending) onPending();
-
-      let res;
-      try {
-        res = await fetch(`${this.#broker}/notify/event/check/${eventid}`, signal ? { signal } : undefined);
-      } catch (e) {
-        if (e instanceof DOMException && e.name === 'AbortError') throw e;
-        throw new HemError(`Broker poll network error: ${e.message}`, { code: 'network' });
-      }
-
-      if (res.status === 202) continue;   // still pending
-      if (!res.ok) throw new HemError(`Broker poll HTTP ${res.status}`, { code: `http_${res.status}`, status: res.status });
-
-      result = await res.json();
-      break;
+    // Step 4: poll; on cancel or timeout withdraw the event
+    let result;
+    try {
+      result = await this.#broker.waitEvent(eventid, { pollInterval, pollTimeout, onPending, signal });
+    } catch (e) {
+      await this.#broker.eventDelete(eventid).catch(() => {});
+      throw e;
     }
-
-    if (!result) throw new HemError('Remote auth timed out', { code: 'timeout' });
 
     // Step 5a: check denial
     if (result.deny) throw new HemError('Auth denied by user', { code: 'denied' });
@@ -686,7 +1047,7 @@ export class HEM {
     if (!config.eid) throw new HemError('No eid in device config', { code: 'ext_register_error' });
 
     // Step 2 -- broker session EPK
-    const session = await this.#req('POST', `${this.#broker}/notify/session`, { eid: config.eid });
+    const session = await this.#broker.session(config.eid);
     const { epk } = session;
     if (!epk) throw new HemError('No epk from broker', { code: 'broker_error' });
 
@@ -694,22 +1055,20 @@ export class HEM {
     const challenge = await this.#req('POST', `${this.#baseUrl}/api/auth/ext/init`, { epk }, token);
 
     // Step 4 -- broker registration session -> rid + QR link
-    const reg = await this.#req('POST', `${this.#broker}/notify/register/init`, {
-      epk,
-      eid: challenge.eid,
-      request: challenge.request,
-    });
+    const reg = await this.#broker.registerInit({ epk, eid: challenge.eid, request: challenge.request });
     const { rid, link } = reg;
     if (!rid) throw new HemError('No rid from broker', { code: 'broker_error' });
 
     // Step 5 -- build the QR payload and hand it to the caller to render.
-    // The payload MUST be byte-identical to the PHP tester: the mobile
-    // authenticator app scans this exact JSON. Key order (link, hash, user,
-    // email, hostname) matches PHP json_encode() of the source array.
+    // The payload MUST be byte-identical to the reference implementation: the
+    // mobile authenticator app scans this exact JSON. Key order (link, hash,
+    // user, email, hostname) matches PHP json_encode() of the source array.
+    // `hash` is base64(SHA-256(request)): the phone checks the request it later
+    // fetches from the broker against what it scanned.
     // The SDK only produces the data; rendering the QR image is out of scope.
     const qrPayload = {
       link,
-      hash: 'not_implemented_yet',
+      hash: toB64(await sha256(strToBytes(challenge.request))),
       user: config.user,
       email: config.email,
       hostname: config.hostname,
@@ -717,36 +1076,7 @@ export class HEM {
     if (onQrCode) onQrCode(JSON.stringify(qrPayload), qrPayload);
 
     // Step 6 -- poll until the mobile app scans the QR
-    const deadline = Date.now() + pollTimeout;
-    let reply = null;
-
-    while (Date.now() < deadline) {
-      await new Promise((r, rej) => {
-        const t = setTimeout(r, pollInterval);
-        if (signal) {
-          if (signal.aborted) { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')); return; }
-          signal.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')); }, { once: true });
-        }
-      });
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      if (onPending) onPending();
-
-      let res;
-      try {
-        res = await fetch(`${this.#broker}/notify/register/check/${rid}`, signal ? { signal } : undefined);
-      } catch (e) {
-        if (e instanceof DOMException && e.name === 'AbortError') throw e;
-        throw new HemError(`Broker poll network error: ${e.message}`, { code: 'network' });
-      }
-
-      if (res.status === 202) continue;   // still pending
-      if (!res.ok) throw new HemError(`Broker poll HTTP ${res.status}`, { code: `http_${res.status}`, status: res.status });
-
-      reply = await res.json();
-      break;
-    }
-
-    if (!reply) throw new HemError('Ext authenticator registration timed out', { code: 'timeout' });
+    const reply = await this.#broker.waitRegistration(rid, { pollInterval, pollTimeout, onPending, signal });
     if (!reply.pid || !reply.reply) throw new HemError('Missing pid/reply from broker', { code: 'broker_error' });
 
     // Step 7 -- validate the pairing on the device
@@ -754,30 +1084,76 @@ export class HEM {
       { pid: reply.pid, reply: reply.reply }, token);
 
     // Step 8 -- finalise the pairing on the broker
-    return this.#req('POST', `${this.#broker}/notify/register/finalise/${rid}`, confirmation);
+    return this.#broker.registerFinalise(rid, confirmation);
   }
 
   /**
    * Obtain MAC data that authenticates this device to the notification broker.
-   * The returned MAC is used to query the broker for the list of external
-   * authenticators currently paired with the device.
+   * The returned object is what Broker.subscribersList / subscribersDelete take;
+   * listExtAuth() and deleteExtAuth() below do the whole round trip.
    *
    * Fetches the device `eid`, opens a broker session for an ephemeral key, then
-   * calls POST /api/auth/ext/mac — same broker handshake as registerExtAuth().
+   * calls POST /api/auth/ext/mac -- same broker handshake as registerExtAuth().
    *
    * Required scope: 'system:config' (or 'auth:ext:pair')
    *
    * @param {string} token  Bearer JWT
-   * @returns {Promise<{nonce: string, mac: string, eid: string}>}
+   * @returns {Promise<{nonce: string, mac: string, eid: string, epk: string}>}
    */
   async getExtAuthMac(token) {
     const config = await this.#req('GET', `${this.#baseUrl}/api/system/config`, null, token);
     if (!config.eid) throw new HemError('No eid in device config', { code: 'ext_register_error' });
 
-    const session = await this.#req('POST', `${this.#broker}/notify/session`, { eid: config.eid });
+    const session = await this.#broker.session(config.eid);
     if (!session.epk) throw new HemError('No epk from broker', { code: 'broker_error' });
 
-    return this.#req('POST', `${this.#baseUrl}/api/auth/ext/mac`, { epk: session.epk }, token);
+    const mac = await this.#req('POST', `${this.#baseUrl}/api/auth/ext/mac`, { epk: session.epk }, token);
+    return { ...mac, epk: session.epk };
+  }
+
+  /**
+   * Mobile authenticators paired with this device, as the broker knows them:
+   * [{ pid, ... }]. A paired phone also exists in the device's keychain as a
+   * key whose description is base64('EXTAID') + pid ('RVhUQUlE' + pid), which
+   * is how a UI matches the two lists.
+   *
+   * Required scope: 'system:config' (or 'auth:ext:pair')
+   *
+   * @param {string} token  Bearer JWT
+   * @returns {Promise<Array<{pid: string, [key: string]: any}>>}
+   */
+  async listExtAuth(token) {
+    const mac = await this.getExtAuthMac(token);
+    return this.#broker.subscribersList(mac);
+  }
+
+  /**
+   * Unpair one mobile authenticator on the broker side. The matching keychain
+   * entry (description 'RVhUQUlE' + pid) is deleted separately with deleteKey().
+   *
+   * Required scope: 'system:config' (or 'auth:ext:pair')
+   *
+   * @param {string} token  Bearer JWT
+   * @param {string} pid    Authenticator id from listExtAuth()
+   * @returns {Promise<object>}
+   */
+  async deleteExtAuth(token, pid) {
+    const mac = await this.getExtAuthMac(token);
+    return this.#broker.subscribersDelete({ ...mac, pid });
+  }
+
+  /**
+   * Whether any mobile authenticator is paired with this device. No token
+   * needed: the auth challenge carries the device id and the broker answers
+   * with a `paired` flag. A login screen uses it to offer the phone first.
+   *
+   * @returns {Promise<boolean>}
+   */
+  async hasExtAuth() {
+    const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
+    if (!challenge.eid) throw new HemError('No eid in auth challenge', { code: 'auth_failed' });
+    const session = await this.#broker.session(challenge.eid);
+    return Boolean(session.paired);
   }
 
   // -- Key Management ----------------------------------------------------------
@@ -1441,11 +1817,14 @@ export class HEM {
    * @param {string}     token       Bearer JWT
    * @param {Uint8Array} bytes       Raw firmware image bytes
    * @param {string}     [filename='firmware.bin']  Upload filename
+   * @param {object}     [opts]
+   * @param {Function}   [opts.onProgress]  (loaded, total) in bytes -- browser only
+   * @param {AbortSignal} [opts.signal]     Cancels the upload
    * @returns {Promise<object>}
    */
-  async uploadFirmware(token, bytes, filename = 'firmware.bin') {
+  async uploadFirmware(token, bytes, filename = 'firmware.bin', { onProgress = null, signal = null } = {}) {
     return this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_fw`,
-      bytes, token, { binary: true, filename });
+      bytes, token, { binary: true, filename, onProgress, signal });
   }
 
   /**
@@ -1484,9 +1863,9 @@ export class HEM {
    * @param {string}     [filename='ui.bin']  Upload filename
    * @returns {Promise<object>}
    */
-  async uploadUi(token, bytes, filename = 'ui.bin') {
+  async uploadUi(token, bytes, filename = 'ui.bin', { onProgress = null, signal = null } = {}) {
     return this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_ui`,
-      bytes, token, { binary: true, filename });
+      bytes, token, { binary: true, filename, onProgress, signal });
   }
 
   /**
@@ -1580,6 +1959,94 @@ export class HEM {
    */
   async getLogEntry(token, id) {
     return this.#req('GET', `${this.#baseUrl}/api/logger/${id}`, null, token);
+  }
+
+  // -- Provisioning (PPA: certificate for the device) ---------------------------
+
+  /**
+   * Install the certificate the broker issued for this device.
+   * Fails with HTTP 403 on a device that is already provisioned.
+   *
+   * @param {object} cert   Result of Broker.provisioning()
+   * @param {string|null} [token]
+   * @returns {Promise<object>}
+   */
+  async installProvisioning(cert, token = null) {
+    return this.#req('POST', `${this.#baseUrl}/api/system/config/provisioning`, cert, token);
+  }
+
+  /**
+   * Provision the device if it still needs it: read the attestation, and when it
+   * carries a CSR, have the broker sign it and install the certificate.
+   *
+   * Resolves with the installed certificate, or null when the device was
+   * already provisioned (no CSR in the attestation).
+   *
+   * @param {string|null} [token]  Any valid JWT; the attestation endpoint accepts any
+   * @returns {Promise<object|null>}
+   */
+  async provision(token = null) {
+    const att = await this.#req('GET', `${this.#baseUrl}/api/system/config/attestation`, null, token);
+    if (!att.csr) return null;
+    const cert = await this.#broker.provisioning({ csr: att.csr, key: att.key, genuine: att.genuine });
+    await this.installProvisioning(cert, token);
+    return cert;
+  }
+
+  // -- *.ence.do domain and TLS certificate ------------------------------------
+
+  /**
+   * Register `<prefix>.ence.do` for this device and install the TLS material.
+   *
+   * With `newCertificate` (default) the device first generates a CSR
+   * (setConfig { gen_csr: true } -> { genuine, csr }); the broker signs it and
+   * returns { emp, key, crt }, which is written back as { tls }. Without it the
+   * broker re-issues the existing registration from the attestation alone.
+   *
+   * Required scope: 'system:config'
+   *
+   * @param {string} token   Bearer JWT
+   * @param {string} prefix  Hostname prefix, e.g. 'my' for my.ence.do
+   * @param {object} [opts]
+   * @param {string} [opts.ip]                 LAN address the name should resolve to
+   * @param {boolean} [opts.newCertificate=true]
+   * @returns {Promise<object>}  The tls block installed on the device
+   */
+  async registerDomain(token, prefix, { ip = null, newCertificate = true } = {}) {
+    let genuine, csr = null;
+    if (newCertificate) {
+      const req = await this.#req('POST', `${this.#baseUrl}/api/system/config`, { gen_csr: true }, token);
+      genuine = req.genuine;
+      csr = req.csr;
+    }
+    if (!genuine) {
+      const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
+      genuine = challenge.genuine;
+    }
+    if (!genuine) throw new HemError('No attestation (genuine) available for domain registration', { code: 'domain_error' });
+
+    const tls = await this.#broker.domainRegister(prefix, { genuine, csr, ip });
+    await this.#req('POST', `${this.#baseUrl}/api/system/config`, { tls }, token);
+    return tls;
+  }
+
+  // -- Audit log verification --------------------------------------------------
+
+  /**
+   * Fetch one log file and verify it against the device's logger key.
+   * See verifyLog() for the format and the result.
+   *
+   * Required scope: 'logger:get'
+   *
+   * @param {string} token
+   * @param {string|number} id   Log entry id from listLog()
+   * @returns {Promise<{ok: boolean, lines: number, line?: number, reason?: string, text: string}>}
+   */
+  async verifyLogEntry(token, id) {
+    const { key } = await this.getLoggerKey(token);
+    const text = await this.getLogEntry(token, id);
+    const result = await verifyLog(key, typeof text === 'string' ? text : JSON.stringify(text));
+    return { ...result, text };
   }
 
 }

@@ -24,10 +24,37 @@ Conventions:
 ## 1. Checkin
 
 Run once after construction, before anything else. Tests the HSM + broker
-connection and synchronises clocks.
+connection and synchronises clocks. The device's answer says whether a newer
+firmware or UI image exists.
 
 ```js
-await hem.hemCheckin();
+const health = await hem.hemCheckin();     // { status, newfws?, newuis?, ... }
+if (health.newfws) console.log('firmware update available:', health.newfws);
+```
+
+Behind an air gap the broker is unreachable and this throws `broker_error`
+(or `network`). Catch it and carry on: password authentication and every
+device-only operation still work.
+
+```js
+let online = true;
+try { await hem.hemCheckin(); } catch (e) { if (e instanceof HemError) online = false; else throw e; }
+```
+
+## 1a. The broker
+
+Every call to `api.encedo.com` is a method of `Broker`, one per endpoint.
+`HEM` builds one from the `broker` option and composes it into the multi-step
+flows below; `hem.broker` is there for the calls a page makes on its own.
+
+```js
+import { Broker } from './hem-sdk.js';
+
+const broker = new Broker('https://api.encedo.com');
+const hem = new HEM('https://abc.ence.do', { broker });   // a URL works too
+
+const { prefix } = await hem.broker.domainPredefs();       // ['my', 'dev', ...]
+const taken = await hem.broker.domainTaken('my');          // true / false
 ```
 
 ---
@@ -55,12 +82,30 @@ const longToken = await hem.authorizePassword('my-password', 'keymgmt:list', 360
 No password — the mobile app signs the challenge. Requires `hemCheckin()` first.
 
 ```js
-const token = await hem.authorizeRemote('keymgmt:list', {
-  pollInterval: 2000,                       // ms between broker polls
-  pollTimeout: 60000,                       // give up after this long
-  onPending: () => console.log('waiting for mobile approval…'),
-  // signal: abortController.signal,        // optional — cancel the wait
-});
+const ac = new AbortController();
+usePasswordButton.onclick = () => ac.abort();   // "Use password instead"
+
+try {
+  const token = await hem.authorizeRemote('keymgmt:list', {
+    pollInterval: 2000,                       // ms between broker polls
+    pollTimeout: 60000,                       // give up after this long
+    onPending: () => console.log('waiting for mobile approval…'),
+    onEvent: (eventid) => console.log('broker event', eventid),
+    signal: ac.signal,
+  });
+} catch (e) {
+  // aborted | timeout: the event has been withdrawn from the broker, so the
+  // phone stops showing it. denied: the user refused on the phone.
+  if (e.code === 'aborted' || e.code === 'timeout') showPasswordForm();
+  else if (e.code === 'denied') showMessage('Access denied by mobile app');
+  else throw e;
+}
+```
+
+Offer the phone only when one is paired — no token needed to ask:
+
+```js
+if (await hem.hasExtAuth()) startRemoteLogin(); else showPasswordForm();
 ```
 
 ### Device initialization (provisioning)
@@ -101,14 +146,49 @@ await hem.registerExtAuth(token, {
 });
 ```
 
-### List paired authenticators
-
-`getExtAuthMac` returns the MAC data used to query the notification broker for
-the list of external authenticators paired with the device.
+### List and remove paired authenticators
 
 ```js
 const token = await hem.authorizePassword('my-password', 'system:config');
-const { nonce, mac, eid } = await hem.getExtAuthMac(token);
+
+const phones = await hem.listExtAuth(token);      // [{ pid, ... }]
+await hem.deleteExtAuth(token, phones[0].pid);    // unpair on the broker
+```
+
+A paired phone also exists in the device's keychain as a key whose description
+is `base64('EXTAID') + pid`; remove that entry too when unpairing:
+
+```js
+const entries = await hem.searchKeys(listToken, 'EXTAID' + phones[0].pid);
+for (const k of entries) await hem.deleteKey(delToken, k.kid);
+```
+
+`getExtAuthMac(token)` returns the `{ nonce, mac, eid, epk }` the two calls
+above hand to `hem.broker.subscribersList` / `subscribersDelete`, should a
+page need the raw exchange.
+
+### Provisioning and a `*.ence.do` name (PPA)
+
+A factory-fresh PPA needs a certificate from the broker before TLS works.
+`provision()` reads the attestation, has the broker sign the CSR it carries and
+installs the result; on a provisioned device it resolves `null` and does
+nothing.
+
+```js
+const cert = await hem.provision();               // null when already provisioned
+```
+
+Registering a hostname asks the device for a CSR, registers
+`<prefix>.ence.do` with the broker and installs the TLS block it returns:
+
+```js
+const token = await hem.authorizePassword('my-password', 'system:config');
+const { prefix } = await hem.broker.domainPredefs();
+if (!(await hem.broker.domainTaken('alice'))) {
+  const tls = await hem.registerDomain(token, 'alice', { ip: '192.168.7.1' });
+}
+// Re-issue for an existing registration, without a new CSR:
+await hem.registerDomain(token, 'alice', { newCertificate: false });
 ```
 
 ---
@@ -336,9 +416,16 @@ const fwBytes2 = new Uint8Array(await (await fetch(fwUrl)).arrayBuffer());
 // c) From a file picker (browser):
 // const fwBytes3 = new Uint8Array(await fileInput.files[0].arrayBuffer());
 
+// d) The image the check-in announced, straight from the broker:
+const { newfws } = await hem.hemCheckin();
+const fwBytes4 = await hem.broker.download('firmware', newfws);   // Uint8Array
+
 // --- Upgrade flow ---
 await hem.usbMode(token);
-await hem.uploadFirmware(token, fwBytes);     // optional filename arg
+await hem.uploadFirmware(token, fwBytes, 'firmware.bin', {
+  onProgress: (loaded, total) => bar.value = loaded / total,   // browser only
+  // signal: ac.signal,
+});
 await hem.checkFirmware(token);               // verify the uploaded image
 await hem.installFirmware(token);             // device reboots afterwards
 
@@ -369,9 +456,27 @@ Scope: `logger:get`.
 ```js
 const token = await hem.authorizePassword('my-password', 'logger:get');
 
-const signerKey = await hem.getLoggerKey(token);   // key used to sign log entries
+const signerKey = await hem.getLoggerKey(token);   // { key }: Ed25519 key that signs log entries
 const page      = await hem.listLog(token, 0);     // entries from offset 0
-const entry     = await hem.getLogEntry(token, entryId);
+const entry     = await hem.getLogEntry(token, entryId);   // the log file, text
+```
+
+Each log file carries its own integrity chain: signed key lines and an HMAC on
+every line. Verify before showing it as evidence:
+
+```js
+const { ok, lines, line, reason, text } = await hem.verifyLogEntry(token, entryId);
+if (!ok) console.warn(`log ${entryId} fails at entry ${line}: ${reason}`);   // signature | sequence | no_key | hmac
+
+// Or, with data already in hand (pure Web Crypto, no device call):
+import { verifyLog } from './hem-sdk.js';
+const result = await verifyLog(signerKey.key, text);
+```
+
+Share a key's share-code by e-mail through the broker:
+
+```js
+await hem.broker.shareEmailPubkey('bob@example.com', shareCode);   // shareCode: the object the share page built
 ```
 
 ---
@@ -384,10 +489,10 @@ try {
 } catch (e) {
   if (e instanceof HemError) {
     console.error('HEM error:', e.code, e.status, e.data);
-    // codes: network, timeout, http_<status>, checkin_error, broker_error,
-    //        auth_failed, auth_password_required, denied, sign_error,
-    //        verify_failed, ecdh_error, hmac_error, cipher_error, pqc_error,
-    //        ext_register_error
+    // codes: network, timeout, aborted, http_<status>, checkin_error,
+    //        broker_error, auth_failed, auth_password_required, denied,
+    //        sign_error, verify_failed, ecdh_error, hmac_error, cipher_error,
+    //        pqc_error, ext_register_error, domain_error
   } else {
     throw e;
   }
@@ -399,4 +504,11 @@ try {
 ```js
 hem.clearCache();   // drop cached JWT tokens
 hem.clearKeys();    // drop cached derived X25519 keys AND all tokens — on logout
+```
+
+## Reading a token
+
+```js
+import { jwtParse } from './hem-sdk.js';
+const { scope, exp, sub } = jwtParse(token) ?? {};
 ```
