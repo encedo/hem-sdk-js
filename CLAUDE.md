@@ -86,13 +86,16 @@ What each consumer relies on today, from reading their code:
 | `www` kit pages | `hemCheckin`, `authorizePassword`, `createKeyPair` | — |
 | `encedo-manager` v2 | everything above plus `Broker`, `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `provision`, `registerDomain`, `verifyLog`, upload `onProgress` | `hemCheckin()` resolving to the step-3 object |
 
-Nobody reads `hemCheckin()`'s value, nobody catches `AbortError` by name,
-everybody constructs `new HEM(url, {debug?})`. So: `hemCheckin` may return an
-object (truthy, as before), cancellation may be a `HemError` (`aborted`), and
-new methods are fine — but never rename or re-order the parameters of the
-methods in the table, never make `broker` mandatory in the constructor, and
-keep `HemError.code` values stable. Re-check this table before a breaking
-change; extend it when a new consumer appears.
+The table is a map of blast radius, not a freeze. Breaking changes are allowed
+(decided 2026-09-03) — the rule is that a change which breaks a row is made
+together with the fix in that project, in the same sitting, and the table is
+updated. What the SDK must not do is break a consumer silently.
+
+As it stands nobody reads `hemCheckin()`'s value, nobody catches `AbortError`
+by name, and everybody constructs `new HEM(url, {debug?})`, so the current
+changes reach no consumer: `hemCheckin` returning an object is still truthy,
+cancellation as `HemError` (`aborted`) is only ever caught by code, and the
+`initialize` signature change touches a method no consumer calls.
 
 ## The master secret (BIP39)
 
