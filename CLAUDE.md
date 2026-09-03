@@ -72,6 +72,46 @@ updated separately. **Always make SDK changes here**, never in a downstream copy
 - Caches: `#tokenCache` (scoped JWTs, auto-purged on expiry), `#derivedKeys`
   (derived X25519 key pair). `clearCache()` / `clearKeys()` drop them.
 
+## Downstream compatibility (checked 2026-09-03)
+
+The SDK is copied into live products, so the public surface only grows.
+What each consumer relies on today, from reading their code:
+
+| Consumer | Uses | Load-bearing behaviour |
+|---|---|---|
+| `encedo-oidc-boundle` (older 510-line copy) | `hemCheckin`, `authorizePassword`, `authorizeRemote` (with `signal` in signin.js), `searchKeys`, `exdsaSign`, `getPubKey`, `getAttestation`, `createKeyPair` | `err instanceof HemError && err.code === 'http_401'` |
+| `chat/encedo-chat` (1453-line copy) | `hemCheckin`, `authorizePassword`, `searchKeys`, `getPubKey`, `createKeyPair`, `ecdh`, `updateKey`, `deleteKey`, `getVersion({timeoutMs})`, `getStatus({timeoutMs})` | `e.code === 'timeout' \|\| e.code === 'aborted'` |
+| `encedo-pgp` (current copy) | `hemCheckin`, `authorizePassword`, `searchKeys`, `createKeyPair`, `getPubKey`, `importPublicKey`, `exdsaSignBytes`, `exdsaVerify`, `ecdh` | binary in / binary out |
+| `encedo-meet` (713-line copy under `src/vendor`) | `authorizePassword`, `hemCheckin`, `authorizeRemote` | — |
+| `www` kit pages | `hemCheckin`, `authorizePassword`, `createKeyPair` | — |
+| `encedo-manager` v2 | everything above plus `Broker`, `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `provision`, `registerDomain`, `verifyLog`, upload `onProgress` | `hemCheckin()` resolving to the step-3 object |
+
+Nobody reads `hemCheckin()`'s value, nobody catches `AbortError` by name,
+everybody constructs `new HEM(url, {debug?})`. So: `hemCheckin` may return an
+object (truthy, as before), cancellation may be a `HemError` (`aborted`), and
+new methods are fine — but never rename or re-order the parameters of the
+methods in the table, never make `broker` mandatory in the constructor, and
+keep `HemError.code` values stable. Re-check this table before a breaking
+change; extend it when a new consumer appears.
+
+## Planned: BIP39 master passphrase (Manager, dashboard stage)
+
+The Manager keeps the 24-word master passphrase (printed on the Proof of
+Personalization PDF). Two additions, both pure Web Crypto plus an embedded
+English wordlist:
+
+1. `initialize` variant taking a mnemonic (or a ready 32-byte admin seed) for
+   the admin key instead of `adminPassword`.
+2. `authorizeMaster(mnemonic, scope)` for the settings page.
+
+The v1 Manager derives the admin key as
+`nacl.box.keyPair.fromSecretKey(fromHex(seedHex.substr(1, 64)))` — one hex
+character INTO the BIP39 seed (`m.toSeed(words)` from jsbip39, PBKDF2-SHA512,
+2048 rounds, salt `mnemonic`). Devices in the field were personalised that way;
+reproduce it exactly, quirk included, and cover it with a test vector taken
+from a real personalisation. `usbMode` is not used by the Manager (USB ACM
+uploads have their own webshell); keep the method for other callers.
+
 ## API spec source
 
 The authoritative description of HEM endpoints, request bodies and response
