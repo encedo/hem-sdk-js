@@ -107,9 +107,18 @@ English wordlist:
 The v1 Manager derives the admin key as
 `nacl.box.keyPair.fromSecretKey(fromHex(seedHex.substr(1, 64)))` — one hex
 character INTO the BIP39 seed (`m.toSeed(words)` from jsbip39, PBKDF2-SHA512,
-2048 rounds, salt `mnemonic`). Devices in the field were personalised that way;
-reproduce it exactly, quirk included, and cover it with a test vector taken
-from a real personalisation. `usbMode` is not used by the Manager (USB ACM
+2048 rounds, salt `mnemonic`). Devices in the field were personalised that way,
+and the master-passphrase login in the v1 Manager (core2 `settings_by_passphrase`)
+uses the same `substr(1, 64)`, so it is consistent end to end: the key is a
+32-byte window starting one nibble into the 64-byte seed, every byte
+straddling two seed bytes. Nobody remembers why; the likely cause is
+`substr(start, length)` written with 1-based `start` in mind (`substr(0, 64)`
+intended). It costs no entropy (256 uniformly random bits either way) but no
+standard BIP39/BIP32 tool derives the same key. Reproduce it exactly as the
+"master key v1" derivation, cover it with a test vector taken from a real
+personalisation, and never change it silently: a corrected derivation would
+need a marker in the device config and would apply to new personalisations
+only. `usbMode` is not used by the Manager (USB ACM
 uploads have their own webshell); keep the method for other callers.
 
 ## API spec source
