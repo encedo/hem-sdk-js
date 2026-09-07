@@ -773,6 +773,33 @@ export class Broker {
     return this.#req('POST', `/domain/register/${encodeURIComponent(prefix)}`, body);
   }
 
+  /**
+   * Where a registration that did not finish at once has got to. A prefix of
+   * the owner's choosing is confirmed by e-mail first, so domainRegister()
+   * answers 201 with an { id } instead of the tls block; this reads
+   * { status: 'pending' | 'email_confirmed' | 'done' | 'failed', ... } for it,
+   * and once `status` is 'done' the answer is the tls block itself.
+   */
+  domainStatus(id) {
+    return this.#req('GET', `/domain/register/${encodeURIComponent(id)}`);
+  }
+
+  /**
+   * Poll a pending registration until it is done. `onPending` gets the status
+   * each time, so a page can say "check your inbox" and then "confirmed".
+   * Rejects with HemError `domain_failed` when the broker gives up, `timeout`
+   * when the caller does (a minute per poll of 4 s by default: four minutes).
+   */
+  async waitDomain(id, { pollInterval = 4_000, pollTimeout = 240_000, onPending = null, signal = null } = {}) {
+    return this.#poll(async () => {
+      const answer = await this.domainStatus(id);
+      if (answer?.status === 'failed') throw new HemError('The domain registration failed', { code: 'domain_failed' });
+      if (answer?.status === 'done' || answer?.crt) return answer;
+      if (onPending) onPending(answer?.status ?? 'pending');
+      return null;
+    }, 'The domain registration was not confirmed in time', { pollInterval, pollTimeout, signal });
+  }
+
   // -- Provisioning ------------------------------------------------------------
 
   /**
@@ -2423,9 +2450,13 @@ export class HEM {
    * @param {object} [opts]
    * @param {string} [opts.ip]                 LAN address the name should resolve to
    * @param {boolean} [opts.newCertificate=true]
+   * @param {number} [opts.pollInterval=4000]  While an e-mail confirmation is waited for
+   * @param {number} [opts.pollTimeout=240000]
+   * @param {Function} [opts.onPending]        Called with the registration status each poll
+   * @param {AbortSignal} [opts.signal]
    * @returns {Promise<object>}  The tls block installed on the device
    */
-  async registerDomain(token, prefix, { ip = null, newCertificate = true } = {}) {
+  async registerDomain(token, prefix, { ip = null, newCertificate = true, pollInterval = 4_000, pollTimeout = 240_000, onPending = null, signal = null } = {}) {
     let genuine, csr = null;
     if (newCertificate) {
       const req = await this.#req('POST', `${this.#baseUrl}/api/system/config`, { gen_csr: true }, token);
@@ -2438,7 +2469,10 @@ export class HEM {
     }
     if (!genuine) throw new HemError('No attestation (genuine) available for domain registration', { code: 'domain_error' });
 
-    const tls = await this.#broker.domainRegister(prefix, { genuine, csr, ip });
+    let tls = await this.#broker.domainRegister(prefix, { genuine, csr, ip });
+    // A prefix of the owner's choosing is confirmed by e-mail first: the broker
+    // answers with an id, and the tls block follows once the owner has clicked.
+    if (!tls?.crt && tls?.id) tls = await this.#broker.waitDomain(tls.id, { pollInterval, pollTimeout, onPending, signal });
     await this.#req('POST', `${this.#baseUrl}/api/system/config`, { tls }, token);
     return tls;
   }

@@ -80,7 +80,7 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | **Storage** | `lockStorage`, `unlockStorage` |
 | **Audit log** | `getLoggerKey`, `listLog`, `getLogEntry`, `verifyLogEntry` |
 | **Cache** | `clearCache`, `clearKeys` |
-| **Broker** (`hem.broker`) | `checkin`, `session`, `eventNew`/`eventCheck`/`eventDelete`/`waitEvent`, `registerInit`/`registerCheck`/`registerFinalise`/`waitRegistration`, `subscribersList`/`subscribersDelete`, `download`, `domainPredefs`/`domainTaken`/`domainRegister`, `provisioning`, `shareEmailPubkey` |
+| **Broker** (`hem.broker`) | `checkin`, `session`, `eventNew`/`eventCheck`/`eventDelete`/`waitEvent`, `registerInit`/`registerCheck`/`registerFinalise`/`waitRegistration`, `subscribersList`/`subscribersDelete`, `download`, `domainPredefs`/`domainTaken`/`domainRegister`/`domainStatus`/`waitDomain`, `provisioning`, `shareEmailPubkey` |
 | **Helpers** (exported functions) | `verifyLog` (audit-log integrity, pure Web Crypto), `verifyLoggerKey` (the device signed the nonce it sent with the key), `jwtParse` |
 
 ### The master secret

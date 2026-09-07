@@ -80,7 +80,11 @@ export declare class Broker {
   domainPredefs(): Promise<{ prefix: string[] }>;
   /** true when `<prefix>.ence.do` is already registered (200); false on 404; other failures throw. */
   domainTaken(prefix: string): Promise<boolean>;
-  domainRegister(prefix: string, args: { genuine: string; csr?: string | null; ip?: string | null }): Promise<{ emp: string; key: string; crt: string; [key: string]: unknown }>;
+  domainRegister(prefix: string, args: { genuine: string; csr?: string | null; ip?: string | null }): Promise<{ emp: string; key: string; crt: string; [key: string]: unknown } | { id: string; status?: string }>;
+  /** Status of a registration that answered 201 with an id; the tls block once `status` is 'done'. */
+  domainStatus(id: string): Promise<{ status: 'pending' | 'email_confirmed' | 'done' | 'failed'; [key: string]: unknown }>;
+  /** Poll domainStatus until done. Rejects with `domain_failed` or `timeout`. */
+  waitDomain(id: string, opts?: PollOpts & { onPending?: (status: string) => void }): Promise<{ emp: string; key: string; crt: string; [key: string]: unknown }>;
 
   provisioning(args: { csr: string; key: string; genuine: string }): Promise<Record<string, unknown>>;
   shareEmailPubkey(email: string, shareCode: Record<string, unknown>, auth?: string): Promise<unknown>;
@@ -270,7 +274,7 @@ export declare class HEM {
   /** Provision if the attestation still carries a CSR; resolves null when already provisioned. */
   provision(token?: string | null): Promise<Record<string, unknown> | null>;
   /** Register `<prefix>.ence.do` and install the TLS block. Scope: system:config. */
-  registerDomain(token: string, prefix: string, opts?: { ip?: string | null; newCertificate?: boolean }): Promise<Record<string, unknown>>;
+  registerDomain(token: string, prefix: string, opts?: { ip?: string | null; newCertificate?: boolean; pollInterval?: number; pollTimeout?: number; onPending?: (status: string) => void; signal?: AbortSignal }): Promise<Record<string, unknown>>;
   /** Fetch one log file and verify it with verifyLog(). Scope: logger:get. */
   verifyLogEntry(token: string, id: string | number): Promise<LogVerification & { text: string }>;
 

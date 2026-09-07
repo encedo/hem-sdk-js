@@ -137,7 +137,18 @@ async function handle(req, res) {
   if (path === '/brk/download/firmware/v2.0.1-_x/bin') { res.writeHead(200, { 'Content-Type': 'application/octet-stream' }); return res.end(Buffer.from([1, 2, 3, 4, 5])); }
   if (path === '/brk/domain/predefs') return json(res, 200, { prefix: ['my', 'dev'] });
   if (path.startsWith('/brk/domain/check/')) return json(res, state.domainTaken[path.split('/').pop()] ? 200 : 404, {});
-  if (path.startsWith('/brk/domain/register/')) return json(res, 200, { emp: 'E', key: 'K', crt: 'C', prefix: path.split('/').pop(), got: body });
+  if (path.startsWith('/brk/domain/register/')) {
+    const tail = path.split('/').pop();
+    // A custom prefix (one that sends a CSR) waits for an e-mail click: 201 + id, then a status to poll.
+    if (req.method === 'POST' && body?.csr && tail !== 'my') { state.domainPolls = 0; return json(res, 201, { id: 'JOB-' + tail }); }
+    if (req.method === 'GET' && tail.startsWith('JOB-')) {
+      const n = ++state.domainPolls;
+      if (n === 1) return json(res, 200, { status: 'pending' });
+      if (n === 2) return json(res, 200, { status: 'email_confirmed' });
+      return json(res, 200, { status: 'done', emp: 'E', key: 'K', crt: 'C', prefix: tail.slice(4) });
+    }
+    return json(res, 200, { emp: 'E', key: 'K', crt: 'C', prefix: tail, got: body });
+  }
   if (path === '/brk/provisioning') return json(res, 200, { crt: 'CERT', genuine: body.genuine });
   if (path === '/brk/share/emailpubkey') return json(res, 200, { sent: true, got: body });
 
@@ -320,6 +331,19 @@ test('registerDomain asks for a CSR, registers and installs the tls block', asyn
   assert.ok(install.auth?.startsWith('Bearer '), 'config writes carry the token');
   const again = await hem.registerDomain(token, 'my', { newCertificate: false });
   assert.deepEqual(again.got, { genuine: 'GEN' }, 're-registration uses the attestation from the auth challenge only');
+});
+
+test('a prefix of the owner\'s choosing is confirmed by e-mail before the tls block arrives', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'system:config');
+  const seen = [];
+  const tls = await hem.registerDomain(token, 'alice', { ip: '192.168.7.1', pollInterval: 5, onPending: (st) => seen.push(st) });
+  assert.deepEqual(seen, ['pending', 'email_confirmed']);
+  assert.equal(tls.crt, 'C');
+  assert.equal(tls.prefix, 'alice');
+  const install = state.log.filter((l) => l.path === '/dev/api/system/config' && l.method === 'POST').pop();
+  assert.deepEqual(install.body, { tls }, 'what the poll ended with is what the device gets');
+  assert.deepEqual(await hem.broker.domainStatus('JOB-alice'), { status: 'done', emp: 'E', key: 'K', crt: 'C', prefix: 'alice' });
 });
 
 test('provision installs a certificate once and is a no-op afterwards', async () => {

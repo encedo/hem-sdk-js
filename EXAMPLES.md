@@ -230,6 +230,13 @@ if (!(await hem.broker.domainTaken('alice'))) {
 }
 // Re-issue for an existing registration, without a new CSR:
 await hem.registerDomain(token, 'alice', { newCertificate: false });
+
+// A name of the owner's own is confirmed by e-mail first: the broker answers
+// 201 with an id, and registerDomain polls it until the click. `onPending`
+// gets 'pending' and then 'email_confirmed', so a page can say what to do.
+await hem.registerDomain(token, 'alice', { ip: '192.168.7.1', onPending: (status) => console.log(status) });
+// The same polling on its own, after a domainRegister() that answered { id }:
+const tls = await hem.broker.waitDomain(id, { onPending: (status) => console.log(status) });
 ```
 
 ---
