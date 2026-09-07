@@ -870,6 +870,27 @@ async function verifyLog(signerKey, logText) {
   return { ok: true, lines };
 }
 
+/**
+ * Check that the device still holds the private half of the logger key it just
+ * handed over: `/api/logger/key` answers with the public key, a fresh nonce and
+ * that nonce's Ed25519 signature. Verifying a log file against a key nobody has
+ * proved possession of shows only that the file is self-consistent, so do this
+ * first and treat a false as "this device did not sign anything".
+ *
+ * @param {{key: string, nonce: string, nonce_signed: string}} loggerKey  getLoggerKey()'s answer
+ * @returns {Promise<boolean>}
+ */
+async function verifyLoggerKey(loggerKey) {
+  const { key, nonce, nonce_signed: signature } = loggerKey ?? {};
+  if (!key || !nonce || !signature) return false;
+  try {
+    const pubKey = await crypto.subtle.importKey('raw', fromB64(key), { name: 'Ed25519' }, false, ['verify']);
+    return await crypto.subtle.verify({ name: 'Ed25519' }, pubKey, fromB64(signature), fromB64(nonce));
+  } catch {
+    return false;      // a key that will not even import has not signed anything
+  }
+}
+
 // --- /api/crypto/* shared options ---------------------------------------------
 
 // Device limits. Exceeding either surfaces as an opaque HTTP 400, so the SDK
@@ -916,6 +937,18 @@ function checkMsgSize(op, data) {
 }
 
 // --- Main class ---------------------------------------------------------------
+
+/**
+ * Default usage constraint for a create/derive request, by key type. The field
+ * says what a key may be used for, and only a key that could do two jobs needs
+ * one: the reference client (hem-api-tester test_10) sends `mode` for the NIST
+ * curves (`ECDH,ExDSA`) and for nothing else, so a caller creating a SECP* key
+ * passes it in. The two 25519 entries below are redundant but long-standing —
+ * the SDK has always sent them and the device takes them — while a `mode` of
+ * `AES256` or `MLKEM768`, which is what the old `MODE[type] ?? type` produced,
+ * was never anything the device asked for.
+ */
+const KEY_MODE = { ED25519: 'ExDSA', CURVE25519: 'ECDH' };
 
 class HEM {
   #baseUrl;
@@ -970,6 +1003,19 @@ class HEM {
   #cachePurge() {
     const now = Math.floor(Date.now() / 1000);
     this.#tokenCache = this.#tokenCache.filter(e => e.exp > now);
+  }
+
+  /**
+   * What this session can still do without asking the user again: one entry per
+   * cached scope, with the second it stops working. The JWTs themselves stay in
+   * here — a page has no use for them, and something that can be shown on screen
+   * or written to a log should not be a bearer token.
+   *
+   * @returns {Array<{scope: string, exp: number}>}
+   */
+  get tokens() {
+    this.#cachePurge();
+    return this.#tokenCache.map(({ scope, exp }) => ({ scope, exp }));
   }
 
   /** Remove all cached tokens (e.g. on logout). */
@@ -1095,9 +1141,11 @@ class HEM {
    * @returns {Promise<string>}  JWT token
    */
   async authorizeMaster(mnemonic, scope, expSeconds = 300, { legacy = false } = {}) {
-    const cached = this.#cacheFind(scope);
-    if (cached) return cached;
-
+    // No cache read here, deliberately. A cached token for this scope may have
+    // come from the password, and a caller asking to authorise with the master
+    // secret is asking for that key in particular — handing back a token the
+    // words never touched would be a lie about who authorised what. The result
+    // is cached, so what follows still reuses it.
     const seed = legacy ? await legacyMasterSeed(mnemonic) : await mnemonicToEntropy(mnemonic);
     if (seed.length !== 32) {
       throw new HemError('The master secret must be 24 words (256 bits)', { code: 'mnemonic_invalid', data: { bytes: seed.length } });
@@ -1471,22 +1519,34 @@ class HEM {
   }
 
   // -- Key Management ----------------------------------------------------------
+  //
+  // Field sizes, confirmed by the product owner on 2026-09-04: a label is ASCII
+  // 0x20-0x7F, up to 32 characters, and a description is a 64-byte field carried
+  // as base64. The firmware in preparation doubles both — 64 characters and 128
+  // bytes. A caller that has to work with modules already in the field holds to
+  // the smaller sizes; the SDK polices neither, it sends what it is given and
+  // the device rejects what will not fit.
 
   /**
    * Generate a new key in the HSM.
    *
    * Required scope: 'keymgmt:gen'
    *
-   * @param {string} token   Bearer JWT
-   * @param {string} label   Human-readable key label
-   * @param {string} type    Key type, e.g. 'ED25519'
-   * @param {string} descr   Base64-encoded description (128-byte field)
+   * @param {string}      token   Bearer JWT
+   * @param {string}      label   Human-readable key label
+   * @param {string}      type    Key type, e.g. 'ED25519'
+   * @param {string}      descr   Base64-encoded description (see the field sizes above)
+   * @param {string|null} [mode]  Usage constraint. The NIST curves (SECP*) can
+   *                              do both jobs, so they need one: 'ECDH',
+   *                              'ExDSA' or 'ECDH,ExDSA'. Everything else has
+   *                              exactly one use and the field is left out.
    * @returns {Promise<{kid: string}>}
    */
-  async createKeyPair(token, label, type, descr) { // label max 32 chars, descr base64-encoded (max 64 chars)
-    const MODE = { ED25519: 'ExDSA', CURVE25519: 'ECDH' };
-    const mode = MODE[type] ?? type;
-    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/create`, { mode, type, label, descr }, token);
+  async createKeyPair(token, label, type, descr, mode = null) {
+    const body = { type, label, descr };
+    const use = mode ?? KEY_MODE[type] ?? null;
+    if (use) body.mode = use;
+    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/create`, body, token);
   }
 
   /**
@@ -1495,11 +1555,11 @@ class HEM {
    * Required scope: 'keymgmt:imp'
    *
    * @param {string}      token       Bearer JWT (must have keymgmt:imp scope)
-   * @param {string}      label       Key label (max 32 chars)
+   * @param {string}      label       Key label (see the field sizes above)
    * @param {string}      type        Key type, e.g. 'ED25519', 'CURVE25519', 'SECP384R1'
    * @param {Uint8Array}  pubKeyBytes Public key bytes: raw 32/56/57 B for 25519/448 types,
    *                                  compressed SEC1 point (0x02/0x03||X) for SECP* types
-   * @param {string|null} [descr]     Optional base64-encoded description (128-byte field)
+   * @param {string|null} [descr]     Optional base64-encoded description (see the field sizes above)
    * @param {string|null} [mode]      Optional usage constraint for NIST ECC keys:
    *                                  'ECDH', 'ExDSA' or 'ECDH,ExDSA'
    * @returns {Promise<{kid: string}>}
@@ -1517,18 +1577,19 @@ class HEM {
    * Required scope: 'keymgmt:gen'
    *
    * @param {string} token        Bearer JWT
-   * @param {string} label        Human-readable key label (max 32 chars)
+   * @param {string} label        Human-readable key label (see the field sizes above)
    * @param {string} type         Key type of the derived key, e.g. 'ED25519'
-   * @param {string} descr        Base64-encoded description (128-byte field)
+   * @param {string} descr        Base64-encoded description (see the field sizes above)
    * @param {string} kid          KID of the existing ECDH key to derive from
    * @param {string} peerPubKeyBase64  Peer's raw public key (standard base64)
+   * @param {string|null} [mode]  Usage constraint, as in createKeyPair()
    * @returns {Promise<{kid: string}>}
    */
-  async deriveKey(token, label, type, descr, kid, peerPubKeyBase64) {
-    const MODE = { ED25519: 'ExDSA', CURVE25519: 'ECDH' };
-    const mode = MODE[type] ?? type;
-    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/derive`,
-      { mode, type, label, descr, kid, pubkey: peerPubKeyBase64 }, token);
+  async deriveKey(token, label, type, descr, kid, peerPubKeyBase64, mode = null) {
+    const body = { type, label, descr, kid, pubkey: peerPubKeyBase64 };
+    const use = mode ?? KEY_MODE[type] ?? null;
+    if (use) body.mode = use;
+    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/derive`, body, token);
   }
 
   /**
@@ -1538,7 +1599,7 @@ class HEM {
    *
    * @param {string} token  Bearer JWT
    * @param {string} kid    Key ID to update
-   * @param {string} label  New label (max 32 chars)
+   * @param {string} label  New label (see the field sizes above)
    * @param {string} descr  New base64-encoded description
    * @returns {Promise<object>}
    */
@@ -1550,7 +1611,8 @@ class HEM {
   /**
    * Get public key metadata (type, pubkey) for a given KID.
    *
-   * Required scope: 'keymgmt:use:<KID>'
+   * Required scope: 'keymgmt:get' (the crypto operations on the same key are
+   * the ones that need 'keymgmt:use:<KID>')
    *
    * @param {string} token   Bearer JWT
    * @param {string} kid     Key ID (hex string)
@@ -1561,28 +1623,32 @@ class HEM {
   }
 
   /**
-   * List keys in the HSM repository.
-   * Returns an array of { kid, label, type, description } where description
-   * is a Uint8Array (raw 128-byte field) or null.
+   * One page of the HSM key repository, with the size of the whole repository
+   * so a caller knows whether to ask for another page. Entries carry the same
+   * fields as searchKeys(); `description` is a Uint8Array (the raw 128-byte
+   * field) or null, `created` and `updated` are Unix seconds or null.
    *
    * Required scope: 'keymgmt:list'
    *
    * @param {string} token   Bearer JWT
    * @param {number} [offset=0]
    * @param {number} [limit=50]
-   * @returns {Promise<Array<{kid:string, label:string, type:string, description:Uint8Array|null}>>}
+   * @returns {Promise<{list: Array<{kid:string, label:string, type:string, created:number|null, updated:number|null, description:Uint8Array|null}>, total:number}>}
    */
   async listKeys(token, offset = 0, limit = 50) {
     const data = await this.#req(
       'GET', `${this.#baseUrl}/api/keymgmt/list/${offset}/${limit}`,
       null, token
     );
-    return (data.list ?? []).map(entry => ({
+    const list = (data.list ?? []).map(entry => ({
       kid: entry.kid,
       label: entry.label ?? '',
       type: entry.type ?? '',
+      created: entry.created ?? null,
+      updated: entry.updated ?? null,
       description: entry.descr ? fromB64(entry.descr) : null,
     }));
+    return { list, total: Number.isFinite(data.total) ? data.total : offset + list.length };
   }
 
   // -- Cryptography ------------------------------------------------------------
@@ -2040,6 +2106,39 @@ class HEM {
   }
 
   /**
+   * Change the password this device is unlocked with. The new password never
+   * travels: what goes over is the X25519 public key it derives to, and a proof
+   * that whoever sent it can also do ECDH with the device — an HMAC of the
+   * device's own nonce under the shared secret. A module that took a public key
+   * without that proof would take one from anybody who could reach this endpoint.
+   *
+   * The master passphrase is not touched: this is the everyday password, and the
+   * 24 words still open the device if it is forgotten.
+   *
+   * Required scope: 'system:config'
+   *
+   * @param {string} token        Bearer JWT
+   * @param {string} newPassword
+   * @returns {Promise<object>}
+   */
+  async setUserPassword(token, newPassword) {
+    const cfg = await this.getConfig(token);
+    const { eid, spk, nonce } = cfg;
+    if (!eid || !spk || !nonce) {
+      throw new HemError('The device did not send eid, spk and nonce to change a password against', { code: 'config_incomplete' });
+    }
+    const user = await this.#deriveX25519(newPassword, eid);
+    const shared = await x25519(user.privKey, fromB64(spk));
+    const hmacKey = await crypto.subtle.importKey('raw', shared, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, fromB64(nonce)));
+    return this.setConfig(token, {
+      userkey: user.pubkeyB64,
+      userkey_nonce: nonce,
+      userkey_hmac: toB64(mac),
+    });
+  }
+
+  /**
    * Read the device configuration.
    *
    * Required scope: 'system:config'
@@ -2365,5 +2464,5 @@ class HEM {
 
 }
 
-export { Broker, HEM, HemError, entropyToMnemonic, generateMnemonic, jwtParse, mnemonicToEntropy, validateMnemonic, verifyLog };
+export { Broker, HEM, HemError, entropyToMnemonic, generateMnemonic, jwtParse, mnemonicToEntropy, validateMnemonic, verifyLog, verifyLoggerKey };
 //# sourceMappingURL=hem-sdk.browser.js.map

@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { HEM, Broker, HemError, jwtParse, verifyLog, generateMnemonic, entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '../hem-sdk.js';
+import { HEM, Broker, HemError, jwtParse, verifyLog, verifyLoggerKey, generateMnemonic, entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '../hem-sdk.js';
 
 const b64 = (bytes) => Buffer.from(bytes).toString('base64');
 const b64url = (bytes) => Buffer.from(bytes).toString('base64url');
@@ -24,6 +24,7 @@ const state = {
   devKeys: null,          // X25519 key pair of the mock device
   spkB64: null,
   eid: 'eid-salt-1234',
+  configNonce: null,      // what a password change proves possession against
   log: [],                // every request: { method, path, body }
   eventPolls: 0,          // 202 until this reaches eventReadyAfter
   eventReadyAfter: 2,
@@ -34,6 +35,11 @@ const state = {
   provisioned: false,
   domainTaken: { my: true },
   paired: true,
+  keys: [
+    { kid: 'K1', label: 'git-signing', type: 'ATT,PKEY,ExDSA,ED25519', descr: Buffer.from('Commits and tags').toString('base64'), created: 1738454400, updated: 1738454400 },
+    { kid: 'K2', label: 'wg-peer-03', type: 'PKEY,ECDH,CURVE25519', descr: Buffer.from('WireGuard identity').toString('base64'), created: 1738454401, updated: 1738454402 },
+    { kid: 'K3', label: 'bob', type: 'ED25519', descr: '', created: 1751846400, updated: 1751846400 },
+  ],
 };
 
 async function verifyEjwt(ejwt) {
@@ -69,7 +75,9 @@ async function handle(req, res) {
     return json(res, 200, { status: 'ok', newfws: 'v2.0.1+/x', newuis: null });
   }
   if (path === '/dev/api/system/version') return json(res, 200, { hwv: '1', blv: '1', fwv: '2', fws: 'x', conf: 'PPA' });
-  if (path === '/dev/api/system/config' && req.method === 'GET') return json(res, 200, { eid: state.eid, user: 'Ann', email: 'ann@example.com', hostname: 'my.ence.do' });
+  if (path === '/dev/api/system/config' && req.method === 'GET') {
+    return json(res, 200, { eid: state.eid, user: 'Ann', email: 'ann@example.com', hostname: 'my.ence.do', spk: state.spkB64, nonce: state.configNonce });
+  }
   if (path === '/dev/api/system/config' && req.method === 'POST') {
     if (body.gen_csr) return json(res, 200, { genuine: 'GEN', csr: 'CSR' });
     return json(res, 200, { updated: true, received: body });
@@ -96,7 +104,14 @@ async function handle(req, res) {
   if (path === '/dev/api/auth/ext/validate') return json(res, 200, { confirmed: body.pid });
   if (path === '/dev/api/auth/ext/mac') return json(res, 200, { nonce: 'N', mac: 'M', eid: state.eid });
   if (path === '/dev/api/system/upgrade/upload_fw') return json(res, 200, { bytes: raw.length, ct: req.headers['content-type'] });
-  if (path === '/dev/api/logger/key') return json(res, 200, { key: state.loggerKeyB64 });
+  if (path === '/dev/api/keymgmt/create') return json(res, 200, { kid: 'NEW1' });
+  if (path.startsWith('/dev/api/keymgmt/get/')) return json(res, 200, { type: 'ED25519', pubkey: 'PUB', updated: 1738454400 });
+  if (path.startsWith('/dev/api/keymgmt/list/')) {
+    const [offset, limit] = path.split('/').slice(-2).map(Number);
+    const page = state.keys.slice(offset, offset + limit);
+    return json(res, 200, { total: state.keys.length, listed: page.length, list: page });
+  }
+  if (path === '/dev/api/logger/key') return json(res, 200, { key: state.loggerKeyB64, nonce: state.loggerNonce, nonce_signed: state.loggerNonceSig });
   if (path.startsWith('/dev/api/logger/')) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(state.logText); }
 
   // ---- broker ------------------------------------------------------------------
@@ -165,6 +180,62 @@ test('authorizePassword signs an eJWT the device accepts and caches the token', 
   assert.equal(state.log.length, before, 'no request for a cached scope');
   const t3 = await hem.authorizePassword(null, 'system:config');
   assert.equal(jwtParse(t3).scope, 'system:config', 'escalation reuses derived keys without a password');
+});
+
+test('a password change sends the new public key and a proof it can be used', async () => {
+  state.configNonce = b64(crypto.getRandomValues(new Uint8Array(32)));
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'system:config');
+  await hem.setUserPassword(token, 'a new password');
+
+  const sent = state.log.filter((e) => e.path === '/dev/api/system/config' && e.method === 'POST').at(-1).body;
+  assert.deepEqual(Object.keys(sent).sort(), ['userkey', 'userkey_hmac', 'userkey_nonce']);
+  assert.equal(sent.userkey_nonce, state.configNonce);
+  assert.equal(fromB64(sent.userkey).length, 32, 'a public key, not a password');
+
+  // The device checks the proof by doing the same ECDH from its side.
+  const userPub = await crypto.subtle.importKey('raw', fromB64(sent.userkey), 'X25519', false, []);
+  const shared = await crypto.subtle.deriveBits({ name: 'X25519', public: userPub }, state.devKeys.privateKey, 256);
+  const key = await crypto.subtle.importKey('raw', shared, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  assert.equal(await crypto.subtle.verify('HMAC', key, fromB64(sent.userkey_hmac), fromB64(state.configNonce)), true);
+
+  // And the key really is the one that password derives to.
+  const same = mk();
+  await same.authorizePassword('a new password', 'system:config');
+  const proof = state.log.filter((e) => e.path === '/dev/api/auth/token' && e.method === 'POST').at(-1).body;
+  const payload = JSON.parse(Buffer.from(proof.auth.split('.')[1], 'base64url').toString());
+  assert.equal(payload.iss, sent.userkey, 'the module can now be unlocked with it');
+});
+
+test('authorising with the master secret never reuses a token the words did not make', async () => {
+  const hem = mk();
+  await hem.authorizePassword('correct horse', 'system:config');    // a cached token for that scope
+  assert.equal(hem.tokens.length, 1);
+
+  const mnemonic = await generateMnemonic();
+  await assert.rejects(hem.authorizeMaster(mnemonic.replace(/^\S+/, 'zoo'), 'system:config'), (e) => e.code === 'mnemonic_checksum',
+    'the cached token must not stand in for checking the words');
+  await assert.rejects(hem.authorizeMaster('four words only here', 'system:config'), (e) => /mnemonic/.test(e.code));
+
+  const before = state.log.filter((e) => e.path === '/dev/api/auth/token' && e.method === 'POST').length;
+  await hem.authorizeMaster(mnemonic, 'system:config');
+  const after = state.log.filter((e) => e.path === '/dev/api/auth/token' && e.method === 'POST');
+  assert.equal(after.length, before + 1, 'it went to the device with the master key');
+  const payload = JSON.parse(Buffer.from(after.at(-1).body.auth.split('.')[1], 'base64url').toString());
+  const fromWords = await mnemonicToEntropy(mnemonic);
+  assert.notEqual(payload.iss, undefined);
+  assert.equal(fromWords.length, 32);
+});
+
+test('the token cache can be looked at without handing out the tokens', async () => {
+  const hem = mk();
+  assert.deepEqual(hem.tokens, []);
+  await hem.authorizePassword('correct horse', 'keymgmt:list', 120);
+  await hem.authorizePassword(null, 'logger:get');
+  assert.deepEqual(hem.tokens.map((t) => t.scope).sort(), ['keymgmt:list', 'logger:get']);
+  assert.ok(hem.tokens.every((t) => typeof t.exp === 'number' && !('token' in t)), 'scope and expiry, nothing else');
+  hem.clearCache();
+  assert.deepEqual(hem.tokens, []);
 });
 
 test('authorizeRemote polls the broker until the phone answers', async () => {
@@ -279,6 +350,10 @@ async function buildLog() {
   state.loggerKeyB64 = b64(new Uint8Array(await crypto.subtle.exportKey('raw', keys.publicKey)));
   const nonce = crypto.getRandomValues(new Uint8Array(32));
   const sig = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, keys.privateKey, nonce));
+  // What /api/logger/key answers with: the key, a fresh nonce, and its signature.
+  const proof = crypto.getRandomValues(new Uint8Array(32));
+  state.loggerNonce = b64(proof);
+  state.loggerNonceSig = b64(new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, keys.privateKey, proof)));
   const hmacKey = await crypto.subtle.importKey('raw', nonce, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const seal = async (prefix) => {
     const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, Buffer.from(prefix))).subarray(0, 16);
@@ -307,6 +382,19 @@ test('verifyLog accepts a well-formed log and names the first bad line', async (
   assert.equal((await verifyLog(wrongKey, state.logText)).reason, 'signature');
 });
 
+test('the logger key is only worth something if the device signed its nonce', async () => {
+  await buildLog();
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'logger:get');
+  const answer = await hem.getLoggerKey(token);
+  assert.equal(await verifyLoggerKey(answer), true);
+
+  assert.equal(await verifyLoggerKey({ ...answer, nonce: b64(crypto.getRandomValues(new Uint8Array(32))) }), false, 'a nonce it did not sign');
+  assert.equal(await verifyLoggerKey({ ...answer, key: state.spkB64 }), false, 'another key entirely');
+  assert.equal(await verifyLoggerKey({ key: answer.key }), false, 'no proof at all');
+  assert.equal(await verifyLoggerKey(undefined), false);
+});
+
 test('verifyLogEntry fetches key and file and verifies them', async () => {
   const hem = mk();
   const token = await hem.authorizePassword('correct horse', 'logger:get');
@@ -319,6 +407,40 @@ test('verifyLogEntry fetches key and file and verifies them', async () => {
 // ---- BIP39 master secret -------------------------------------------------------------
 
 // The official BIP39 English vectors (Trezor test set).
+test('listKeys pages the repository and reports its total', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'keymgmt:list');
+  const first = await hem.listKeys(token, 0, 2);
+  assert.equal(first.total, 3);
+  assert.deepEqual(first.list.map((k) => k.kid), ['K1', 'K2']);
+  assert.equal(first.list[0].label, 'git-signing');
+  assert.equal(Buffer.from(first.list[0].description).toString(), 'Commits and tags');
+  assert.equal(first.list[0].created, 1738454400);
+  assert.equal(first.list[1].updated, 1738454402);
+
+  const second = await hem.listKeys(token, 2, 2);
+  assert.deepEqual(second.list.map((k) => k.kid), ['K3']);
+  assert.equal(second.list[0].description, null, 'an empty description is null, not an empty array');
+  assert.equal(second.total, 3);
+});
+
+test('createKeyPair sends a mode only where the device wants one', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'keymgmt:gen');
+  const sent = () => state.log.filter((e) => e.path === '/dev/api/keymgmt/create').at(-1).body;
+
+  await hem.createKeyPair(token, 'signing', 'ED25519', 'ZA==');
+  assert.equal(sent().mode, 'ExDSA', 'the 25519 defaults are unchanged');
+  await hem.createKeyPair(token, 'wrap', 'MLKEM768', 'ZA==');
+  assert.equal('mode' in sent(), false, 'a key with one possible use carries no mode');
+  await hem.createKeyPair(token, 'nist', 'SECP384R1', 'ZA==', 'ECDH,ExDSA');
+  assert.equal(sent().mode, 'ECDH,ExDSA', "a curve that can do both takes the caller's word");
+  assert.deepEqual(Object.keys(sent()).sort(), ['descr', 'label', 'mode', 'type']);
+
+  const pub = await hem.getPubKey(token, 'NEW1');
+  assert.equal(pub.pubkey, 'PUB');
+});
+
 const VECTORS = [
   ['00000000000000000000000000000000', 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'],
   ['0000000000000000000000000000000000000000000000000000000000000000', ('abandon '.repeat(23) + 'art')],

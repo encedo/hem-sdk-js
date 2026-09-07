@@ -39,7 +39,7 @@ const hem = new HEM('https://abc.ence.do');
 
 const health = await hem.hemCheckin();                      // once, first; { status, newfws?, newuis? }
 const token  = await hem.authorizePassword('my-password', 'keymgmt:list');
-const keys   = await hem.listKeys(token);
+const { list, total } = await hem.listKeys(token);            // one page, and how many keys there are
 ```
 
 ## Device and broker
@@ -75,13 +75,13 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | **Provisioning and domains** | `provision` / `installProvisioning` (device certificate), `registerDomain` (`<prefix>.ence.do` + TLS) |
 | **Key management** | `listKeys`, `searchKeys`, `getPubKey`, `createKeyPair`, `deriveKey`, `importPublicKey`, `updateKey`, `deleteKey` |
 | **Cryptography** | `exdsaSign(Bytes)`/`exdsaVerify` (EdDSA/ECDSA), `ecdh`/`ecdhKid`, `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt`, `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum) |
-| **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `getAttestation`, `reboot`, `shutdown`, `selftest` |
+| **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `setUserPassword`, `getAttestation`, `reboot`, `shutdown`, `selftest` |
 | **Upgrade** | `usbMode`, `uploadFirmware`/`checkFirmware`/`installFirmware`, `uploadUi`/`checkUi`/`installUi` (uploads take `onProgress`) |
 | **Storage** | `lockStorage`, `unlockStorage` |
 | **Audit log** | `getLoggerKey`, `listLog`, `getLogEntry`, `verifyLogEntry` |
 | **Cache** | `clearCache`, `clearKeys` |
 | **Broker** (`hem.broker`) | `checkin`, `session`, `eventNew`/`eventCheck`/`eventDelete`/`waitEvent`, `registerInit`/`registerCheck`/`registerFinalise`/`waitRegistration`, `subscribersList`/`subscribersDelete`, `download`, `domainPredefs`/`domainTaken`/`domainRegister`, `provisioning`, `shareEmailPubkey` |
-| **Helpers** (exported functions) | `verifyLog` (audit-log integrity, pure Web Crypto), `jwtParse` |
+| **Helpers** (exported functions) | `verifyLog` (audit-log integrity, pure Web Crypto), `verifyLoggerKey` (the device signed the nonce it sent with the key), `jwtParse` |
 
 ### The master secret
 
@@ -111,8 +111,9 @@ Every JWT is issued for a scope that authorizes a class of operations:
 | `keymgmt:imp` | `importPublicKey` |
 | `keymgmt:upd` | `updateKey` |
 | `keymgmt:del` | `deleteKey` |
-| `keymgmt:use:<KID>` | `getPubKey` and all `/crypto/*` operations on that key |
-| `system:config` | `getConfig`, `setConfig`, `registerExtAuth`, `listExtAuth`, `deleteExtAuth`, `registerDomain` |
+| `keymgmt:get` | `getPubKey` |
+| `keymgmt:use:<KID>` | all `/crypto/*` operations on that key |
+| `system:config` | `getConfig`, `setConfig`, `setUserPassword`, `registerExtAuth`, `listExtAuth`, `deleteExtAuth`, `registerDomain` |
 | `system:upgrade` | all upgrade operations |
 | `storage:disk<N>:rw` | `lockStorage`, `unlockStorage` for that disk |
 | `logger:get` | `getLoggerKey`, `listLog`, `getLogEntry`, `verifyLogEntry` |

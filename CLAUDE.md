@@ -97,6 +97,24 @@ changes reach no consumer: `hemCheckin` returning an object is still truthy,
 cancellation as `HemError` (`aborted`) is only ever caught by code, and the
 `initialize` signature change touches a method no consumer calls.
 
+`listKeys()` returns `{ list, total }` instead of a bare array (2026-09-04), and
+its entries carry `created` / `updated` like `searchKeys()` does. The device has
+always answered `{ list, total, listed }`; dropping `total` meant a UI could not
+say how many keys there are, or page without guessing. Nothing outside this repo
+calls `listKeys` (grep over every sibling consumer: they all use `searchKeys`),
+so the break costs nobody a fix.
+
+`createKeyPair()` and `deriveKey()` take `mode` as a last argument and send the
+field only when there is one (2026-09-04). `mode` says what a key may be used
+for, and only a key that can do two jobs needs telling: hem-api-tester test_10
+sends it for the four SECP* curves and for nothing else. The old
+`MODE[type] ?? type` sent `mode: 'AES256'` for an AES key and `mode: 'MLKEM768'`
+for a ML-KEM one, and had no way to say `ECDH,ExDSA`. Consumers create only
+CURVE25519 and ED25519 keys, whose defaults are unchanged, so the request they
+send is byte for byte what it was — and `encedo-oidc-boundle`'s divergent copy
+already had this exact signature, against real devices, which is the best
+evidence the shaping is right.
+
 ## The master secret (BIP39)
 
 256 bits from `crypto.getRandomValues` ARE the master X25519 private key, and

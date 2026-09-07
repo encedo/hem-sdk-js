@@ -19,6 +19,9 @@ export interface LogVerification {
 /** Verify an audit-log file against the device's logger key (`key` from getLoggerKey()). */
 export declare function verifyLog(signerKey: string, logText: string): Promise<LogVerification>;
 
+/** Verify that the device signed getLoggerKey()'s nonce, so the key is one it holds. */
+export declare function verifyLoggerKey(loggerKey: { key: string; nonce: string; nonce_signed: string }): Promise<boolean>;
+
 /**
  * BIP39 master secret. The entropy behind the words IS the master X25519
  * private key, so the 24 words on a Proof of Personalization are the key.
@@ -87,12 +90,20 @@ export interface HemKey {
   kid: string;
   label: string;
   type: string;
+  /** Unix seconds, when the device reports them. */
+  created: number | null;
+  updated: number | null;
+  /** The raw 128-byte description field, or null when it is empty. */
   description: Uint8Array | null;
 }
 
-export interface HemSearchKey extends HemKey {
-  created: number | null;
-  updated: number | null;
+/** listKeys() and searchKeys() return the same entries. */
+export type HemSearchKey = HemKey;
+
+/** One page of the key repository plus the size of the whole repository. */
+export interface HemKeyPage {
+  list: HemKey[];
+  total: number;
 }
 
 /**
@@ -185,17 +196,23 @@ export declare class HEM {
     ) => void;
   } & PollOpts): Promise<unknown>;
 
-  listKeys(token: string, offset?: number, limit?: number): Promise<HemKey[]>;
+  /** One page; `total` is the whole repository, so a caller can page on. */
+  listKeys(token: string, offset?: number, limit?: number): Promise<HemKeyPage>;
   /**
    * Prefix search over the description field. Pass the plain pattern — the SDK
    * base64-encodes it and adds the '^' anchor. limit <= 0 leaves the device
    * default (15). token may be null when the device allows anonymous search.
    */
-  searchKeys(token: string | null, descr: string | Uint8Array, offset?: number, limit?: number): Promise<HemSearchKey[]>;
-  getPubKey(token: string, kid: string): Promise<string>;
-  createKeyPair(token: string, label: string, type: string, descr: string): Promise<{ kid: string }>;
+  searchKeys(token: string | null, descr: string | Uint8Array, offset?: number, limit?: number): Promise<HemKey[]>;
+  getPubKey(token: string, kid: string): Promise<{ type: string; pubkey: string; updated?: number }>;
+  /**
+   * `mode` ('ECDH', 'ExDSA' or 'ECDH,ExDSA') is needed by the SECP* curves, which can do both.
+   * `label` is ASCII 0x20-0x7F, up to 32 characters, and `descr` the base64 of a 64-byte
+   * field; the firmware in preparation doubles both. The device rejects what does not fit.
+   */
+  createKeyPair(token: string, label: string, type: string, descr: string, mode?: string | null): Promise<{ kid: string }>;
   importPublicKey(token: string, label: string, type: string, pubKeyBytes: Uint8Array, descr?: string | null, mode?: string | null): Promise<{ kid: string }>;
-  deriveKey(token: string, label: string, type: string, descr: string, kid: string, peerPubKeyBase64: string): Promise<{ kid: string }>;
+  deriveKey(token: string, label: string, type: string, descr: string, kid: string, peerPubKeyBase64: string, mode?: string | null): Promise<{ kid: string }>;
   updateKey(token: string, kid: string, label: string, descr: string): Promise<unknown>;
   exdsaSignBytes(token: string, kid: string, data: Uint8Array, alg?: string, ctx?: string | null): Promise<string>;
   exdsaVerify(token: string, kid: string, data: Uint8Array, sig: string, alg?: string): Promise<boolean>;
@@ -219,6 +236,8 @@ export declare class HEM {
   getVersion(opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ hwv: string; blv: string; fwv: string; fws: string; conf: string }>;
   getStatus(opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<Record<string, unknown>>;
   getConfig(token: string): Promise<Record<string, unknown>>;
+  /** Change the everyday password. Sends the key it derives to, plus a proof of ECDH; the 24 words are untouched. */
+  setUserPassword(token: string, newPassword: string): Promise<unknown>;
   setConfig(token: string, cfg: Record<string, unknown>): Promise<{ updated: boolean }>;
   reboot(token: string): Promise<unknown>;
   shutdown(token: string): Promise<unknown>;
@@ -257,6 +276,8 @@ export declare class HEM {
 
   clearCache(): void;
 
+  /** Cached scopes and when each stops working — the tokens themselves stay inside. */
+  readonly tokens: Array<{ scope: string; exp: number }>;
   /** Discard cached derived keys and all JWT tokens (call on logout). */
   clearKeys(): void;
 }

@@ -193,11 +193,14 @@ const phones = await hem.listExtAuth(token);      // [{ pid, ... }]
 await hem.deleteExtAuth(token, phones[0].pid);    // unpair on the broker
 ```
 
-A paired phone also exists in the device's keychain as a key whose description
-is `base64('EXTAID') + pid`; remove that entry too when unpairing:
+A paired phone also exists in the device's keychain as a key whose description,
+as base64, reads `'RVhUQUlE' + pid` — `base64('EXTAID')` with the pid (itself
+base64) written straight after it. `searchKeys` takes the field's bytes, so
+decode that string before searching; remove the entry too when unpairing:
 
 ```js
-const entries = await hem.searchKeys(listToken, 'EXTAID' + phones[0].pid);
+const field = Uint8Array.from(atob('RVhUQUlE' + phones[0].pid), (c) => c.charCodeAt(0));
+const entries = await hem.searchKeys(listToken, field);
 for (const k of entries) await hem.deleteKey(delToken, k.kid);
 ```
 
@@ -236,8 +239,11 @@ await hem.registerDomain(token, 'alice', { newCertificate: false });
 ```js
 const token = await hem.authorizePassword('my-password', 'keymgmt:list');
 
-// List — paginated; returns [{ kid, label, type, description }]
-const keys = await hem.listKeys(token, 0, 50);
+// List — one page at a time. `total` is the size of the whole repository,
+// so a caller knows whether to ask for the next page.
+// list: [{ kid, label, type, created, updated, description }]
+const { list, total } = await hem.listKeys(token, 0, 50);
+const all = list.length < total ? list.concat((await hem.listKeys(token, list.length, 50)).list) : list;
 ```
 
 ```js
@@ -267,6 +273,10 @@ const genToken = await hem.authorizePassword('my-password', 'keymgmt:gen');
 const { kid } = await hem.createKeyPair(genToken, 'My signing key', 'ED25519',
   btoa('purpose: document signing'));
 
+// The NIST curves can sign AND agree, so they need to be told which:
+const nistKid = await hem.createKeyPair(genToken, 'Work P-384', 'SECP384R1',
+  btoa('purpose: both'), 'ECDH,ExDSA');
+
 // Derive a key from an existing ECDH key + a peer public key
 const derived = await hem.deriveKey(genToken, 'Derived key', 'ED25519',
   btoa('derived'), ecdhKid, peerPubKeyBase64);
@@ -287,9 +297,9 @@ const nist = await hem.importPublicKey(impToken, 'Peer P-384', 'SECP384R1',
 const updToken = await hem.authorizePassword('my-password', 'keymgmt:upd');
 await hem.updateKey(updToken, kid, 'Renamed key', btoa('new description'));
 
-// Get public key metadata (scope: keymgmt:use:<KID>)
-const useToken = await hem.authorizePassword('my-password', `keymgmt:use:${kid}`);
-const pub = await hem.getPubKey(useToken, kid);
+// Get public key metadata: { type, pubkey, updated } (scope: keymgmt:get)
+const getToken = await hem.authorizePassword('my-password', 'keymgmt:get');
+const pub = await hem.getPubKey(getToken, kid);
 
 // Delete (scope: keymgmt:del)
 const delToken = await hem.authorizePassword('my-password', 'keymgmt:del');
