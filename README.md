@@ -76,7 +76,7 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | **Key management** | `listKeys`, `searchKeys`, `getPubKey`, `createKeyPair`, `deriveKey`, `importPublicKey`, `updateKey`, `deleteKey` |
 | **Cryptography** | `exdsaSign(Bytes)`/`exdsaVerify` (EdDSA/ECDSA), `ecdh`/`ecdhKid`, `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt`, `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum) |
 | **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `setUserPassword`, `getAttestation`, `reboot`, `shutdown`, `selftest` |
-| **Upgrade** | `usbMode`, `uploadFirmware`/`checkFirmware`/`installFirmware`, `uploadUi`/`checkUi`/`installUi` (uploads take `onProgress`) |
+| **Upgrade** | `usbMode`, `uploadFirmware`/`checkFirmware`/`waitFirmwareCheck`/`installFirmware`, `uploadUi`/`checkUi`/`waitUiCheck`/`installUi` (uploads take `onProgress`; the checks answer null while the device is still verifying, the waits poll) |
 | **Storage** | `lockStorage`, `unlockStorage` |
 | **Audit log** | `getLoggerKey`, `listLog`, `getLogEntry`, `verifyLogEntry` |
 | **Cache** | `clearCache`, `clearKeys` |

@@ -314,6 +314,21 @@ async function requestNode(method, url, headers, body, { signal = null, timeoutM
 
 // Wait, unless the caller cancels first. Cancelling rejects with the same
 // `aborted` HemError a cancelled request produces, so one catch handles both.
+/**
+ * Call `step` every `pollInterval` ms until it answers something other than
+ * null, or `pollTimeout` passes (HemError `timeout`), or `signal` cancels.
+ */
+async function pollUntil(step, timeoutMessage, { pollInterval = 2_000, pollTimeout = 60_000, onPending = null, signal = null } = {}) {
+  const deadline = Date.now() + pollTimeout;
+  while (Date.now() < deadline) {
+    const result = await step();
+    if (result !== null) return result;
+    if (onPending) onPending();
+    await sleep(pollInterval, signal);
+  }
+  throw new HemError(timeoutMessage, { code: 'timeout' });
+}
+
 function sleep(ms, signal = null) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(new HemError('Request aborted', { code: 'aborted' })); return; }
@@ -2268,15 +2283,32 @@ export class HEM {
   }
 
   /**
-   * Verify the firmware image previously uploaded with uploadFirmware().
+   * Verify the firmware image previously uploaded with uploadFirmware(). The
+   * device checks the signature in the background: it answers 201 or 202 while
+   * it is still at it, and this resolves null then — 200 with the result once
+   * it is done. waitFirmwareCheck() does the polling.
    *
    * Required scope: 'system:upgrade'
    *
    * @param {string} token  Bearer JWT
-   * @returns {Promise<object>}
+   * @returns {Promise<object|null>}  null while the device is still checking
    */
-  async checkFirmware(token) {
-    return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_fw`, null, token);
+  async checkFirmware(token, { signal = null } = {}) {
+    const r = await this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_fw`, null, token, { signal, withStatus: true });
+    return r.status === 200 ? r.data : null;
+  }
+
+  /**
+   * Poll checkFirmware() until the device has verified the image. Rejects with
+   * HemError `timeout`, `aborted`, or whatever the device answered (a 4xx means
+   * the image did not verify).
+   *
+   * @param {string} token
+   * @param {object} [opts]  pollInterval (4 s), pollTimeout (3 min), onPending, signal
+   * @returns {Promise<object>}  The device's answer to the check
+   */
+  waitFirmwareCheck(token, { pollInterval = 4_000, pollTimeout = 180_000, onPending = null, signal = null } = {}) {
+    return pollUntil(() => this.checkFirmware(token, { signal }), 'The firmware check did not finish in time', { pollInterval, pollTimeout, onPending, signal });
   }
 
   /**
@@ -2309,15 +2341,23 @@ export class HEM {
   }
 
   /**
-   * Verify the UI bundle previously uploaded with uploadUi().
+   * Verify the UI bundle previously uploaded with uploadUi(). As with
+   * checkFirmware(): null while the device is still checking, the result once
+   * it is done; waitUiCheck() polls.
    *
    * Required scope: 'system:upgrade'
    *
    * @param {string} token  Bearer JWT
-   * @returns {Promise<object>}
+   * @returns {Promise<object|null>}
    */
-  async checkUi(token) {
-    return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_ui`, null, token);
+  async checkUi(token, { signal = null } = {}) {
+    const r = await this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_ui`, null, token, { signal, withStatus: true });
+    return r.status === 200 ? r.data : null;
+  }
+
+  /** Poll checkUi() until the device has verified the bundle; see waitFirmwareCheck(). */
+  waitUiCheck(token, { pollInterval = 4_000, pollTimeout = 180_000, onPending = null, signal = null } = {}) {
+    return pollUntil(() => this.checkUi(token, { signal }), 'The UI bundle check did not finish in time', { pollInterval, pollTimeout, onPending, signal });
   }
 
   /**

@@ -481,12 +481,12 @@ await hem.uploadFirmware(token, fwBytes, 'firmware.bin', {
   onProgress: (loaded, total) => bar.value = loaded / total,   // browser only
   // signal: ac.signal,
 });
-await hem.checkFirmware(token);               // verify the uploaded image
+await hem.waitFirmwareCheck(token);           // the device verifies in the background; this polls until it is done
 await hem.installFirmware(token);             // device reboots afterwards
 
 // UI bundle — same pattern
 await hem.uploadUi(token, uiBytes);
-await hem.checkUi(token);
+await hem.waitUiCheck(token);
 await hem.installUi(token);
 ```
 

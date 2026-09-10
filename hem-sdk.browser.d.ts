@@ -253,13 +253,17 @@ export declare class HEM {
     onProgress?: (loaded: number, total: number) => void;
     signal?: AbortSignal;
   }): Promise<unknown>;
-  checkFirmware(token: string): Promise<unknown>;
+  /** null while the device is still checking (it answers 201/202); the result once it is done. */
+  checkFirmware(token: string, opts?: { signal?: AbortSignal }): Promise<Record<string, unknown> | null>;
+  /** Poll checkFirmware() until done. Rejects with `timeout`, `aborted`, or the device's 4xx. */
+  waitFirmwareCheck(token: string, opts?: PollOpts): Promise<Record<string, unknown>>;
   installFirmware(token: string): Promise<unknown>;
   uploadUi(token: string, bytes: Uint8Array, filename?: string, opts?: {
     onProgress?: (loaded: number, total: number) => void;
     signal?: AbortSignal;
   }): Promise<unknown>;
-  checkUi(token: string): Promise<unknown>;
+  checkUi(token: string, opts?: { signal?: AbortSignal }): Promise<Record<string, unknown> | null>;
+  waitUiCheck(token: string, opts?: PollOpts): Promise<Record<string, unknown>>;
   installUi(token: string): Promise<unknown>;
 
   lockStorage(token: string): Promise<unknown>;

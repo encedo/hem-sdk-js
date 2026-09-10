@@ -33,6 +33,7 @@ const state = {
   regReadyAfter: 1,
   deleted: [],
   provisioned: false,
+  fwChecks: 0,
   domainTaken: { my: true },
   paired: true,
   keys: [
@@ -103,7 +104,10 @@ async function handle(req, res) {
   if (path === '/dev/api/auth/ext/init') return json(res, 200, { eid: state.eid, request: 'REQUEST-JWT' });
   if (path === '/dev/api/auth/ext/validate') return json(res, 200, { confirmed: body.pid });
   if (path === '/dev/api/auth/ext/mac') return json(res, 200, { nonce: 'N', mac: 'M', eid: state.eid });
-  if (path === '/dev/api/system/upgrade/upload_fw') return json(res, 200, { bytes: raw.length, ct: req.headers['content-type'] });
+  if (path === '/dev/api/system/upgrade/upload_fw') { state.fwChecks = 0; return json(res, 200, { bytes: raw.length, ct: req.headers['content-type'] }); }
+  // The device verifies in the background: 202 while at it, 200 with the result once done.
+  if (path === '/dev/api/system/upgrade/check_fw') return ++state.fwChecks < 3 ? json(res, 202, null) : json(res, 200, { verified: true, fwv: 'v9' });
+  if (path === '/dev/api/system/upgrade/install_fw') return json(res, 200, { installing: true });
   if (path === '/dev/api/keymgmt/create') return json(res, 200, { kid: 'NEW1' });
   if (path.startsWith('/dev/api/keymgmt/get/')) return json(res, 200, { type: 'ED25519', pubkey: 'PUB', updated: 1738454400 });
   if (path.startsWith('/dev/api/keymgmt/list/')) {
@@ -353,6 +357,18 @@ test('provision installs a certificate once and is a no-op afterwards', async ()
   assert.deepEqual(cert, { crt: 'CERT', genuine: 'GEN' });
   assert.equal(state.provisioned, true);
   assert.equal(await hem.provision(), null);
+});
+
+test('the firmware check answers null while the device is still at it, and waitFirmwareCheck polls through', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'system:upgrade');
+  await hem.uploadFirmware(token, new Uint8Array([1, 2, 3]));
+  assert.equal(await hem.checkFirmware(token), null, '202: not done');
+  let pending = 0;
+  const result = await hem.waitFirmwareCheck(token, { pollInterval: 5, onPending: () => pending++ });
+  assert.deepEqual(result, { verified: true, fwv: 'v9' });
+  assert.equal(pending, 1, 'one more 202 before the 200');
+  assert.deepEqual(await hem.installFirmware(token), { installing: true });
 });
 
 test('uploadFirmware sends raw bytes as octet-stream (Node transport)', async () => {
