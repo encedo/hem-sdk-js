@@ -72,6 +72,14 @@ updated separately. **Always make SDK changes here**, never in a downstream copy
 - Caches: `#tokenCache` (scoped JWTs, auto-purged on expiry), `#derivedKeys`
   (derived X25519 key pair). `clearCache()` / `clearKeys()` drop them.
 
+## One line, no branches
+
+The SDK is shared, so it has a single line of history: `main`. Work goes there
+and goes out to every project that uses it. A change that breaks a consumer is
+allowed — see the table below for who calls what — but it is written down in
+[MIGRATION.md](MIGRATION.md) with what a project has to do about it, in the
+same commit that makes it.
+
 ## Downstream compatibility (checked 2026-09-03)
 
 The SDK is copied into live products, so the public surface only grows.
