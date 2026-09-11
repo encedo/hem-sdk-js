@@ -48,14 +48,22 @@ sends the field **only when the caller passes it**, which is what the reference
 client does: hem-api-tester test_10 creates all 23 supported types and sends
 `mode: 'ECDH,ExDSA'` for the four SECP* curves alone.
 
+A mode on a single-use key is allowed, and checked: the device refuses
+`mode: 'ECDH'` on an `ED25519` key with a 4xx, because that key signs and
+cannot agree anything. The SDK now catches that contradiction before the
+request and throws `HemError` with code `bad_mode`, naming both the type and
+the mode — an opaque status is no way to learn which argument was wrong. A mode
+that matches the one thing the key does is passed through, pointless but
+harmless, and a mode on any other type is sent as given.
+
 **Who this touches:** every project creates `ED25519` or `CURVE25519` keys, and
 those requests now carry one field fewer — the `mode: 'ExDSA'` / `mode: 'ECDH'`
-the SDK used to add. No call site changes; only the bytes on the wire. The
-device has taken both forms for as long as anyone has looked, and the reference
-sends the shorter one, but **this has not been tried against a module since the
-change** — create one key of each type against a real device before a release
-depends on it. A project creating SECP* keys passes `'ECDH,ExDSA'` (or one of
-the two) as the last argument.
+the SDK used to add, which was right but redundant. No call site changes; only
+the bytes on the wire, and the reference client sends the shorter form. Still,
+**this has not been tried against a module since the change** — create one key
+of each type against a real device before a release depends on it. A project
+creating SECP* keys passes `'ECDH,ExDSA'` (or one of the two) as the last
+argument.
 
 ## 3. `checkFirmware()` and `checkUi()` answer `null` while the device is still checking
 

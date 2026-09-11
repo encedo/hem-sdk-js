@@ -193,7 +193,9 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
 - `mode` on a create, derive or import is **only for the NIST curves**, where
   one key does both ECDH and ExDSA and has to be told which. The other 19 types
   the device supports take no `mode` at all, and the SDK sends one only when a
-  caller passes it — as hem-api-tester test_10 does. `searchKeys` needs the
+  caller passes it — as hem-api-tester test_10 does. It may be given on a
+  single-use key, but it is checked: `ECDH` on an ED25519 key is a 4xx from the
+  device, and `checkMode()` throws `bad_mode` for it before the request. `searchKeys` needs the
   pattern base64-encoded with a leading `^`; that mismatch silently breaks
   against a current device.
 - Storage lock/unlock has no disk argument: the disk is selected by the token

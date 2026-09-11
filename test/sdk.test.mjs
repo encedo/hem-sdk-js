@@ -476,6 +476,21 @@ test('createKeyPair sends a mode only where the device wants one', async () => {
     assert.equal('mode' in sent(), false, `${type} asked for a mode it has no use for`);
     assert.deepEqual(Object.keys(sent()).sort(), ['descr', 'label', 'type']);
   }
+  // A mode that matches the one thing the key does is allowed, if pointless.
+  await hem.createKeyPair(token, 'signing', 'ED25519', 'ZA==', 'ExDSA');
+  assert.equal(sent().mode, 'ExDSA', 'what the caller asked for is what goes');
+
+  // One that contradicts the type is refused here: the device answers 4xx for
+  // it, and an opaque status is no way to learn which argument was wrong.
+  for (const [type, mode] of [['ED25519', 'ECDH'], ['CURVE25519', 'ExDSA'], ['ED448', 'ECDH'], ['CURVE448', 'ECDH,ExDSA']]) {
+    await assert.rejects(hem.createKeyPair(token, 'k', type, 'ZA==', mode), (e) => e.code === 'bad_mode', `${type} + ${mode}`);
+    await assert.rejects(hem.deriveKey(token, 'k', type, 'ZA==', 'K1', 'cGs=', mode), (e) => e.code === 'bad_mode');
+    await assert.rejects(hem.importPublicKey(token, 'k', type, new Uint8Array(32), 'ZA==', mode), (e) => e.code === 'bad_mode');
+  }
+  // Whatever the device makes of a mode on another type is the device's business.
+  await hem.createKeyPair(token, 'sym', 'AES256', 'ZA==', 'something');
+  assert.equal(sent().mode, 'something', 'the SDK does not invent rules it was not told');
+
   // The NIST curves do ECDH and ExDSA with the same key, so they are told which.
   await hem.createKeyPair(token, 'nist', 'SECP384R1', 'ZA==', 'ECDH,ExDSA');
   assert.equal(sent().mode, 'ECDH,ExDSA', "a curve that can do both takes the caller's word");

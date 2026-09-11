@@ -991,7 +991,26 @@ function checkMsgSize(op, data) {
  * what the reference client does: hem-api-tester test_10 creates all 23 key
  * types the device supports and sends `mode: 'ECDH,ExDSA'` for SECP256R1,
  * SECP384R1, SECP521R1 and SECP256K1, and no `mode` at all for the other 19.
+ *
+ * A mode on a single-use key is allowed but pointless, and it is checked: ask
+ * for `ECDH` on an ED25519 key and the device answers 4xx, because that key
+ * signs and cannot agree anything. An opaque status for an argument the caller
+ * can still see is worth catching here, as with the crypto field limits below.
  */
+const SINGLE_USE = { ED25519: 'ExDSA', ED448: 'ExDSA', CURVE25519: 'ECDH', CURVE448: 'ECDH' };
+
+/**
+ * Throw before the request when a mode contradicts the key type. Anything not
+ * in the table above — the NIST curves, the symmetric and post-quantum types —
+ * is the device's business, and is sent as given.
+ */
+function checkMode(type, mode) {
+  const only = SINGLE_USE[type];
+  if (!mode || !only || mode === only) return;
+  throw new HemError(
+    `A key of type ${type} can only ${only === 'ECDH' ? 'agree a shared secret (ECDH)' : 'sign (ExDSA)'}, so mode '${mode}' is not something it can be given`,
+    { code: 'bad_mode' });
+}
 
 export class HEM {
   #baseUrl;
@@ -1582,10 +1601,12 @@ export class HEM {
    * @param {string|null} [mode]  Usage constraint. The NIST curves (SECP*) can
    *                              do both jobs, so they need one: 'ECDH',
    *                              'ExDSA' or 'ECDH,ExDSA'. Everything else has
-   *                              exactly one use and the field is left out.
+   *                              exactly one use and the field is left out —
+   *                              it may be given, but a wrong one is refused.
    * @returns {Promise<{kid: string}>}
    */
   async createKeyPair(token, label, type, descr, mode = null) {
+    checkMode(type, mode);
     const body = { type, label, descr };
     if (mode) body.mode = mode;
     return this.#req('POST', `${this.#baseUrl}/api/keymgmt/create`, body, token);
@@ -1607,6 +1628,7 @@ export class HEM {
    * @returns {Promise<{kid: string}>}
    */
   async importPublicKey(token, label, type, pubKeyBytes, descr = null, mode = null) {
+    checkMode(type, mode);
     const body = { type, label, pubkey: toB64(pubKeyBytes) };
     if (descr !== null) body.descr = descr;
     if (mode !== null) body.mode = mode;
@@ -1628,6 +1650,7 @@ export class HEM {
    * @returns {Promise<{kid: string}>}
    */
   async deriveKey(token, label, type, descr, kid, peerPubKeyBase64, mode = null) {
+    checkMode(type, mode);
     const body = { type, label, descr, kid, pubkey: peerPubKeyBase64 };
     if (mode) body.mode = mode;
     return this.#req('POST', `${this.#baseUrl}/api/keymgmt/derive`, body, token);
