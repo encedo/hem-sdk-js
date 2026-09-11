@@ -113,15 +113,16 @@ calls `listKeys` (grep over every sibling consumer: they all use `searchKeys`),
 so the break costs nobody a fix.
 
 `createKeyPair()` and `deriveKey()` take `mode` as a last argument and send the
-field only when there is one (2026-09-04). `mode` says what a key may be used
-for, and only a key that can do two jobs needs telling: hem-api-tester test_10
-sends it for the four SECP* curves and for nothing else. The old
-`MODE[type] ?? type` sent `mode: 'AES256'` for an AES key and `mode: 'MLKEM768'`
-for a ML-KEM one, and had no way to say `ECDH,ExDSA`. Consumers create only
-CURVE25519 and ED25519 keys, whose defaults are unchanged, so the request they
-send is byte for byte what it was — and `encedo-oidc-boundle`'s divergent copy
-already had this exact signature, against real devices, which is the best
-evidence the shaping is right.
+field only when the caller passes one (2026-09-04, corrected 2026-09-11). It
+says what an asymmetric key may be used for, and only a key that can do two
+jobs needs telling — the NIST curves, where the same key does ECDH and ExDSA.
+The old `MODE[type] ?? type` sent `mode: 'AES256'` for an AES key, and the
+first pass at this kept sending `ExDSA` / `ECDH` for the 25519 curves out of
+habit. Neither is what the device asks for: hem-api-tester test_10 creates all
+23 supported types and sends `mode` for SECP256R1, SECP384R1, SECP521R1 and
+SECP256K1 only. So a consumer creating ED25519 or CURVE25519 keys now sends one
+field fewer than it did. The device has always accepted both, but this has not
+been tried against a module since the change — do that before relying on it.
 
 ## The master secret (BIP39)
 
@@ -189,10 +190,12 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
 ## Gotchas
 
 - Browser X25519 needs Chrome 113+ / Firefox 130+.
-- The `createKeyPair` / `deriveKey` request body needs a `mode` field
-  (`ED25519`→`ExDSA`, `CURVE25519`→`ECDH`); `searchKeys` needs the pattern
-  base64-encoded with a leading `^`. These mismatches silently break against a
-  current device — see the methods for the exact shaping.
+- `mode` on a create, derive or import is **only for the NIST curves**, where
+  one key does both ECDH and ExDSA and has to be told which. The other 19 types
+  the device supports take no `mode` at all, and the SDK sends one only when a
+  caller passes it — as hem-api-tester test_10 does. `searchKeys` needs the
+  pattern base64-encoded with a leading `^`; that mismatch silently breaks
+  against a current device.
 - Storage lock/unlock has no disk argument: the disk is selected by the token
   scope (`storage:disk<N>:rw`). The Manager v1 called `/unlock/ro` and
   `/unlock/rw`; those sub-paths are legacy (hem-api-tester test_12 uses the

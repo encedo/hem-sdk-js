@@ -469,10 +469,14 @@ test('createKeyPair sends a mode only where the device wants one', async () => {
   const token = await hem.authorizePassword('correct horse', 'keymgmt:gen');
   const sent = () => state.log.filter((e) => e.path === '/dev/api/keymgmt/create').at(-1).body;
 
-  await hem.createKeyPair(token, 'signing', 'ED25519', 'ZA==');
-  assert.equal(sent().mode, 'ExDSA', 'the 25519 defaults are unchanged');
-  await hem.createKeyPair(token, 'wrap', 'MLKEM768', 'ZA==');
-  assert.equal('mode' in sent(), false, 'a key with one possible use carries no mode');
+  // A key that can do one thing carries no mode — which is every type but the
+  // four NIST curves, as hem-api-tester test_10 creates all 23 of them.
+  for (const type of ['ED25519', 'CURVE25519', 'ED448', 'CURVE448', 'MLKEM768', 'MLDSA65', 'AES256', 'SHA2-256']) {
+    await hem.createKeyPair(token, 'k', type, 'ZA==');
+    assert.equal('mode' in sent(), false, `${type} asked for a mode it has no use for`);
+    assert.deepEqual(Object.keys(sent()).sort(), ['descr', 'label', 'type']);
+  }
+  // The NIST curves do ECDH and ExDSA with the same key, so they are told which.
   await hem.createKeyPair(token, 'nist', 'SECP384R1', 'ZA==', 'ECDH,ExDSA');
   assert.equal(sent().mode, 'ECDH,ExDSA', "a curve that can do both takes the caller's word");
   assert.deepEqual(Object.keys(sent()).sort(), ['descr', 'label', 'mode', 'type']);

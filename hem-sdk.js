@@ -981,16 +981,17 @@ function checkMsgSize(op, data) {
 // --- Main class ---------------------------------------------------------------
 
 /**
- * Default usage constraint for a create/derive request, by key type. The field
- * says what a key may be used for, and only a key that could do two jobs needs
- * one: the reference client (hem-api-tester test_10) sends `mode` for the NIST
- * curves (`ECDH,ExDSA`) and for nothing else, so a caller creating a SECP* key
- * passes it in. The two 25519 entries below are redundant but long-standing —
- * the SDK has always sent them and the device takes them — while a `mode` of
- * `AES256` or `MLKEM768`, which is what the old `MODE[type] ?? type` produced,
- * was never anything the device asked for.
+ * `mode` on a create, derive or import request says what an asymmetric key may
+ * be used for. Only a key that can do two jobs needs telling, which means the
+ * NIST curves: the same key there does ECDH and ExDSA. Nothing else takes one
+ * — not the 25519 and 448 curves, which each do one thing, and not a symmetric
+ * or post-quantum key.
+ *
+ * So the SDK sends `mode` when, and only when, the caller passes one. That is
+ * what the reference client does: hem-api-tester test_10 creates all 23 key
+ * types the device supports and sends `mode: 'ECDH,ExDSA'` for SECP256R1,
+ * SECP384R1, SECP521R1 and SECP256K1, and no `mode` at all for the other 19.
  */
-const KEY_MODE = { ED25519: 'ExDSA', CURVE25519: 'ECDH' };
 
 export class HEM {
   #baseUrl;
@@ -1586,8 +1587,7 @@ export class HEM {
    */
   async createKeyPair(token, label, type, descr, mode = null) {
     const body = { type, label, descr };
-    const use = mode ?? KEY_MODE[type] ?? null;
-    if (use) body.mode = use;
+    if (mode) body.mode = mode;
     return this.#req('POST', `${this.#baseUrl}/api/keymgmt/create`, body, token);
   }
 
@@ -1629,8 +1629,7 @@ export class HEM {
    */
   async deriveKey(token, label, type, descr, kid, peerPubKeyBase64, mode = null) {
     const body = { type, label, descr, kid, pubkey: peerPubKeyBase64 };
-    const use = mode ?? KEY_MODE[type] ?? null;
-    if (use) body.mode = use;
+    if (mode) body.mode = mode;
     return this.#req('POST', `${this.#baseUrl}/api/keymgmt/derive`, body, token);
   }
 

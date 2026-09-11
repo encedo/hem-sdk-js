@@ -40,16 +40,22 @@ await hem.createKeyPair(token, label, 'SECP384R1', descr, 'ECDH,ExDSA'); // now 
 await hem.deriveKey(token, label, type, descr, kid, peer, mode);        // mode is last, optional
 ```
 
-`ED25519` still sends `ExDSA` and `CURVE25519` still sends `ECDH`, so **for
-those two the request on the wire is byte for byte what it was**. Every other
-type now sends no `mode` unless you pass one.
+`mode` is for asymmetric keys that can do two jobs, and that means the NIST
+curves and nothing else: one SECP key does ECDH and ExDSA, so it is told which.
+Every other type the device supports — the 25519 and 448 curves, the symmetric
+types, ML-KEM and ML-DSA — has exactly one use and takes no `mode`. The SDK now
+sends the field **only when the caller passes it**, which is what the reference
+client does: hem-api-tester test_10 creates all 23 supported types and sends
+`mode: 'ECDH,ExDSA'` for the four SECP* curves alone.
 
-**Who this touches:** a project that creates `ED25519` or `CURVE25519` keys —
-which is all of them, as far as the compatibility table goes — sends exactly
-what it sent before and needs no change. A project creating AES, ML-KEM or
-SECP* keys should check what the device expects and pass `mode` if it wants
-one. `encedo-oidc-boundle`'s own copy already had this signature, against real
-devices, which is the best evidence that the shaping is right.
+**Who this touches:** every project creates `ED25519` or `CURVE25519` keys, and
+those requests now carry one field fewer — the `mode: 'ExDSA'` / `mode: 'ECDH'`
+the SDK used to add. No call site changes; only the bytes on the wire. The
+device has taken both forms for as long as anyone has looked, and the reference
+sends the shorter one, but **this has not been tried against a module since the
+change** — create one key of each type against a real device before a release
+depends on it. A project creating SECP* keys passes `'ECDH,ExDSA'` (or one of
+the two) as the last argument.
 
 ## 3. `checkFirmware()` and `checkUi()` answer `null` while the device is still checking
 
