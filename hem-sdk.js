@@ -987,10 +987,12 @@ function checkMsgSize(op, data) {
  * — not the 25519 and 448 curves, which each do one thing, and not a symmetric
  * or post-quantum key.
  *
- * So the SDK sends `mode` when, and only when, the caller passes one. That is
- * what the reference client does: hem-api-tester test_10 creates all 23 key
- * types the device supports and sends `mode: 'ECDH,ExDSA'` for SECP256R1,
- * SECP384R1, SECP521R1 and SECP256K1, and no `mode` at all for the other 19.
+ * So the SDK sends `mode` when, and only when, the caller passes one. The
+ * published reference calls the field "Key operation mode (for NIST ECC only)"
+ * and gives it three values — 'ECDH', 'ExDSA', 'ECDH,ExDSA'
+ * (docs.encedo.com/hem-api, key management, create a key) — and hem-api-tester
+ * test_10 creates all 23 key types the device supports, sending `mode` for
+ * SECP256R1, SECP384R1, SECP521R1 and SECP256K1 and for none of the other 19.
  *
  * A mode on a single-use key is allowed but pointless, and it is checked: ask
  * for `ECDH` on an ED25519 key and the device answers 4xx, because that key

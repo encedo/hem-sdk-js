@@ -149,10 +149,20 @@ the method stays for other callers.
 
 ## API spec source
 
-The authoritative description of HEM endpoints, request bodies and response
-fields is the PHP test suite **`hem-api-tester`** (sibling repo, typically at
-`../../hem-api-tester`). When adding or fixing an endpoint, read the matching
-`test_*.php` and `libs/lib.php` — the PHP is the reference implementation.
+Two sources, and they agree:
+
+- **<https://docs.encedo.com/hem-api>** — the published reference: every
+  endpoint, its request body and its fields. Start here for what a field means
+  and whether it is required.
+- **`hem-api-tester`** (sibling repo, typically at `../../hem-api-tester`) —
+  the reference implementation, run against real devices. Read the matching
+  `test_*.php` and `libs/lib.php` for what a correct request actually looks
+  like, and for the shapes the published reference leaves out.
+
+Where the docs say a field is optional, the PHP shows when it is sent in
+practice: `mode`, for instance, is documented as "Key operation mode (for NIST
+ECC only)" and test_10 sends it for the four SECP* curves and for none of the
+other 19 types.
 
 `/api/diag/*` endpoints (memory dump, fault injection) are **intentionally not
 implemented** — they are hardware-destructive Common Criteria test hooks.
