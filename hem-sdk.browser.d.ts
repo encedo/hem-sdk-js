@@ -156,7 +156,8 @@ export declare class HEM {
   hemCheckin(): Promise<{ status: string; newfws?: string; newuis?: string; [key: string]: unknown }>;
 
   /** Pass null or '' to reuse cached derived keys (set on first call with a real password). */
-  authorizePassword(password: string | null, scope: string, expSeconds?: number): Promise<string>;
+  /** `remember: false` uses the derived key for this call alone; the next scope needs the password again. */
+  authorizePassword(password: string | null, scope: string, expSeconds?: number, opts?: { remember?: boolean }): Promise<string>;
 
   /**
    * Mobile push authorisation. Cancelling (`signal`) or timing out withdraws

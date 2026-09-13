@@ -141,6 +141,10 @@ Additive, so a project takes it when it wants it:
 - **External authenticators** — `listExtAuth`, `deleteExtAuth`, `hasExtAuth`,
   and `registerExtAuth` with the pairing QR payload fixed.
 - **Uploads take `onProgress`**, and every request takes a `signal`.
+- **`authorizePassword(..., { remember: false })`** uses the derived key for
+  that one call instead of keeping it, so the next scope needs the password
+  typed again. Tokens are cached either way. It is what a "save password for
+  this session" tick, left unticked, should do.
 
 ## Checking a project against it
 

@@ -1161,9 +1161,14 @@ class HEM {
    * @param {string} password    Local password (plain text)
    * @param {string} scope       e.g. 'keymgmt:list' or 'keymgmt:use:<KID>'
    * @param {number} [expSeconds=300]  Requested token lifetime
+   * @param {object} [opts]
+   * @param {boolean} [opts.remember=true]  Keep the derived key for the scopes
+   *   that follow. With `false` it is used for this call alone and the next
+   *   scope needs the password typed again — v1's "save password for this
+   *   session", unticked. Tokens are cached either way.
    * @returns {Promise<string>}  JWT token
    */
-  async authorizePassword(password, scope, expSeconds = 300) {
+  async authorizePassword(password, scope, expSeconds = 300, { remember = true } = {}) {
     const cached = this.#cacheFind(scope);
     if (cached) return cached;
 
@@ -1171,16 +1176,23 @@ class HEM {
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
     // { eid: string (stable salt), spk: base64 (device X25519 pubkey), jti: string (nonce) }
 
-    // Derive X25519 keys from password and cache them, or reuse cached keys
+    // Derive X25519 keys from the password, or reuse what a previous call kept.
+    // Whether to keep them is the caller's to decide: a UI that offers "remember
+    // the password for this session" keeps them and never asks again, one that
+    // does not asks for every scope, and with `remember: false` the key lives no
+    // longer than this call. Tokens are cached either way, so the same scope is
+    // not asked about twice.
+    let keys = this.#derivedKeys;
     if (password) {
-      this.#derivedKeys = await this.#deriveX25519(password, challenge.eid);
+      keys = await this.#deriveX25519(password, challenge.eid);
+      if (remember) this.#derivedKeys = keys;
       // Note: JS strings are immutable — the password primitive cannot be zeroed here.
       // The caller should not hold a long-lived reference to it.
     }
-    if (!this.#derivedKeys) {
+    if (!keys) {
       throw new HemError('Password required (no cached keys)', { code: 'auth_password_required' });
     }
-    return this.#authorizeWithKeys(this.#derivedKeys, challenge, scope, expSeconds);
+    return this.#authorizeWithKeys(keys, challenge, scope, expSeconds);
   }
 
   // -- Authorization: Master secret (the 24 words) ------------------------------

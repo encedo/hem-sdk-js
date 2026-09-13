@@ -202,6 +202,21 @@ test('authorizePassword signs an eJWT the device accepts and caches the token', 
   assert.equal(jwtParse(t3).scope, 'system:config', 'escalation reuses derived keys without a password');
 });
 
+test('a password can be used once and not kept, and tokens are cached either way', async () => {
+  const hem = mk();
+  await hem.authorizePassword('correct horse', 'keymgmt:list', 300, { remember: false });
+  // The token is cached, so the scope it was taken for needs nothing more.
+  assert.ok(await hem.authorizePassword(null, 'keymgmt:list'));
+  // Another scope has no token and no key to make one with.
+  await assert.rejects(hem.authorizePassword(null, 'keymgmt:gen'), (e) => e.code === 'auth_password_required');
+  assert.ok(await hem.authorizePassword('correct horse', 'keymgmt:gen', 300, { remember: false }));
+
+  // Remembered, the key answers for every scope that follows.
+  const kept = mk();
+  await kept.authorizePassword('correct horse', 'keymgmt:list');
+  assert.ok(await kept.authorizePassword(null, 'keymgmt:gen'), 'a scope it has no token for still works');
+});
+
 test('a password change sends the new public key and a proof it can be used', async () => {
   state.configNonce = b64(crypto.getRandomValues(new Uint8Array(32)));
   const hem = mk();
