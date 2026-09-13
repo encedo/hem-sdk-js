@@ -147,8 +147,9 @@ Additive, so a project takes it when it wants it:
 ```bash
 cd <project>
 git -C <path-to-sdk-copy> pull        # or update the submodule, or re-copy the bundle
-grep -rn "listKeys\|createKeyPair\|deriveKey\|checkFirmware\|checkUi" src/
+grep -rn "listKeys\|createKeyPair\|deriveKey\|checkFirmware\|checkUi\|authorizeRemote" src/
 ```
 
-Those five names are the whole blast radius. Everything else a project calls
-behaves as it did.
+Those five names, plus `authorizeRemote` for a project that offers phone
+sign-in, are the whole blast radius. Everything else a project calls behaves as
+it did.
