@@ -163,6 +163,8 @@ export declare class HEM {
    * the event from the broker; rejects with code `aborted`, `timeout` or `denied`.
    */
   authorizeRemote(scope: string, opts?: PollOpts & {
+    /** How long the token should be good for, in seconds (default 300). */
+    expSeconds?: number;
     /** Called once with the broker event id. */
     onEvent?: (eventid: string) => void;
   }): Promise<string>;

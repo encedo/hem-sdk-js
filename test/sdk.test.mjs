@@ -99,7 +99,12 @@ async function handle(req, res) {
     state.initIss = payload.iss;
     return json(res, 200, { instanceid: 'INST-1', inited: true });
   }
-  if (path === '/dev/api/auth/ext/request') return json(res, 200, { challenge: 'CH', epk: body.epk, scope: body.scope });
+  if (path === '/dev/api/auth/ext/request') {
+    // exp is required; a device reading a missing one as zero sees a request
+    // that expired in 1970, so the mock refuses it the way the device would.
+    if (!Number.isFinite(body.exp)) return json(res, 400, { error: 'exp required' });
+    return json(res, 200, { challenge: 'CH', epk: body.epk, scope: body.scope, exp: body.exp });
+  }
   if (path === '/dev/api/auth/ext/token') return json(res, 200, { token: fakeJwt({ scope: 'remote', exp: Math.floor(Date.now() / 1000) + 300 }) });
   if (path === '/dev/api/auth/ext/init') return json(res, 200, { eid: state.eid, request: 'REQUEST-JWT' });
   if (path === '/dev/api/auth/ext/validate') return json(res, 200, { confirmed: body.pid });
@@ -251,6 +256,21 @@ test('the token cache can be looked at without handing out the tokens', async ()
   assert.ok(hem.tokens.every((t) => typeof t.exp === 'number' && !('token' in t)), 'scope and expiry, nothing else');
   hem.clearCache();
   assert.deepEqual(hem.tokens, []);
+});
+
+test('authorizeRemote asks the device for a token with a lifetime, as the device requires', async () => {
+  const hem = mk();
+  const before = Math.floor(Date.now() / 1000);
+  await hem.authorizeRemote('system:config', { pollInterval: 5, expSeconds: 120 });
+  const sent = state.log.filter((e) => e.path === '/dev/api/auth/ext/request').at(-1).body;
+  assert.ok(sent.exp >= before + 120 && sent.exp <= Math.floor(Date.now() / 1000) + 120,
+    `exp is an epoch second that many seconds out, not a duration: ${sent.exp}`);
+  assert.equal(sent.scope, 'system:config');
+  assert.ok(sent.epk, 'and the broker session key it belongs to');
+  hem.clearKeys();
+  await hem.authorizeRemote('keymgmt:list', { pollInterval: 5 });
+  const dflt = state.log.filter((e) => e.path === '/dev/api/auth/ext/request').at(-1).body;
+  assert.ok(dflt.exp >= before + 300, 'five minutes by default');
 });
 
 test('authorizeRemote polls the broker until the phone answers', async () => {

@@ -1298,7 +1298,7 @@ export class HEM {
    *
    * Flow:
    *   1. GET  {broker}/notify/session         -> { epk } (broker session pubkey)
-   *   2. POST /api/auth/ext/request { epk, scope } -> challenge
+   *   2. POST /api/auth/ext/request { epk, scope, exp } -> challenge
    *   3. POST {broker}/notify/event/new       -> { eventid }
    *   4. Poll GET {broker}/notify/event/check/{eventid}  (202 = pending, 200 = done)
    *   5. POST /api/auth/ext/token { authreply } -> { token: JWT }
@@ -1310,6 +1310,7 @@ export class HEM {
    *
    * @param {string} scope       e.g. 'keymgmt:list'
    * @param {object} [opts]
+   * @param {number} [opts.expSeconds=300]     How long the token should be good for
    * @param {number} [opts.pollInterval=2000]  Poll interval in ms
    * @param {number} [opts.pollTimeout=60000]  Max wait time in ms
    * @param {Function} [opts.onPending]        Called each poll while waiting (no args)
@@ -1318,6 +1319,7 @@ export class HEM {
    * @returns {Promise<string>}  JWT token
    */
   async authorizeRemote(scope, {
+    expSeconds = 300,
     pollInterval = 2_000,
     pollTimeout = 60_000,
     onPending = null,
@@ -1330,10 +1332,17 @@ export class HEM {
     // Step 1: broker session EPK
     const session = await this.#broker.session();
 
-    // Step 2: request auth from device (pass full session data + scope)
+    // Step 2: request auth from device (session data, the scope, and how long
+    // the token should be good for). `exp` is required — the published
+    // reference calls it "Requested lifetime of the token" and the reference
+    // client sends an absolute epoch second (hem-api-tester test_6:
+    // `'exp' => time()+120`), which is the form that runs against hardware.
+    // Leaving it out is what the SDK used to do, and a device reading a
+    // missing field as zero sees a request that expired in 1970.
     const challenge = await this.#req('POST', `${this.#baseUrl}/api/auth/ext/request`, {
       ...session,
       scope,
+      exp: Math.floor(Date.now() / 1000) + expSeconds,
     });
 
     // Step 3: forward challenge to broker -> eventid

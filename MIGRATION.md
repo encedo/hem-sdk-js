@@ -2,7 +2,7 @@
 
 Everything the Manager needed was on `manager-v2` for a week; it is on `main`
 now and there are no branches. The public surface went from 52 methods to 83,
-**nothing was removed**, and four things changed in a way that can break a
+**nothing was removed**, and five things changed in a way that can break a
 caller. This is the list, and what to do about each.
 
 The SDK is shared: fix the project, not the SDK.
@@ -83,7 +83,29 @@ const result = await hem.waitFirmwareCheck(token, { onPending });  // or let the
 a caller treated any resolved value as success, it now has to wait for a
 non-null one — or call the `wait…` form, which is what the Manager does.
 
-## 4. `authorizeMaster()` always derives, and `clearKeys()` was already dropping the token cache
+## 4. `authorizeRemote()` sends the `exp` the device requires
+
+`POST /api/auth/ext/request` takes three fields and the published reference
+marks all three required: `epk`, `scope` and `exp`, "Requested lifetime of the
+token". The SDK sent the first two. A device reading a missing `exp` as zero
+is looking at a request that expired in 1970, which is the shape of the
+timestamp complaints seen when a phone authorisation is retried.
+
+```js
+await hem.authorizeRemote('keymgmt:list');                      // now asks for 300 s
+await hem.authorizeRemote('keymgmt:list', { expSeconds: 120 }); // or say
+```
+
+`exp` goes out as an absolute epoch second, `now + expSeconds`, which is what
+hem-api-tester test_6 sends (`'exp' => time()+120`) and therefore what runs
+against hardware.
+
+**Who this touches:** `oidc` and `meet` call `authorizeRemote`. No call site
+changes — they get a field they should always have been sending. **Worth
+re-testing a phone sign-in on each**, since this is the one change that alters
+a request the device was already unhappy about.
+
+## 5. `authorizeMaster()` always derives, and `clearKeys()` was already dropping the token cache
 
 `authorizeMaster()` is new, so nothing can break on it, but the bug it had is
 worth knowing about if you copied the pattern: it returned a cached token for
