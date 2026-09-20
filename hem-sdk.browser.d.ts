@@ -221,7 +221,10 @@ export declare class HEM {
   importPublicKey(token: string, label: string, type: string, pubKeyBytes: Uint8Array, descr?: string | null, mode?: string | null): Promise<{ kid: string }>;
   deriveKey(token: string, label: string, type: string, descr: string, kid: string, peerPubKeyBase64: string, mode?: string | null): Promise<{ kid: string }>;
   updateKey(token: string, kid: string, label: string, descr: string): Promise<unknown>;
-  exdsaSignBytes(token: string, kid: string, data: Uint8Array, alg?: string, ctx?: string | null): Promise<string>;
+  /** Sign a string (its UTF-8 bytes). Resolves to the raw signature bytes -- DER for ECDSA, 64 bytes for Ed25519. */
+  exdsaSign(token: string, kid: string, msg: string, alg?: string, ctx?: string | null): Promise<Uint8Array>;
+  /** Same as exdsaSign for binary input. Resolves to the raw signature bytes, not a string. */
+  exdsaSignBytes(token: string, kid: string, data: Uint8Array, alg?: string, ctx?: string | null): Promise<Uint8Array>;
   exdsaVerify(token: string, kid: string, data: Uint8Array, sig: string, alg?: string): Promise<boolean>;
   /** alg hashes the shared secret; omit it for the raw 32 bytes a Noise handshake needs. */
   ecdh(token: string, kid: string, peerPubKeyBase64: string, opts?: { alg?: string | null }): Promise<Uint8Array>;
