@@ -10,8 +10,9 @@ hardware security device. It runs unchanged in the browser (Web Crypto +
 
 This repo is the **single source of truth** for the SDK. The same files are
 copied (manually, whole-folder) into other projects: `encedo-meet`,
-`encedo-pgp`. `encedo-oidc-boundle` carries an older divergent copy — it is
-updated separately. **Always make SDK changes here**, never in a downstream copy.
+`encedo-pgp`. `encedo-oidc` and `encedo-chat` take it as a **git submodule**
+(`hem-sdk-js/`) and serve `hem-sdk.browser.js`. **Always make SDK changes
+here**, never in a downstream copy.
 
 ## Layout
 
@@ -87,7 +88,7 @@ What each consumer relies on today, from reading their code:
 
 | Consumer | Uses | Load-bearing behaviour |
 |---|---|---|
-| `encedo-oidc-boundle` (older 510-line copy) | `hemCheckin`, `authorizePassword`, `authorizeRemote` (with `signal` in signin.js), `searchKeys`, `exdsaSign`, `getPubKey`, `getAttestation`, `createKeyPair` | `err instanceof HemError && err.code === 'http_401'` |
+| `encedo-oidc` (git submodule, serves `hem-sdk.browser.js` at `/hem-sdk.js`; current since 2026-09-20) | `hemCheckin`, `authorizePassword`, `authorizeRemote` (with `signal` in signin.js), `searchKeys`, `exdsaSign`, `getPubKey`, `getAttestation`, `createKeyPair` | `err instanceof HemError && err.code === 'http_401'` |
 | `chat/encedo-chat` (1453-line copy) | `hemCheckin`, `authorizePassword`, `searchKeys`, `getPubKey`, `createKeyPair`, `ecdh`, `updateKey`, `deleteKey`, `getVersion({timeoutMs})`, `getStatus({timeoutMs})` | `e.code === 'timeout' \|\| e.code === 'aborted'` |
 | `encedo-pgp` (current copy) | `hemCheckin`, `authorizePassword`, `searchKeys`, `createKeyPair`, `getPubKey`, `importPublicKey`, `exdsaSignBytes`, `exdsaVerify`, `ecdh` | binary in / binary out |
 | `encedo-meet` (713-line copy under `src/vendor`) | `authorizePassword`, `hemCheckin`, `authorizeRemote` | — |
