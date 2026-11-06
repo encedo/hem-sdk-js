@@ -449,6 +449,38 @@ await hem.mldsaVerify(token, dsaKid, data, sig, { ctx: 'my-app' });   // true / 
 const sigH = await hem.mldsaSign(token, dsaKid, sha512Digest, { mode: 'HashML-DSA-SHA512' });
 ```
 
+### X-Wing and HPKE
+
+```js
+// Both operations take two keys for X-Wing (an MLKEM768 and a CURVE25519 key):
+// one token with both scopes.
+const t2 = await hem.authorizePassword('my-password', [`keymgmt:use:${kemKid}`, `keymgmt:use:${xKid}`]);
+const { ss, ct } = await hem.xwingEncaps(t2, kemKid, xKid);       // ct: 1120 bytes
+const ss2 = await hem.xwingDecaps(t2, kemKid, xKid, ct);
+
+// HPKE (RFC 9180), Base mode, one message: to a key of the HEM ...
+const sealed = await hem.hpkeSeal(token, { kid: inboxKid }, 'for the inbox', { info: 'app:v1' });
+// ... or to anyone's public key - any valid token will do then.
+const out = await hem.hpkeSeal(token, { pubkey: bobX25519, kem: 'DHKEM-X25519' }, data);
+// Open with a key pair made with mode 'HPKE'; suite, info and aad as sealed.
+const plain = await hem.hpkeOpen(token, inboxKid, sealed.enc, sealed.ct, { info: 'app:v1' });
+```
+
+### KDF, one-time passwords, random
+
+```js
+// Bytes out of a stored HMAC key (keep them in the HEM with deriveKey() instead):
+const okm = await hem.kdf(token, hmacKid, 'HKDF', 32, { salt: 'tenant-7', info: 'enc' });
+const k = await hem.kdf(token, hmacKid, 'SP800-108', 32, { info: labelZeroContext });
+
+// TOTP / HOTP on a stored SHA1 seed; the seed never leaves the HEM.
+const { code, step } = await hem.otp(token, otpKid);                      // TOTP, device clock
+const r = await hem.otpVerify(token, otpKid, '287082', { window: 1 });   // { verified, step }
+// The device remembers no used codes: refuse a step not larger than the last one accepted.
+
+const nonce = await hem.random(token, 32);
+```
+
 ---
 
 ## 5. System
@@ -473,6 +505,13 @@ const fresh = await hem.getAttestation(token, { nonce: crypto.getRandomValues(ne
 await hem.selftest(token);
 await hem.reboot(token);
 await hem.shutdown(token);
+
+// Key storage reclaim: deleted keys leave holes until one runs (at the next boot).
+const report = await hem.defragCheck(token);              // { reclaimable, reclaimable_size, ... }
+if (report.reclaimable) await hem.defragStart(token);     // { started: true }: the device restarts
+
+// A device out of the box, no token: HTTPS, and on an EPA its attestation key.
+const { csr } = await hem.bootstrap({ att: { seed: moduleSeed /* 32 B */, epoch: 0 } });
 ```
 
 ---

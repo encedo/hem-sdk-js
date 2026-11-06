@@ -1094,6 +1094,32 @@ function keyPage(data, offset) {
   };
 }
 
+/** kdf / aead / info / aad of an HPKE request, the same for seal and open. */
+function applyHpkeSuite(body, { kdf, aead, info, aad }) {
+  if (kdf) body.kdf = kdf;
+  if (aead) body.aead = aead;
+  if (info !== null && info !== undefined) body.info = toB64(asBytes(info));
+  if (aad) body.aad = toB64(aad);
+}
+
+/** The request body of hmac/otp: TOTP takes period / time, HOTP a counter. */
+function otpBody(kid, { mode = 'TOTP', digits = null, period = null, time = null, counter = null } = {}) {
+  const body = { kid, mode };
+  if (digits !== null) body.digits = digits;
+  if (mode === 'TOTP') {
+    if (counter !== null) throw new HemError('otp: a counter is for HOTP', { code: 'invalid_arg' });
+    if (period !== null) body.period = period;
+    if (time !== null) body.time = time;
+  } else if (mode === 'HOTP') {
+    if (period !== null || time !== null) throw new HemError('otp: period and time are for TOTP', { code: 'invalid_arg' });
+    if (counter === null) throw new HemError('otp: HOTP needs a counter', { code: 'invalid_arg' });
+    body.counter = counter;
+  } else {
+    throw new HemError(`otp: mode is TOTP or HOTP, not ${mode}`, { code: 'invalid_arg' });
+  }
+  return body;
+}
+
 function checkMsgSize(op, data) {
   if (data.length > MAX_CRYPTO_MSG) {
     throw new HemError(`${op}: message is ${data.length} bytes, max ${MAX_CRYPTO_MSG}`,
@@ -2354,6 +2380,205 @@ export class HEM {
     return ret?.verified === true;
   }
 
+  /**
+   * X-Wing hybrid KEM (ML-KEM-768 + X25519, draft-connolly-cfrg-xwing-kem) to
+   * two keys in the HEM: an MLKEM768 key and a CURVE25519 key, made there or
+   * imported (encrypting to someone else's X-Wing key, whose public key is
+   * pk_M ‖ pk_X). The result holds as long as either half does.
+   *
+   * Required scope: 'keymgmt:use:<kid>' and 'keymgmt:use:<extKid>' (one token, scope array)
+   *
+   * @param {string} token
+   * @param {string} kid     The MLKEM768 key
+   * @param {string} extKid  The CURVE25519 key
+   * @returns {Promise<{alg: string, ss: Uint8Array, ct: Uint8Array}>}  ss 32 B; ct 1120 B (ct_M ‖ ct_X)
+   */
+  async xwingEncaps(token, kid, extKid) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/xwing/encaps`, { kid, ext_kid: extKid }, token);
+    if (!ret.ss || !ret.ct) throw new HemError('Missing ss/ct in xwing/encaps response', { code: 'pqc_error' });
+    return { alg: ret.alg, ss: fromB64(ret.ss), ct: fromB64(ret.ct) };
+  }
+
+  /**
+   * X-Wing decapsulation with the two private keys made in the HEM (not
+   * HPKE-only ones). A changed ciphertext of the right size gives an
+   * unrelated secret, not an error (implicit rejection).
+   *
+   * Required scope: 'keymgmt:use:<kid>' and 'keymgmt:use:<extKid>'
+   *
+   * @param {string} token
+   * @param {string} kid     The MLKEM768 key
+   * @param {string} extKid  The CURVE25519 key
+   * @param {Uint8Array} ct  1120 bytes
+   * @returns {Promise<Uint8Array>}  32-byte shared secret
+   */
+  async xwingDecaps(token, kid, extKid, ct) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/xwing/decaps`, { kid, ext_kid: extKid, ct: toB64(ct) }, token);
+    if (!ret.ss) throw new HemError('No ss in xwing/decaps response', { code: 'pqc_error' });
+    return fromB64(ret.ss);
+  }
+
+  /**
+   * HPKE (RFC 9180) Base mode, single shot: encrypt to a recipient public
+   * key. The result opens in any RFC 9180 implementation with the same suite.
+   * The recipient is a key in the HEM (`{ kid }`, `{ kid, extKid }` for
+   * X-Wing; a key pair needs the HPKE flag, an imported public key none), or a
+   * key outside it (`{ pubkey, kem }`, then any valid token will do).
+   *
+   * KEMs: 'DHKEM-P256', 'DHKEM-P384', 'DHKEM-P521', 'DHKEM-X25519',
+   * 'DHKEM-X448', 'MLKEM512', 'MLKEM768', 'MLKEM1024', 'X-Wing'. Without
+   * `kdf` / `aead` the KEM's default suite is used.
+   *
+   * Required scope: 'keymgmt:use:<kid>' (and of extKid); any token with pubkey + kem
+   *
+   * @param {string} token
+   * @param {{kid: string, extKid?: string} | {pubkey: Uint8Array, kem: string}} recipient
+   * @param {Uint8Array|string} data  1..2048 bytes; seal a data key for more
+   * @param {object} [opts]
+   * @param {'HKDF-SHA256'|'HKDF-SHA384'|'HKDF-SHA512'} [opts.kdf]
+   * @param {'AES128-GCM'|'AES256-GCM'|'CHACHA20-POLY1305'} [opts.aead]
+   * @param {Uint8Array|string} [opts.info]  1..128 bytes
+   * @param {Uint8Array} [opts.aad]  1..256 bytes
+   * @returns {Promise<{enc: Uint8Array, ct: Uint8Array, suite: string, kem: string, kdf: string, aead: string}>}
+   *          ct is the ciphertext with its 16-byte tag; suite the IANA ids 'kem-kdf-aead' in hex
+   */
+  async hpkeSeal(token, recipient, data, { kdf = null, aead = null, info = null, aad = null } = {}) {
+    const body = {};
+    if (recipient?.kid) {
+      body.kid = recipient.kid;
+      if (recipient.extKid) body.ext_kid = recipient.extKid;
+    } else if (recipient?.pubkey instanceof Uint8Array && recipient.kem) {
+      body.pubkey = toB64(recipient.pubkey);
+      body.kem = recipient.kem;
+    } else {
+      throw new HemError('hpkeSeal: the recipient is { kid[, extKid] } or { pubkey: Uint8Array, kem }', { code: 'invalid_arg' });
+    }
+    applyHpkeSuite(body, { kdf, aead, info, aad });
+    body.msg = toB64(asBytes(data));
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hpke/seal`, body, token);
+    if (!ret.enc || !ret.ct) throw new HemError('Missing enc/ct in hpke/seal response', { code: 'hpke_error' });
+    return { enc: fromB64(ret.enc), ct: fromB64(ret.ct), suite: ret.suite, kem: ret.kem, kdf: ret.kdf, aead: ret.aead };
+  }
+
+  /**
+   * HPKE Base mode, single shot: open what was sealed to a key of the HEM -
+   * by hpkeSeal() or any RFC 9180 implementation. The key (both for X-Wing)
+   * must be a key pair with the HPKE flag. `kdf`, `aead`, `info` and `aad`
+   * must be the sealer's; any difference is an authentication failure (406).
+   *
+   * Required scope: 'keymgmt:use:<kid>' (and of extKid)
+   *
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array} enc  The encapsulated key, the KEM's length
+   * @param {Uint8Array} ct   Ciphertext with its tag, 17..2064 bytes
+   * @param {object} [opts]
+   * @param {string} [opts.extKid]  The CURVE25519 key of an X-Wing pair
+   * @param {string} [opts.kdf]
+   * @param {string} [opts.aead]
+   * @param {Uint8Array|string} [opts.info]
+   * @param {Uint8Array} [opts.aad]
+   * @returns {Promise<Uint8Array>}  The plaintext
+   */
+  async hpkeOpen(token, kid, enc, ct, { extKid = null, kdf = null, aead = null, info = null, aad = null } = {}) {
+    const body = { kid };
+    if (extKid) body.ext_kid = extKid;
+    applyHpkeSuite(body, { kdf, aead, info, aad });
+    body.enc = toB64(enc);
+    body.ct = toB64(ct);
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hpke/open`, body, token);
+    if (typeof ret.plaintext !== 'string') throw new HemError('No plaintext in hpke/open response', { code: 'hpke_error' });
+    return fromB64(ret.plaintext);
+  }
+
+  /**
+   * Derive bytes from a stored HMAC key (SHA2-256/384/512) and hand them out:
+   * HKDF (RFC 5869), or the NIST SP 800-108r1 KDF in counter mode (as PKCS#11
+   * CKM_SP800_108_COUNTER_KDF). To keep the result inside the HEM as a key,
+   * use deriveKey() with no peer instead.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string} token
+   * @param {string} kid
+   * @param {'HKDF'|'SP800-108'} alg
+   * @param {number} len  16..128 bytes
+   * @param {object} [opts]
+   * @param {Uint8Array|string} [opts.salt]  1..128 bytes; HKDF only
+   * @param {Uint8Array|string} [opts.info]  1..128 bytes, not 'encedo-...'; for SP 800-108 the
+   *   fixed input between counter and L, normally Label ‖ 0x00 ‖ Context
+   * @returns {Promise<Uint8Array>}
+   */
+  async kdf(token, kid, alg, len, { salt = null, info = null } = {}) {
+    if (salt !== null && alg !== 'HKDF') throw new HemError('kdf: a salt is for HKDF only', { code: 'invalid_arg' });
+    const body = { kid, alg, len };
+    if (salt !== null) body.salt = toB64(asBytes(salt));
+    if (info !== null) body.info = toB64(asBytes(info));
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/kdf`, body, token);
+    if (!ret.okm) throw new HemError('No okm in kdf response', { code: 'kdf_error' });
+    return fromB64(ret.okm);
+  }
+
+  /**
+   * The current one-time password of a stored SHA1 seed: TOTP (RFC 6238) by
+   * the device clock, or HOTP (RFC 4226) at `counter`. The seed never leaves
+   * the device. Keep the returned `step`: it is what otpVerify() matches
+   * against, and what blocks a replay.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string} token
+   * @param {string} kid  A SHA1 key (created, or derived over ECDH so an authenticator app can have it)
+   * @param {object} [opts]
+   * @param {'TOTP'|'HOTP'} [opts.mode='TOTP']
+   * @param {6|8} [opts.digits=6]
+   * @param {number} [opts.period=30]  TOTP, 15..300 s
+   * @param {number} [opts.time]       TOTP, unix seconds; default the device clock (it must be set)
+   * @param {number} [opts.counter]    HOTP, required
+   * @returns {Promise<{code: string, step: number}>}
+   */
+  async otp(token, kid, opts = {}) {
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/otp`, otpBody(kid, opts), token);
+    if (typeof ret.code !== 'string') throw new HemError('No code in hmac/otp response', { code: 'otp_error' });
+    return { code: ret.code, step: ret.step };
+  }
+
+  /**
+   * Check a one-time password in a window: TOTP steps T - window .. T +
+   * window, HOTP counters counter .. counter + window. The device remembers no
+   * used codes: refuse a `step` that is not larger than the last one accepted.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string} token
+   * @param {string} kid
+   * @param {string} code  `digits` decimal digits
+   * @param {object} [opts]  As otp(), plus:
+   * @param {number} [opts.window=1]  0..10
+   * @returns {Promise<{verified: boolean, step?: number}>}  `step`: the matching step / counter
+   */
+  async otpVerify(token, kid, code, { window = null, ...opts } = {}) {
+    const body = { ...otpBody(kid, opts), code: String(code) };
+    if (window !== null) body.window = window;
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/otp`, body, token);
+    return ret?.verified === true ? { verified: true, step: ret.step } : { verified: false };
+  }
+
+  /**
+   * Random bytes from the device's DRBG (seeded from its TRNG). Any valid
+   * token, any role; before personalisation none.
+   *
+   * @param {string|null} token
+   * @param {number} [n=32]  1..8192
+   * @returns {Promise<Uint8Array>}
+   */
+  async random(token, n = 32) {
+    if (!Number.isInteger(n) || n < 1 || n > 8192) throw new HemError(`random: n is 1..8192, got ${n}`, { code: 'invalid_arg' });
+    const ret = await this.#req('GET', `${this.#baseUrl}/api/crypto/random/${n}`, null, token);
+    if (!ret.rnd) throw new HemError('No rnd in random response', { code: 'random_error' });
+    return fromB64(ret.rnd);
+  }
+
   // -- System Management -------------------------------------------------------
 
   /**
@@ -2489,6 +2714,77 @@ export class HEM {
    */
   async selftest(token) {
     return this.#req('GET', `${this.#baseUrl}/api/system/selftest`, null, token);
+  }
+
+  /**
+   * The key storage reclaim report: a dry run, nothing written. Deleted keys
+   * leave holes that stay until a reclaim; `reclaimable` says whether
+   * defragStart() would run one (no unreadable records, and 8 KB or more to
+   * gain, or duplicate KIDs). Needs about 144 KB of free RAM on the device: a
+   * 503 means try again later.
+   *
+   * Required scope: 'system:config'
+   *
+   * @param {string} token
+   * @returns {Promise<{used: number, keys: number, deleted: number, deleted_size: number, invalid: number,
+   *          duplicates: number, reclaimable: boolean, reclaimable_size: number, reserved: string}>}
+   */
+  async defragCheck(token) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/defrag/check`, null, token);
+  }
+
+  /**
+   * Start the key storage reclaim. It runs at the next boot, before USB
+   * starts, journalled so a power loss finishes it at the boot after; KIDs,
+   * labels and keys do not change. `started: true` means the device restarts
+   * about 2 s after the answer and is away for some seconds. With nothing to
+   * reclaim nothing is written (`started: false`). Unreadable records refuse
+   * it: HTTP 409, the report in `err.data`.
+   *
+   * Required scope: 'system:config'
+   *
+   * @param {string} token
+   * @returns {Promise<{started: boolean, report: object|null}>}  report as defragCheck()
+   */
+  async defragStart(token) {
+    const r = await this.#req('GET', `${this.#baseUrl}/api/system/defrag/start`, null, token, { withStatus: true });
+    return { started: r.status === 202, report: r.data && typeof r.data === 'object' ? r.data : null };
+  }
+
+  /**
+   * Bootstrap a device that is not personalised yet (no token): start HTTPS
+   * with a certificate, and on an EPA derive its attestation key. Each part is
+   * accepted once per power-up (409 for a second one).
+   *
+   * - `tls`: PPA `{ emp, key, crt }` as for setConfig(); EPA `{ pkey, crt,
+   *   hostname? }`. The certificate is checked by the HTTPS task after the
+   *   answer; HTTPS starts only if it passes.
+   * - `att` (EPA): the 32-byte module seed and an epoch 0..65535. The same
+   *   seed, chip, slot and epoch always give the same P-256 key; the answer
+   *   carries its CSR (subject key id = the SKID of the attestation tokens).
+   *   The key is stored at personalisation; a reset before that needs another
+   *   bootstrap.
+   *
+   * @param {object} parts
+   * @param {object} [parts.tls]
+   * @param {{seed: Uint8Array, epoch: number}} [parts.att]
+   * @returns {Promise<{csr: Uint8Array|null}>}  The attestation key's CSR (DER), with `att`
+   */
+  async bootstrap({ tls = null, att = null } = {}) {
+    const body = {};
+    if (tls) body.tls = tls;
+    if (att) {
+      if (!(att.seed instanceof Uint8Array) || att.seed.length !== 32) {
+        throw new HemError('bootstrap: att.seed is 32 bytes', { code: 'invalid_arg' });
+      }
+      if (!Number.isInteger(att.epoch) || att.epoch < 0 || att.epoch > 65535) {
+        throw new HemError('bootstrap: att.epoch is an integer 0..65535', { code: 'invalid_arg' });
+      }
+      body.att = { seed: toB64(att.seed), epoch: att.epoch };
+    }
+    if (!body.tls && !body.att) throw new HemError('bootstrap: give tls, att or both', { code: 'invalid_arg' });
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/system/config`, body);
+    return { csr: b64OrNull(ret?.att?.csr) };
   }
 
   // -- Firmware / UI Upgrade ---------------------------------------------------

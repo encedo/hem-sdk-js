@@ -74,8 +74,8 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | **Mobile authenticators** | `registerExtAuth` (pair; hands the QR payload to the caller), `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `getExtAuthMac` |
 | **Provisioning and domains** | `provision` / `installProvisioning` (device certificate), `registerDomain` (`<prefix>.ence.do` + TLS) |
 | **Key management** | `listKeys`, `searchKeys` (prefix / suffix / anywhere, type and mode filters), `getKeyPublicInfo`, `createKeyPair`, `deriveKey` (ECDH or HMAC parent), `importPublicKey`, `updateKey`, `deleteKey` — every key in one shape, `HemKey` |
-| **Cryptography** | `exdsaSign`/`exdsaVerify` (EdDSA/ECDSA, `det`, `ctx`), `ecdh` (peer bytes or KID; raw, digest or HKDF), `ecdhHkdf` (several keys from one agreement), `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt` (AES-CBC/GCM, ChaCha20-Poly1305), `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum; HashML-DSA and external μ). The `*Verify` calls resolve to the device's verdict, `true` or `false` |
-| **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `setUserPassword`, `getAttestation`, `reboot`, `shutdown`, `selftest` |
+| **Cryptography** | `exdsaSign`/`exdsaVerify` (EdDSA/ECDSA, `det`, `ctx`), `ecdh` (peer bytes or KID; raw, digest or HKDF), `ecdhHkdf` (several keys from one agreement), `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt` (AES-CBC/GCM, ChaCha20-Poly1305), `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum; HashML-DSA and external μ), `xwingEncaps`/`xwingDecaps`, `hpkeSeal`/`hpkeOpen` (RFC 9180), `kdf` (HKDF, SP 800-108), `otp`/`otpVerify` (TOTP, HOTP), `random`. The `*Verify` calls resolve to the device's verdict, `true` or `false` |
+| **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `setUserPassword`, `getAttestation`, `reboot`, `shutdown`, `selftest`, `defragCheck`/`defragStart` (key storage reclaim), `bootstrap` (before personalisation: HTTPS, EPA attestation key) |
 | **Upgrade** | `rebootToUsbMode`, `uploadFirmware`/`checkFirmware`/`waitFirmwareCheck`/`installFirmware`, `uploadUi`/`checkUi`/`waitUiCheck`/`installUi` (uploads take `onProgress`; the checks answer null while the device is still verifying, the waits poll) |
 | **Storage** | `lockStorage`, `unlockStorage` |
 | **Audit log** | `getLoggerKey` (with a nonce of ours), `listLogFiles`, `getLogFile`, `verifyLogFile` |
@@ -113,8 +113,9 @@ Every JWT is issued for a scope that authorizes a class of operations:
 | `keymgmt:upd` | `updateKey` |
 | `keymgmt:del` | `deleteKey` |
 | `keymgmt:get` | `getKeyPublicInfo` |
-| `keymgmt:use:<KID>` | all `/crypto/*` operations on that key, and `getKeyPublicInfo` of it |
-| `system:config` | `getConfig`, `setConfig`, `setUserPassword`, `registerExtAuth`, `listExtAuth`, `deleteExtAuth`, `registerDomain`, `selftest`, `reboot`, `shutdown`, `rebootToUsbMode` and the upgrade checks / installs |
+| `keymgmt:use:<KID>` | all `/crypto/*` operations on that key, and `getKeyPublicInfo` of it (X-Wing and HPKE with two keys: both, in one token) |
+| any valid token | `random`, `hpkeSeal` to `{ pubkey, kem }`, `getAttestation` |
+| `system:config` | `getConfig`, `setConfig`, `setUserPassword`, `registerExtAuth`, `listExtAuth`, `deleteExtAuth`, `registerDomain`, `selftest`, `defragCheck`, `defragStart`, `reboot`, `shutdown`, `rebootToUsbMode` and the upgrade checks / installs |
 | `system:upgrade` | all upgrade operations, `reboot` |
 | `system:shutdown` | `reboot`, `shutdown` |
 | `storage:disk<N>:rw` | `lockStorage`, `unlockStorage` for that disk |

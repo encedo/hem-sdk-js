@@ -81,6 +81,7 @@ async function handle(req, res) {
   }
   if (path === '/dev/api/system/config' && req.method === 'POST') {
     if (body.gen_csr) return json(res, 200, { genuine: 'GEN', csr: 'CSR' });
+    if (!req.headers.authorization) return json(res, 200, body.att ? { att: { csr: b64([0x30, 0x82]) } } : undefined);   // bootstrap
     return json(res, 200, { updated: true, received: body });
   }
   if (path.startsWith('/dev/api/system/config/attestation')) return json(res, 200, state.provisioned ? { genuine: 'GEN' } : { genuine: 'GEN', csr: 'CSR', key: 'KEY' });
@@ -137,6 +138,19 @@ async function handle(req, res) {
   if (path === '/dev/api/crypto/cipher/wrap') return json(res, 200, { wrapped: b64(new Uint8Array(40)) });
   if (path === '/dev/api/crypto/hmac/hash') return json(res, 200, { mac: b64(new Uint8Array(32)) });
   if (path.startsWith('/dev/api/storage/unlock')) return json(res, 200);
+  if (path === '/dev/api/crypto/pqc/xwing/encaps') return json(res, 200, { alg: 'X-Wing', ss: b64(new Uint8Array(32)), ct: b64(new Uint8Array(1120)) });
+  if (path === '/dev/api/crypto/pqc/xwing/decaps') return json(res, 200, { alg: 'X-Wing', ss: b64(new Uint8Array(32)) });
+  if (path === '/dev/api/crypto/hpke/seal') return json(res, 200, { mode: 'base', suite: '647a-0001-0003', kem: 'X-Wing', kdf: 'HKDF-SHA256', aead: 'CHACHA20-POLY1305', enc: b64([1, 2]), ct: b64([3, 4]) });
+  if (path === '/dev/api/crypto/hpke/open') return json(res, 200, { mode: 'base', suite: '647a-0001-0003', plaintext: b64(Buffer.from('opened')) });
+  if (path === '/dev/api/crypto/kdf') return json(res, 200, { okm: b64(new Uint8Array(body.len)) });
+  if (path === '/dev/api/crypto/hmac/otp') {
+    if (body.code === undefined) return json(res, 200, { code: '287082', step: 1 });
+    return json(res, 200, body.code === '287082' ? { verified: true, step: 59321047 } : { verified: false });
+  }
+  if (path.startsWith('/dev/api/crypto/random/')) return json(res, 200, { rnd: b64(new Uint8Array(Number(path.split('/').pop()))) });
+  const defragReport = { used: 114848, keys: 243, deleted: 46, deleted_size: 12352, invalid: 0, duplicates: 0, reclaimable: true, reclaimable_size: 12352, reserved: 'idle' };
+  if (path === '/dev/api/system/defrag/check') return json(res, 200, defragReport);
+  if (path === '/dev/api/system/defrag/start') return json(res, state.defragStatus ?? 202, defragReport);
   if (path.startsWith('/dev/api/logger/key')) {
     // /logger/key/<nonce base64url> signs the caller's nonce; without it, a nonce of the device's own
     const asked = path.split('/')[5];
@@ -734,6 +748,83 @@ test('attestation with our nonce, a disk unlocked read-only, and the init token 
   await hem.unlockStorage(token);
   assert.equal(state.log.at(-1).path, '/dev/api/storage/unlock');
   await assert.rejects(hem.unlockStorage(token, { mode: 'x' }), (e) => e.code === 'invalid_arg');
+});
+
+test('X-Wing and HPKE: two keys under one token, or a recipient outside the HEM', async () => {
+  const hem = mk();
+  const m = '00112233445566778899aabbccddeeff', x = 'ffeeddccbbaa99887766554433221100';
+  const token = await hem.authorizePassword('correct horse', [`keymgmt:use:${m}`, `keymgmt:use:${x}`]);
+  const sent = (p) => state.log.filter((e) => e.path === `/dev/api/crypto/${p}`).at(-1).body;
+  const { alg, ss, ct } = await hem.xwingEncaps(token, m, x);
+  assert.equal(alg, 'X-Wing');
+  assert.equal(ss.length, 32);
+  assert.equal(ct.length, 1120);
+  assert.deepEqual(sent('pqc/xwing/encaps'), { kid: m, ext_kid: x });
+  assert.equal((await hem.xwingDecaps(token, m, x, ct)).length, 32);
+  assert.deepEqual(sent('pqc/xwing/decaps'), { kid: m, ext_kid: x, ct: b64(ct) });
+
+  const sealed = await hem.hpkeSeal(token, { kid: m, extKid: x }, 'secret', { info: 'app:v1', aead: 'CHACHA20-POLY1305' });
+  assert.deepEqual(sent('hpke/seal'), { kid: m, ext_kid: x, aead: 'CHACHA20-POLY1305', info: b64(Buffer.from('app:v1')), msg: b64(Buffer.from('secret')) });
+  assert.equal(sealed.suite, '647a-0001-0003');
+  assert.deepEqual([...sealed.enc], [1, 2]);
+  await hem.hpkeSeal(token, { pubkey: new Uint8Array(32), kem: 'DHKEM-X25519' }, new Uint8Array([9]));
+  assert.deepEqual(sent('hpke/seal'), { pubkey: b64(new Uint8Array(32)), kem: 'DHKEM-X25519', msg: b64([9]) });
+  await assert.rejects(hem.hpkeSeal(token, { pubkey: b64(new Uint8Array(32)), kem: 'DHKEM-X25519' }, 'x'), (e) => e.code === 'invalid_arg');
+
+  const plain = await hem.hpkeOpen(token, m, sealed.enc, sealed.ct, { extKid: x, info: 'app:v1', aead: 'CHACHA20-POLY1305' });
+  assert.equal(Buffer.from(plain).toString(), 'opened');
+  assert.deepEqual(sent('hpke/open'), { kid: m, ext_kid: x, aead: 'CHACHA20-POLY1305', info: b64(Buffer.from('app:v1')), enc: b64(sealed.enc), ct: b64(sealed.ct) });
+});
+
+test('kdf, one-time passwords and random bytes', async () => {
+  const hem = mk();
+  const kid = '00112233445566778899aabbccddeeff';
+  const token = await hem.authorizePassword('correct horse', `keymgmt:use:${kid}`);
+  const sent = (p) => state.log.filter((e) => e.path === `/dev/api/crypto/${p}`).at(-1).body;
+  assert.equal((await hem.kdf(token, kid, 'HKDF', 32, { salt: 'tenant-7', info: 'enc' })).length, 32);
+  assert.deepEqual(sent('kdf'), { kid, alg: 'HKDF', len: 32, salt: b64(Buffer.from('tenant-7')), info: b64(Buffer.from('enc')) });
+  await hem.kdf(token, kid, 'SP800-108', 16, { info: new Uint8Array([1, 0, 2]) });
+  assert.deepEqual(sent('kdf'), { kid, alg: 'SP800-108', len: 16, info: b64([1, 0, 2]) });
+  await assert.rejects(hem.kdf(token, kid, 'SP800-108', 16, { salt: 's' }), (e) => e.code === 'invalid_arg');
+
+  assert.deepEqual(await hem.otp(token, kid), { code: '287082', step: 1 });
+  assert.deepEqual(sent('hmac/otp'), { kid, mode: 'TOTP' });
+  await hem.otp(token, kid, { mode: 'HOTP', counter: 5, digits: 8 });
+  assert.deepEqual(sent('hmac/otp'), { kid, mode: 'HOTP', digits: 8, counter: 5 });
+  await assert.rejects(hem.otp(token, kid, { mode: 'HOTP' }), (e) => e.code === 'invalid_arg', 'HOTP needs a counter');
+  await assert.rejects(hem.otp(token, kid, { counter: 1 }), (e) => e.code === 'invalid_arg', 'a counter is not TOTP');
+  assert.deepEqual(await hem.otpVerify(token, kid, '287082', { window: 2 }), { verified: true, step: 59321047 });
+  assert.deepEqual(sent('hmac/otp'), { kid, mode: 'TOTP', code: '287082', window: 2 });
+  assert.deepEqual(await hem.otpVerify(token, kid, '000000'), { verified: false });
+
+  assert.equal((await hem.random(token, 64)).length, 64);
+  assert.equal(state.log.at(-1).path, '/dev/api/crypto/random/64');
+  await assert.rejects(hem.random(token, 9000), (e) => e.code === 'invalid_arg');
+});
+
+test('defrag: a dry run, then a start that says whether the device restarts', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'system:config');
+  const report = await hem.defragCheck(token);
+  assert.equal(report.reclaimable, true);
+  state.defragStatus = 202;
+  assert.deepEqual(await hem.defragStart(token), { started: true, report });
+  state.defragStatus = 200;
+  assert.equal((await hem.defragStart(token)).started, false, 'nothing to reclaim: nothing written');
+  state.defragStatus = 409;
+  await assert.rejects(hem.defragStart(token), (e) => e.code === 'http_409' && e.data.invalid === 0, 'unreadable records: the report rides on the error');
+});
+
+test('bootstrap of a device out of the box: tls, and the EPA attestation key', async () => {
+  const hem = mk();
+  const { csr } = await hem.bootstrap({ att: { seed: new Uint8Array(32).fill(7), epoch: 0 } });
+  assert.deepEqual([...csr], [0x30, 0x82]);
+  const sent = state.log.at(-1);
+  assert.equal(sent.auth, null, 'no token before personalisation');
+  assert.deepEqual(sent.body, { att: { seed: b64(new Uint8Array(32).fill(7)), epoch: 0 } });
+  assert.deepEqual(await hem.bootstrap({ tls: { pkey: 'K', crt: 'C' } }), { csr: null });
+  await assert.rejects(hem.bootstrap({ att: { seed: new Uint8Array(16), epoch: 0 } }), (e) => e.code === 'invalid_arg');
+  await assert.rejects(hem.bootstrap({}), (e) => e.code === 'invalid_arg');
 });
 
 const VECTORS = [

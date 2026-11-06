@@ -98,6 +98,9 @@ mldsaVerify(token, kid, data, sig)                       mldsaVerify(token, kid,
   ECDSA), alg `ECDSA` (prehashed), ML-DSA `mode` ('HashML-DSA-SHA256/384/512',
   'ML-DSA-mu'), `CHACHA20-POLY1305`. `mlkemEncaps` also returns `alg`.
 - `cipherEncrypt`'s `iv` is never null.
+- New calls, no change for anyone: `xwingEncaps` / `xwingDecaps`, `hpkeSeal` /
+  `hpkeOpen`, `kdf`, `otp` / `otpVerify`, `random`, `defragCheck` /
+  `defragStart`, `bootstrap`.
 
 ### Authentication and system
 
