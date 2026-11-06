@@ -2205,8 +2205,8 @@ class HEM {
    * runs HKDF over it with `hkdfSalt`, `hkdfCtx` (info) and `hkdfLen`; the
    * three are not sent with any other `alg`.
    *
-   * Required scope: 'keymgmt:use:<KID>' ('keymgmt:use:<extKid>' too for a
-   * stored peer: one token with a scope array)
+   * Required scope: 'keymgmt:use:<KID>' (of `kid` alone: a stored peer
+   * `extKid` needs no scope of its own - API reference, common rules)
    *
    * @param {string} token
    * @param {string} kid
