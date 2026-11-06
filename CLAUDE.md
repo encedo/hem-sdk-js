@@ -106,9 +106,11 @@ line of work, without compatibility with older firmware (it is retired with
 sitting, the other consumers in a second pass once the SDK is done; they keep
 their copies / submodule pointers until then. [MIGRATION.md](MIGRATION.md),
 section "Firmware 1.3", lists what each has to change. Rows touched so far:
-`encedo-oidc` (`searchKeys`, `getPubKey`, `createKeyPair`), `encedo-chat`
-(`searchKeys`, `getPubKey`, `createKeyPair`, `updateKey`), `encedo-pgp`
-(`searchKeys`, `getPubKey`, `createKeyPair`, `importPublicKey`, `exdsaVerify`),
+`encedo-oidc` (`searchKeys`, `getPubKey`, `createKeyPair`, `exdsaSign` - its
+`ctx`), `encedo-chat`
+(`searchKeys`, `getPubKey`, `createKeyPair`, `updateKey`, `ecdh`), `encedo-pgp`
+(`searchKeys`, `getPubKey`, `createKeyPair`, `importPublicKey`, `exdsaSignBytes`,
+`exdsaVerify`, `ecdh`),
 `encedo-meet` (`authorizeRemote` `expSeconds`), `www` (`createKeyPair`).
 
 As it stands nobody reads `hemCheckin()`'s value, nobody catches `AbortError`
@@ -190,7 +192,9 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
    the request body and unwrapping the response field.
 2. Binary in / binary out: data parameters and return values are `Uint8Array`;
    base64 encoding/decoding happens inside the method (`toB64` / `fromB64`).
-   Match `exdsaSignBytes` / `ecdh` as the style reference.
+   A string where bytes are expected is UTF-8 text; a peer public key is
+   always bytes. Required arguments go positionally, the rest in one options
+   object. Match `exdsaSign` / `ecdh` as the style reference.
 3. `*Verify` methods resolve to the device's `verified` (`true` / `false`):
    the device answers 200 for every well-formed request, a wrong signature
    included, and puts the verdict in the body. Any other status throws.

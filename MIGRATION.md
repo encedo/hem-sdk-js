@@ -75,6 +75,41 @@ always failed). In Node, requests have no default timeout any more (it was
 15 s, shorter than an ML-DSA signature may take); pass `timeoutMs` where one
 is wanted.
 
+### Cryptography
+
+```js
+// before                                                // now
+exdsaSign(token, kid, msgString, alg, ctxB64)            exdsaSign(token, kid, data, alg, { ctx, det })   // data: bytes or text
+exdsaSignBytes(token, kid, bytes, alg, ctxB64)           exdsaSign(token, kid, bytes, alg, { ctx })
+exdsaVerify(token, kid, data, sig, alg)                  exdsaVerify(token, kid, data, sig, alg, { ctx })
+ecdh(token, kid, peerPubKeyBase64, { alg })              ecdh(token, kid, peerBytes, { alg, hkdfSalt, hkdfCtx, hkdfLen })
+ecdhKid(token, kid, extKid, { alg })                     ecdh(token, kid, extKid, { alg })                // a 32-hex KID
+cipherWrap(token, kid, alg, data, opts)                  cipherWrap(token, kid, data, { alg, ... })      // alg optional, AES256
+cipherUnwrap(token, kid, alg, wrapped, opts)             cipherUnwrap(token, kid, wrapped, { alg, ... })
+mldsaSign(token, kid, data)                              mldsaSign(token, kid, data, { ctx, mode })
+mldsaVerify(token, kid, data, sig)                       mldsaVerify(token, kid, data, sig, { ctx, mode })
+```
+
+- **A peer public key is bytes** everywhere (`pubkey` of the peer modes,
+  `ecdh`): a base64 string throws `invalid_arg`. Decode it first.
+- **A context is bytes or text**, encoded by the SDK (`exdsaSign` took the
+  caller's base64 before).
+- New: `ecdhHkdf` (several HKDF outputs from one ECDH), `det` (RFC 6979
+  ECDSA), alg `ECDSA` (prehashed), ML-DSA `mode` ('HashML-DSA-SHA256/384/512',
+  'ML-DSA-mu'), `CHACHA20-POLY1305`. `mlkemEncaps` also returns `alg`.
+- `cipherEncrypt`'s `iv` is never null.
+
+### Authentication and system
+
+- **A scope may be an array** of 1..8 values (`authorizePassword`,
+  `authorizeMaster`, `authorizeRemote`): one token for several keys or
+  operations, and X-Wing / HPKE with two keys need one. A cached token serves
+  every scope it holds; `tokens` lists `scope` as the string or the array.
+- `ctx` (1..64 characters, copied into the token) on all three.
+- `initialize` caches the `system:config` token the device answers with.
+- `getAttestation(token, { nonce })` binds `genuine` to the request;
+  `unlockStorage(token, { mode: 'ro' | 'rw' })`.
+
 ### Who this touches
 
 Fixed with the change: `encedo-manager`. To fix in the second pass:

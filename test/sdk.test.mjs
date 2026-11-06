@@ -83,13 +83,13 @@ async function handle(req, res) {
     if (body.gen_csr) return json(res, 200, { genuine: 'GEN', csr: 'CSR' });
     return json(res, 200, { updated: true, received: body });
   }
-  if (path === '/dev/api/system/config/attestation') return json(res, 200, state.provisioned ? { genuine: 'GEN' } : { genuine: 'GEN', csr: 'CSR', key: 'KEY' });
+  if (path.startsWith('/dev/api/system/config/attestation')) return json(res, 200, state.provisioned ? { genuine: 'GEN' } : { genuine: 'GEN', csr: 'CSR', key: 'KEY' });
   if (path === '/dev/api/system/config/provisioning') { state.provisioned = true; return json(res, 200, { installed: true }); }
   if (path === '/dev/api/auth/token' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-1' });   // no genuine: only auth/init has one
   if (path === '/dev/api/auth/token' && req.method === 'POST') {
     const { ok, payload } = await verifyEjwt(body.auth);
     if (!ok) return json(res, 401, { error: 'bad signature' });
-    return json(res, 200, { token: fakeJwt({ scope: payload.scope, exp: payload.exp, sub: 'user' }) });
+    return json(res, 200, { token: fakeJwt({ scope: payload.scope, exp: payload.exp, sub: 'user', ...(payload.ctx ? { ctx: payload.ctx } : {}) }) });
   }
   if (path === '/dev/api/auth/init' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-init', exp: Math.floor(Date.now() / 1000) + 300 });
   if (path === '/dev/api/auth/init' && req.method === 'POST') {
@@ -97,7 +97,7 @@ async function handle(req, res) {
     if (!ok) return json(res, 401, { error: 'bad signature' });
     state.initCfg = payload.cfg;
     state.initIss = payload.iss;
-    return json(res, 200, { instanceid: 'INST-1', inited: true });
+    return json(res, 200, { instanceid: 'INST-1', token: fakeJwt({ scope: 'system:config', sub: 'U', exp: Math.floor(Date.now() / 1000) + 28800 }) });
   }
   if (path === '/dev/api/auth/ext/request') return json(res, 200, { authreq: 'AUTHREQ', epk: body.epk });
   if (path === '/dev/api/auth/ext/token') return json(res, 200, { token: fakeJwt({ scope: 'remote', exp: Math.floor(Date.now() / 1000) + 300 }) });
@@ -129,7 +129,14 @@ async function handle(req, res) {
     return json(res, 200, { verified: Buffer.from(body.msg, 'base64').toString() === 'good' });   // 200 either way, as the device does
   }
   if (path === '/dev/api/crypto/cipher/encrypt') return json(res, 200, { ciphertext: b64([1]), iv: b64([2]), tag: b64([3]) });
-  if (path === '/dev/api/crypto/ecdh') return json(res, 200, { ecdh: b64(new Uint8Array(48)) });   // a P-384 raw secret
+  if (path === '/dev/api/crypto/ecdh') {
+    if (body.hkdf_args) return json(res, 200, { hkdf: body.hkdf_args.map((_, i) => b64([i + 1])) });
+    return json(res, 200, { ecdh: b64(new Uint8Array(48)) });   // a P-384 raw secret
+  }
+  if (path === '/dev/api/crypto/exdsa/sign' || path === '/dev/api/crypto/pqc/mldsa/sign') return json(res, 200, { sign: b64([7, 7]) });
+  if (path === '/dev/api/crypto/cipher/wrap') return json(res, 200, { wrapped: b64(new Uint8Array(40)) });
+  if (path === '/dev/api/crypto/hmac/hash') return json(res, 200, { mac: b64(new Uint8Array(32)) });
+  if (path.startsWith('/dev/api/storage/unlock')) return json(res, 200);
   if (path.startsWith('/dev/api/logger/key')) {
     // /logger/key/<nonce base64url> signs the caller's nonce; without it, a nonce of the device's own
     const asked = path.split('/')[5];
@@ -650,11 +657,83 @@ test('the HKDF fields of a peer-key cipher are hkdf_ctx / hkdf_salt, checked bef
   await assert.rejects(hem.cipherEncrypt(token, kid, Buffer.from('hi'), 'AES256-GCM', { hkdfSalt: new Uint8Array(129) }), (e) => e.code === 'invalid_arg');
 });
 
-test('a raw ECDH secret is as long as the curve makes it', async () => {
+test('a raw ECDH secret is as long as the curve makes it; the peer is bytes or a KID', async () => {
   const hem = mk();
   const kid = '00112233445566778899aabbccddeeff';
   const token = await hem.authorizePassword('correct horse', `keymgmt:use:${kid}`);
-  assert.equal((await hem.ecdhKid(token, kid, 'ffeeddccbbaa99887766554433221100')).length, 48, 'P-384');
+  const sent = () => state.log.filter((e) => e.path === '/dev/api/crypto/ecdh').at(-1).body;
+  assert.equal((await hem.ecdh(token, kid, 'ffeeddccbbaa99887766554433221100')).length, 48, 'P-384');
+  assert.deepEqual(sent(), { kid, ext_kid: 'ffeeddccbbaa99887766554433221100' });
+  await hem.ecdh(token, kid, new Uint8Array(32), { alg: 'HKDF-SHA2-256', hkdfSalt: new Uint8Array([1]), hkdfCtx: 'wg:v1', hkdfLen: 64 });
+  assert.deepEqual(sent(), { kid, pubkey: b64(new Uint8Array(32)), alg: 'HKDF-SHA2-256', hkdf_salt: b64([1]), hkdf_ctx: b64(Buffer.from('wg:v1')), hkdf_len: 64 });
+  await hem.ecdh(token, kid, new Uint8Array(32), { alg: 'SHA2-256', hkdfCtx: 'ignored' });
+  assert.deepEqual(sent(), { kid, pubkey: b64(new Uint8Array(32)), alg: 'SHA2-256' }, 'HKDF fields only with an HKDF-* alg');
+  await assert.rejects(hem.ecdh(token, kid, b64(new Uint8Array(32))), (e) => e.code === 'invalid_arg', 'a base64 string is neither bytes nor a KID');
+
+  const [enc, mac] = await hem.ecdhHkdf(token, kid, new Uint8Array(32), 'HKDF-SHA2-256', [{ hkdfCtx: 'enc', hkdfLen: 32 }, { hkdfCtx: 'mac' }]);
+  assert.deepEqual(sent().hkdf_args, [{ hkdf_ctx: b64(Buffer.from('enc')), hkdf_len: 32 }, { hkdf_ctx: b64(Buffer.from('mac')) }]);
+  assert.deepEqual([...enc], [1]);
+  assert.deepEqual([...mac], [2]);
+  await assert.rejects(hem.ecdhHkdf(token, kid, new Uint8Array(32), 'HKDF-SHA2-256', []), (e) => e.code === 'invalid_arg');
+});
+
+test('signatures take bytes or text, a context as bytes, and deterministic ECDSA', async () => {
+  const hem = mk();
+  const kid = '00112233445566778899aabbccddeeff';
+  const token = await hem.authorizePassword('correct horse', `keymgmt:use:${kid}`);
+  const sent = (p) => state.log.filter((e) => e.path === `/dev/api/crypto/${p}`).at(-1).body;
+  assert.deepEqual([...await hem.exdsaSign(token, kid, 'hello')], [7, 7]);
+  assert.deepEqual(sent('exdsa/sign'), { kid, alg: 'Ed25519', msg: b64(Buffer.from('hello')) });
+  await hem.exdsaSign(token, kid, new Uint8Array(32), 'ECDSA', { det: true });
+  assert.deepEqual(sent('exdsa/sign'), { kid, alg: 'ECDSA', msg: b64(new Uint8Array(32)), det: true });
+  await hem.exdsaSign(token, kid, 'x', 'Ed25519ctx', { ctx: 'app' });
+  assert.equal(sent('exdsa/sign').ctx, b64(Buffer.from('app')), 'the context is encoded here, not by the caller');
+  await hem.exdsaVerify(token, kid, 'good', new Uint8Array(64), 'Ed25519ctx', { ctx: 'app' });
+  assert.equal(sent('exdsa/verify').ctx, b64(Buffer.from('app')));
+
+  await hem.mldsaSign(token, kid, new Uint8Array(64), { mode: 'ML-DSA-mu' });
+  assert.deepEqual(sent('pqc/mldsa/sign'), { kid, msg: b64(new Uint8Array(64)), mode: 'ML-DSA-mu' });
+  assert.equal(await hem.mldsaVerify(token, kid, 'good', new Uint8Array(4), { ctx: 'c', mode: 'ML-DSA' }), true);
+  assert.deepEqual(sent('pqc/mldsa/verify'), { kid, msg: b64(Buffer.from('good')), sign: b64(new Uint8Array(4)), ctx: b64(Buffer.from('c')), mode: 'ML-DSA' });
+
+  await hem.cipherWrap(token, kid, new Uint8Array(32), { alg: 'AES128', pubkey: new Uint8Array(32), hkdfCtx: 'psk' });
+  assert.deepEqual(sent('cipher/wrap'), { kid, msg: b64(new Uint8Array(32)), alg: 'AES128', pubkey: b64(new Uint8Array(32)), hkdf_ctx: b64(Buffer.from('psk')) });
+  await hem.cipherWrap(token, kid, new Uint8Array(32));
+  assert.deepEqual(sent('cipher/wrap'), { kid, msg: b64(new Uint8Array(32)) }, 'AES256 by default, the device\'s');
+  await assert.rejects(hem.hmacHash(token, kid, 'x', 'SHA2-256', { pubkey: b64(new Uint8Array(32)) }), (e) => e.code === 'invalid_arg', 'a peer key is bytes');
+});
+
+test('one token for several scopes, cached for each of them', async () => {
+  const hem = mk();
+  const a = 'keymgmt:use:00112233445566778899aabbccddeeff', b = 'keymgmt:use:ffeeddccbbaa99887766554433221100';
+  const before = state.log.length;
+  const token = await hem.authorizePassword('correct horse', [a, b]);
+  assert.deepEqual(jwtParse(token).scope, [a, b], 'the array goes to the device as an array');
+  assert.equal(await hem.authorizePassword(null, b), token, 'a later single scope reuses it');
+  assert.equal(await hem.authorizePassword(null, [b, a]), token, 'in any order');
+  assert.equal(state.log.length - before, 2, 'one challenge and one exchange in all');
+  assert.deepEqual(hem.tokens.map((t) => t.scope), [[a, b]]);
+
+  const withCtx = await hem.authorizePassword(null, a, 300, { ctx: 'job-7' });
+  assert.notEqual(withCtx, token, 'a token with another ctx is another token');
+  assert.equal(jwtParse(withCtx).ctx, 'job-7');
+  for (const bad of [[], Array(9).fill(a).map((s, i) => s + i), [a, a], ['storage:disk0', 'storage:disk1:rw']]) {
+    await assert.rejects(hem.authorizePassword(null, bad), (e) => e.code === 'invalid_arg', JSON.stringify(bad));
+  }
+});
+
+test('attestation with our nonce, a disk unlocked read-only, and the init token cached', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'storage:disk0:rw');
+  const nonce = crypto.getRandomValues(new Uint8Array(32));
+  await hem.getAttestation(token, { nonce });
+  assert.equal(state.log.at(-1).path, `/dev/api/system/config/attestation/${b64url(nonce)}`);
+  await assert.rejects(hem.getAttestation(token, { nonce: new Uint8Array(8) }), (e) => e.code === 'invalid_arg');
+  await hem.unlockStorage(token, { mode: 'ro' });
+  assert.equal(state.log.at(-1).path, '/dev/api/storage/unlock/ro');
+  await hem.unlockStorage(token);
+  assert.equal(state.log.at(-1).path, '/dev/api/storage/unlock');
+  await assert.rejects(hem.unlockStorage(token, { mode: 'x' }), (e) => e.code === 'invalid_arg');
 });
 
 const VECTORS = [
@@ -718,7 +797,8 @@ test('initialize with a mnemonic writes that key as masterkey', async () => {
   const entropy = await mnemonicToEntropy(mnemonic);
 
   const r = await hem.initialize({ mnemonic }, 'user-password', { user: 'Ann', hostname: 'my.ence.do' });
-  assert.equal(r.inited, true);
+  assert.equal(r.instanceid, 'INST-1');
+  assert.equal(await hem.authorizePassword(null, 'system:config'), r.token, 'the init token is cached: no second sign-in');
 
   // The master public key on the device is X25519(entropy) — the words are the key.
   const priv = await crypto.subtle.importKey('pkcs8',

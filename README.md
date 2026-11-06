@@ -69,12 +69,12 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | Group | Operations |
 |-------|------------|
 | **Checkin** | `hemCheckin` — connection test + clock sync (call once, first); returns `newfws` / `newuis` when an update is available |
-| **Authentication** | `authorizePassword`, `authorizeRemote` (mobile push; cancelling withdraws the event), `authorizeMaster` (the 24 words), `initialize` (device initialisation) |
+| **Authentication** (a scope is a string or an array of 1..8; a cached token serves each scope it holds) | `authorizePassword`, `authorizeRemote` (mobile push; cancelling withdraws the event), `authorizeMaster` (the 24 words), `initialize` (device initialisation) |
 | **Master secret** | `generateMnemonic`, `entropyToMnemonic`, `mnemonicToEntropy`, `validateMnemonic` — BIP39, where the entropy *is* the master key |
 | **Mobile authenticators** | `registerExtAuth` (pair; hands the QR payload to the caller), `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `getExtAuthMac` |
 | **Provisioning and domains** | `provision` / `installProvisioning` (device certificate), `registerDomain` (`<prefix>.ence.do` + TLS) |
 | **Key management** | `listKeys`, `searchKeys` (prefix / suffix / anywhere, type and mode filters), `getKeyPublicInfo`, `createKeyPair`, `deriveKey` (ECDH or HMAC parent), `importPublicKey`, `updateKey`, `deleteKey` — every key in one shape, `HemKey` |
-| **Cryptography** | `exdsaSign(Bytes)`/`exdsaVerify` (EdDSA/ECDSA), `ecdh`/`ecdhKid`, `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt` (AES-CBC/GCM, ChaCha20-Poly1305), `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum). The `*Verify` calls resolve to the device's verdict, `true` or `false` |
+| **Cryptography** | `exdsaSign`/`exdsaVerify` (EdDSA/ECDSA, `det`, `ctx`), `ecdh` (peer bytes or KID; raw, digest or HKDF), `ecdhHkdf` (several keys from one agreement), `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt` (AES-CBC/GCM, ChaCha20-Poly1305), `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum; HashML-DSA and external μ). The `*Verify` calls resolve to the device's verdict, `true` or `false` |
 | **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `setUserPassword`, `getAttestation`, `reboot`, `shutdown`, `selftest` |
 | **Upgrade** | `rebootToUsbMode`, `uploadFirmware`/`checkFirmware`/`waitFirmwareCheck`/`installFirmware`, `uploadUi`/`checkUi`/`waitUiCheck`/`installUi` (uploads take `onProgress`; the checks answer null while the device is still verifying, the waits poll) |
 | **Storage** | `lockStorage`, `unlockStorage` |

@@ -295,7 +295,7 @@ const nist = await hem.createKeyPair(genToken, 'Work P-384', 'SECP384R1', { mode
 const hpke = await hem.createKeyPair(genToken, 'Inbox', 'CURVE25519', { mode: 'HPKE' });
 
 // Derive (scope: keymgmt:derive) from ECDH with a peer key ...
-const derived = await hem.deriveKey(genToken, 'Shared with Bob', 'AES256', ecdhKid, { pubkey: bobX25519 /* Uint8Array */ });
+const derived = await hem.deriveKey(genToken, 'Shared with Bob', 'AES256', myX25519Kid, { pubkey: bobX25519 /* Uint8Array */ });
 // ... or, with no peer, from a stored HMAC key: a key hierarchy from one secret.
 const tenant = await hem.deriveKey(genToken, 'tenant-7', 'AES256', hmacKid, { hkdfSalt: 'tenant-7' });
 ```
@@ -325,54 +325,66 @@ await hem.deleteKey(delToken, kid);
 
 ## 4. Cryptography
 
-All `/crypto/*` operations need a `keymgmt:use:<KID>` token.
+All `/crypto/*` operations need a `keymgmt:use:<KID>` token for the key they
+name, and TLS. Data goes in as bytes (a string is taken as UTF-8) and comes
+back as bytes; `msg` is at most 2048 bytes.
 
 ```js
 const token = await hem.authorizePassword('my-password', `keymgmt:use:${kid}`);
 const data = new TextEncoder().encode('message to protect');
+
+// Two keys in one operation (X-Wing, HPKE with ext_kid), or several operations
+// on one sign-in: one token with an array of scopes, cached for each of them.
+const both = await hem.authorizePassword('my-password', [`keymgmt:use:${kemKid}`, `keymgmt:use:${x25519Kid}`]);
 ```
 
 ### EdDSA / ECDSA signing
 
 ```js
-// Sign a string (UTF-8 encoded internally)
-const sig1 = await hem.exdsaSign(token, kid, 'hello world');
+const sig = await hem.exdsaSign(token, kid, data);                   // Ed25519 by default
+const sig2 = await hem.exdsaSign(token, kid, 'text works too');
 
-// Sign raw bytes — use this for OpenPGP / TLS / JWT etc.
-const sig2 = await hem.exdsaSignBytes(token, kid, data);          // Uint8Array
+// ECDSA comes back as raw r ‖ s (JWS / WebCrypto form). `det: true` makes it
+// deterministic (RFC 6979); alg 'ECDSA' signs a digest the caller made.
+const es256 = await hem.exdsaSign(token, p256Kid, data, 'SHA256WithECDSA', { det: true });
+const pre = await hem.exdsaSign(token, p256Kid, digest32, 'ECDSA');
 
-// Verify (with a key pair or an imported public key). The device answers 200
-// either way and the SDK returns its verdict: false is an invalid signature.
-if (!(await hem.exdsaVerify(token, kid, data, sig2))) throw new Error('bad signature');
+// A context for Ed25519ctx / Ed25519ph / Ed448, as bytes or text:
+const sig3 = await hem.exdsaSign(token, kid, data, 'Ed25519ctx', { ctx: 'my-app' });
 
-// Other algorithms — pass a base64 ctx for Ed25519ctx / Ed448
-const sig3 = await hem.exdsaSignBytes(token, kid, data, 'Ed25519ctx', btoa('ctx'));
+// Verify (a key pair or an imported public key). The device answers 200 either
+// way and the SDK returns its verdict: false is an invalid signature.
+if (!(await hem.exdsaVerify(token, kid, data, sig))) throw new Error('bad signature');
 ```
 
 ### ECDH
 
 ```js
-// ECDH on the device. Without alg the raw secret comes back - as long as the
-// curve (32 B for X25519 / P-256, 48 for P-384, 66 for P-521, 56 for X448) and
-// only on a device personalised with the raw_ecdh_enabled policy (else 403).
-const secret = await hem.ecdh(token, kid, peerPubKeyBase64);       // Uint8Array
+// The peer is raw key bytes, or the KID of a key already in the HEM.
+// Without alg: the raw secret, as long as the curve - only on a device
+// personalised with the raw_ecdh_enabled policy (403 otherwise).
+const secret = await hem.ecdh(token, kid, peerPubKeyBytes);           // Uint8Array
+const secret2 = await hem.ecdh(token, kid, peerKid);                  // both operands in the HEM
 
-// Two-KID variant: the peer public key is already imported in the HSM (extKid);
-// both operands stay in-device, only the 32-byte shared secret comes back.
-const secret2 = await hem.ecdhKid(token, kid, extKid);            // Uint8Array
+// A digest of it, or HKDF over it:
+const hashed = await hem.ecdh(token, kid, peerPubKeyBytes, { alg: 'SHA2-256' });
+const okm = await hem.ecdh(token, kid, peerPubKeyBytes, { alg: 'HKDF-SHA2-256', hkdfSalt: salt, hkdfCtx: 'wg:v1', hkdfLen: 32 });
 
-// alg hashes the result. Omit it whenever you need the raw secret — a Noise or
-// TLS handshake will not match a digest.
-const hashed = await hem.ecdh(token, kid, peerPubKeyBase64, { alg: 'SHA2-256' });
+// Several keys from one agreement; the shared secret never leaves the device:
+const [encKey, macKey] = await hem.ecdhHkdf(token, kid, peerPubKeyBytes, 'HKDF-SHA2-256',
+  [{ hkdfCtx: 'enc', hkdfLen: 32 }, { hkdfCtx: 'mac', hkdfLen: 32 }]);
 ```
 
 ### Indirect operations (ECDH-derived keys)
 
 `hmacHash`, `hmacVerify`, `cipherEncrypt`, `cipherDecrypt`, `cipherWrap` and
-`cipherUnwrap` all accept `extKid` or `pubkey`. Either one makes the device run
-ECDH between `kid` and that peer key and use the shared secret as the
-operation's key, so the key actually in use never exists outside the HSM. Pass
-one or the other, never both, and the peer key must be of the same type as `kid`.
+`cipherUnwrap` all accept `extKid` (a key in the HEM) or `pubkey` (raw bytes).
+Either one makes the device run ECDH between `kid` and that peer key and use
+the result as the operation's key, so the key actually in use never exists
+outside the HEM. Pass one or the other, never both; the peer key is of the
+same type as `kid`. The cipher calls derive the key by HKDF, shaped by
+`hkdfCtx` and `hkdfSalt` (1..128 bytes each), which must be repeated to get
+the same key back.
 
 Naming **the key's own public key** is legal and gives a self-ECDH key — a key
 derived from a private key that cannot be recomputed by anyone holding only
@@ -385,12 +397,10 @@ configuration without a separate secret.
 const mac = await hem.hmacHash(token, kid, data, 'SHA2-256');      // Uint8Array
 const ok = await hem.hmacVerify(token, kid, data, mac, 'SHA2-256'); // true / false
 
-// MAC key = ECDH(kid, myOwnPubKey) — never leaves the device.
-const mac2 = await hem.hmacHash(token, kid, data, 'SHA2-256', { pubkey: myPubKeyBase64 });
-await hem.hmacVerify(token, kid, data, mac2, 'SHA2-256', { pubkey: myPubKeyBase64 });
+// MAC key = ECDH(kid, myOwnPubKey) — never leaves the device. The peer modes need alg.
+const mac2 = await hem.hmacHash(token, kid, data, 'SHA2-256', { pubkey: myPubKeyBytes });
+await hem.hmacVerify(token, kid, data, mac2, 'SHA2-256', { pubkey: myPubKeyBytes });
 ```
-
-`data` is limited to 2048 bytes, as is every other `/crypto/*` payload.
 
 ### Symmetric encryption
 
@@ -399,45 +409,44 @@ an `AES256` key in the HEM). There is no ECB.
 
 The IV is generated by the device (CBC 16 B, GCM and ChaCha20 12 B), and GCM /
 ChaCha20-Poly1305 add a 16-byte tag — both come back with the ciphertext and
-both must be handed to `cipherDecrypt`. With a peer key the device derives the
-cipher key by HKDF: `hkdfCtx` and `hkdfSalt` (1..128 bytes each) shape it and
-must be repeated on decrypt.
+both must be handed to `cipherDecrypt`.
 
 ```js
 const { ciphertext, iv, tag } = await hem.cipherEncrypt(token, kid, data, 'AES256-GCM');
 const plaintext = await hem.cipherDecrypt(token, kid, ciphertext, 'AES256-GCM', { iv, tag });
 
 // With additional authenticated data, and a key derived from a peer's key:
-const enc = await hem.cipherEncrypt(token, kid, data, 'AES256-GCM',
-  { extKid: peerKid, aad: headerBytes });
+const enc = await hem.cipherEncrypt(token, kid, data, 'CHACHA20-POLY1305',
+  { extKid: peerKid, hkdfCtx: 'files:v1', aad: headerBytes });
 ```
 
 ### Key wrapping
 
-NIST AES key wrap: deterministic, 32 bytes in → 40 bytes out.
+AES key wrap (RFC 3394): deterministic, n bytes in, n + 8 out (16..2048, a
+multiple of 8). The KEK is `AES256` unless `alg` says otherwise.
 
 ```js
-const wrapped   = await hem.cipherWrap(token, kid, 'AES256', keyMaterialBytes);
-const unwrapped = await hem.cipherUnwrap(token, kid, 'AES256', wrapped);
+const wrapped   = await hem.cipherWrap(token, kid, keyMaterialBytes);
+const unwrapped = await hem.cipherUnwrap(token, kid, wrapped);
 
-// Wrapped under a self-ECDH KEK, domain-separated by hkdfCtx (1..128 bytes).
-// Every option must be repeated verbatim on unwrap — a different context derives
-// a different KEK and the unwrap fails.
-const opts = { pubkey: myPubKeyBase64, hkdfCtx: 'ENC-WG-PSK-v1' };
-const psk        = await hem.cipherWrap(token, kid, 'AES256', pskBytes, opts);
-const pskPlain   = await hem.cipherUnwrap(token, kid, 'AES256', psk, opts);
+// Under a self-ECDH KEK, domain-separated by hkdfCtx. Every option must be
+// repeated on unwrap — a different context derives a different KEK.
+const opts = { pubkey: myPubKeyBytes, hkdfCtx: 'ENC-WG-PSK-v1' };
+const psk      = await hem.cipherWrap(token, kid, pskBytes, opts);
+const pskPlain = await hem.cipherUnwrap(token, kid, psk, opts);
 ```
 
 ### Post-quantum (ML-KEM / ML-DSA)
 
 ```js
-// ML-KEM key encapsulation
-const { ss, ct } = await hem.mlkemEncaps(token, kemKid);  // ss = shared secret
+// ML-KEM: encapsulate to a key in the HEM (made there, or imported), decapsulate with one made there.
+const { alg, ss, ct } = await hem.mlkemEncaps(token, kemKid);
 const ss2 = await hem.mlkemDecaps(token, kemKid, ct);     // ss2 equals ss
 
-// ML-DSA signatures
-const sig = await hem.mldsaSign(token, dsaKid, data);
-await hem.mldsaVerify(token, dsaKid, data, sig);          // true / false
+// ML-DSA: the message itself, or (mode) a digest or μ for data over 2 KB.
+const sig = await hem.mldsaSign(token, dsaKid, data, { ctx: 'my-app' });
+await hem.mldsaVerify(token, dsaKid, data, sig, { ctx: 'my-app' });   // true / false
+const sigH = await hem.mldsaSign(token, dsaKid, sha512Digest, { mode: 'HashML-DSA-SHA512' });
 ```
 
 ---
@@ -455,7 +464,9 @@ const config = await hem.getConfig(token);
 await hem.setConfig(token, { user: 'New Name' });          // { updated: true }
 
 // Device attestation — any valid token is accepted
-const attestation = await hem.getAttestation(token);       // { genuine, ... }
+const attestation = await hem.getAttestation(token);       // { genuine, crt | csr, ... }
+// Bound to this request with a nonce of ours (32..64 B):
+const fresh = await hem.getAttestation(token, { nonce: crypto.getRandomValues(new Uint8Array(32)) });
 
 // Lifecycle: system:config does all three (reboot also takes system:upgrade /
 // system:shutdown, shutdown system:shutdown)
@@ -515,7 +526,8 @@ The disk (disk0 / disk1) is selected by the token's scope, not an argument.
 ```js
 const token = await hem.authorizePassword('my-password', 'storage:disk0:rw');
 await hem.lockStorage(token);
-await hem.unlockStorage(token);
+await hem.unlockStorage(token);                  // writable: the scope ends in :rw
+await hem.unlockStorage(token, { mode: 'ro' });  // read-only all the same
 ```
 
 ---

@@ -988,8 +988,20 @@ function applyPeerKey(body, opts, op) {
   if (extKid && pubkey) {
     throw new HemError(`${op}: pass extKid or pubkey, not both`, { code: 'invalid_arg' });
   }
+  if (pubkey && !(pubkey instanceof Uint8Array)) {
+    throw new HemError(`${op}: pubkey must be a Uint8Array (raw key bytes)`, { code: 'invalid_arg' });
+  }
   if (extKid) body.ext_kid = extKid;
-  else if (pubkey) body.pubkey = pubkey instanceof Uint8Array ? toB64(pubkey) : pubkey;
+  else if (pubkey) body.pubkey = toB64(pubkey);
+}
+
+const KID_RE = /^[0-9a-fA-F]{32}$/;
+
+/** A peer given as raw key bytes, or as the KID of a key stored in the HEM. */
+function peerField(body, peer, op) {
+  if (peer instanceof Uint8Array) body.pubkey = toB64(peer);
+  else if (typeof peer === 'string' && KID_RE.test(peer)) body.ext_kid = peer;
+  else throw new HemError(`${op}: the peer is raw key bytes (Uint8Array) or a 32-hex KID`, { code: 'invalid_arg' });
 }
 
 /**
@@ -1018,6 +1030,19 @@ function applyHkdf(body, opts, op) {
 /** Bytes as given, or a string as UTF-8. */
 function asBytes(v) {
   return v instanceof Uint8Array ? v : strToBytes(String(v));
+}
+
+/** A scope as a list: a string is one value, an array 1..8 of them. */
+function scopeList(scope) {
+  return Array.isArray(scope) ? scope : [scope];
+}
+
+/** The device answers a bad scope with a bare 400; catch the shape here. */
+function checkScope(scope) {
+  const list = scopeList(scope);
+  const ok = list.length >= 1 && list.length <= 8 && list.every(s => typeof s === 'string' && s.length > 0 && s.length <= 44)
+    && new Set(list).size === list.length && list.filter(s => s.startsWith('storage:')).length <= 1;
+  if (!ok) throw new HemError('A scope is a string, or 1..8 distinct strings with at most one storage:*', { code: 'invalid_arg' });
 }
 
 const b64OrNull = (v) => (typeof v === 'string' && v ? fromB64(v) : null);
@@ -1151,17 +1176,24 @@ export class HEM {
 
   // -- Token Cache -------------------------------------------------------------
 
-  #cacheStore(scope, jwt) {
+  // A token carries one scope or an array of them (DEV-436). The device grants
+  // a call when any value of the array matches, so a cached token answers for
+  // every scope it holds: one for ['keymgmt:list', 'keymgmt:get'] also serves
+  // a later 'keymgmt:get'. What it holds is read from the token itself - the
+  // phone may approve less than was asked. `ctx` must match too.
+  #cacheStore(scope, jwt, ctx = null) {
     const payload = jwtParse(jwt);
     const exp = payload?.exp ?? (Math.floor(Date.now() / 1000) + 300);
-    this.#tokenCache.push({ scope, token: jwt, exp });
+    const granted = payload?.scope ?? scope;
+    this.#tokenCache.push({ scope: granted, scopes: scopeList(granted), ctx, token: jwt, exp });
     this.#cachePurge();
   }
 
-  #cacheFind(scope) {
+  #cacheFind(scope, ctx = null) {
     this.#cachePurge();
     const now = Math.floor(Date.now() / 1000);
-    return this.#tokenCache.find(e => e.scope === scope && e.exp > now)?.token ?? null;
+    const wanted = scopeList(scope);
+    return this.#tokenCache.find(e => e.exp > now && e.ctx === ctx && wanted.every(s => e.scopes.includes(s)))?.token ?? null;
   }
 
   #cachePurge() {
@@ -1175,7 +1207,7 @@ export class HEM {
    * here — a page has no use for them, and something that can be shown on screen
    * or written to a log should not be a bearer token.
    *
-   * @returns {Array<{scope: string, exp: number}>}
+   * @returns {Array<{scope: string|string[], exp: number}>}
    */
   get tokens() {
     this.#cachePurge();
@@ -1259,17 +1291,20 @@ export class HEM {
    * The resulting JWT is cached automatically.
    *
    * @param {string} password    Local password (plain text)
-   * @param {string} scope       e.g. 'keymgmt:list' or 'keymgmt:use:<KID>'
+   * @param {string|string[]} scope  e.g. 'keymgmt:list', 'keymgmt:use:<KID>', or 1..8 of them
+   *   in an array for one token that does several things (both keys of X-Wing / HPKE)
    * @param {number} [expSeconds=300]  Requested token lifetime
    * @param {object} [opts]
+   * @param {string} [opts.ctx]  1..64 characters, copied into the token
    * @param {boolean} [opts.remember=true]  Keep the derived key for the scopes
    *   that follow. With `false` it is used for this call alone and the next
    *   scope needs the password typed again — v1's "save password for this
    *   session", unticked. Tokens are cached either way.
    * @returns {Promise<string>}  JWT token
    */
-  async authorizePassword(password, scope, expSeconds = 300, { remember = true } = {}) {
-    const cached = this.#cacheFind(scope);
+  async authorizePassword(password, scope, expSeconds = 300, { remember = true, ctx = null } = {}) {
+    checkScope(scope);
+    const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
 
     // Phase 1 -- get challenge (always needed for fresh jti + spk)
@@ -1292,7 +1327,7 @@ export class HEM {
     if (!keys) {
       throw new HemError('Password required (no cached keys)', { code: 'auth_password_required' });
     }
-    return this.#authorizeWithKeys(keys, challenge, scope, expSeconds);
+    return this.#authorizeWithKeys(keys, challenge, scope, expSeconds, ctx);
   }
 
   // -- Authorization: Master secret (the 24 words) ------------------------------
@@ -1309,14 +1344,16 @@ export class HEM {
    * including a new user password. Do not cache the mnemonic anywhere.
    *
    * @param {string} mnemonic   12-24 BIP39 words
-   * @param {string} scope
+   * @param {string|string[]} scope  As authorizePassword
    * @param {number} [expSeconds=300]
    * @param {object} [opts]
+   * @param {string} [opts.ctx]  1..64 characters, copied into the token
    * @param {boolean} [opts.legacy=false]  Device personalised by the v1 Manager,
    *   whose master key came from the BIP39 seed at a one-nibble offset.
    * @returns {Promise<string>}  JWT token
    */
-  async authorizeMaster(mnemonic, scope, expSeconds = 300, { legacy = false } = {}) {
+  async authorizeMaster(mnemonic, scope, expSeconds = 300, { legacy = false, ctx = null } = {}) {
+    checkScope(scope);
     // No cache read here, deliberately. A cached token for this scope may have
     // come from the password, and a caller asking to authorise with the master
     // secret is asking for that key in particular — handing back a token the
@@ -1330,11 +1367,11 @@ export class HEM {
     seed.fill(0);
 
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
-    return this.#authorizeWithKeys(keys, challenge, scope, expSeconds);
+    return this.#authorizeWithKeys(keys, challenge, scope, expSeconds, ctx);
   }
 
   /** Sign the device's challenge with `keys` and exchange it for a scoped token. */
-  async #authorizeWithKeys({ privKey, pubkeyB64 }, challenge, scope, expSeconds) {
+  async #authorizeWithKeys({ privKey, pubkeyB64 }, challenge, scope, expSeconds, ctx = null) {
     const iat = Math.floor(Date.now() / 1000) - 5;   // -5s for clock drift
     const payload = {
       jti: challenge.jti,
@@ -1344,13 +1381,14 @@ export class HEM {
       iss: pubkeyB64,   // our X25519 public key as standard base64
       scope,
     };
+    if (ctx) payload.ctx = ctx;
 
     const ejwt = await this.#buildEjwt(privKey, challenge.spk, payload);
     const resp = await this.#req('POST', `${this.#baseUrl}/api/auth/token`, { auth: ejwt });
 
     if (!resp.token) throw new HemError('No token in auth response', { code: 'auth_failed' });
 
-    this.#cacheStore(scope, resp.token);
+    this.#cacheStore(scope, resp.token, ctx);
     return resp.token;
   }
 
@@ -1390,15 +1428,25 @@ export class HEM {
   // -- System: Attestation -----------------------------------------------------
 
   /**
-   * Fetch device attestation data from the HSM.
-   * Any valid token is accepted -- scope has no effect on this endpoint.
+   * The device certificate and a fresh attestation token (`genuine`). PPA:
+   * `crt` once the chip is provisioned, `csr` and `key` before; EPA: `csr` of
+   * the attestation key. `genuine` is `<SKID>.<TS>.<SIG>`, or with a nonce of
+   * ours `<nonce>.<SKID>.<TS>.<SIG>` - bound to this request, so it cannot be
+   * replayed; verify it with the public key of `crt`.
    *
-   * @param   {string} token  Any currently valid JWT token (e.g. useToken from authorizePassword)
-   * @returns {Promise<{genuine: string, [key: string]: any}>}
-   *          genuine -- device attestation blob, validated externally via api.encedo.com
+   * Any valid token (none before personalisation).
+   *
+   * @param {string|null} token
+   * @param {object} [opts]
+   * @param {Uint8Array} [opts.nonce]  32..64 random bytes
+   * @returns {Promise<{genuine: string, crt?: string, csr?: string, key?: string}>}  base64 DER
    */
-  async getAttestation(token) {
-    return this.#req('GET', `${this.#baseUrl}/api/system/config/attestation`, null, token);
+  async getAttestation(token, { nonce = null } = {}) {
+    if (nonce && (nonce.length < 32 || nonce.length > 64)) {
+      throw new HemError(`getAttestation: nonce is ${nonce.length} bytes, must be 32..64`, { code: 'invalid_arg' });
+    }
+    const path = nonce ? `/api/system/config/attestation/${toB64url(nonce)}` : '/api/system/config/attestation';
+    return this.#req('GET', `${this.#baseUrl}${path}`, null, token);
   }
 
   // -- Authorization: Remote (mobile push via broker) --------------------------
@@ -1420,7 +1468,7 @@ export class HEM {
    * reject with HemError: code `aborted` or `timeout`; a refusal on the phone
    * is `denied`.
    *
-   * @param {string} scope       e.g. 'keymgmt:list'
+   * @param {string|string[]} scope  As authorizePassword
    * @param {object} [opts]
    * @param {string} [opts.ctx]        1..64 chars, copied into the token
    * @param {string} [opts.note]       1..128 chars shown with the request on the phone
@@ -1440,7 +1488,8 @@ export class HEM {
     onEvent = null,
     signal = null,
   } = {}) {
-    const cached = this.#cacheFind(scope);
+    checkScope(scope);
+    const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
 
     // Step 1: broker session EPK
@@ -1478,7 +1527,7 @@ export class HEM {
 
     if (!resp.token) throw new HemError('No token in ext/token response', { code: 'auth_failed' });
 
-    this.#cacheStore(scope, resp.token);
+    this.#cacheStore(scope, resp.token, ctx);
     return resp.token;
   }
 
@@ -1503,12 +1552,14 @@ export class HEM {
    *
    * @param {string|{mnemonic: string}|{entropy: Uint8Array}} admin  Master secret
    * @param {string} userPassword   Local user passphrase
-   * @param {object} [cfg]          Device config: { user, email, hostname,
-   *                                trusted_ts, trusted_backend, allow_keysearch,
-   *                                gen_csr, origin, ... }. masterkey/userkey are
-   *                                filled in automatically and override any value
-   *                                passed here.
-   * @returns {Promise<object>}     Initialization result from the device
+   * @param {object} [cfg]          Device config (API 1.3, POST /api/auth/init): user, email,
+   *                                hostname, origin, trusted_ts, trusted_backend, allow_keysearch;
+   *                                PPA also ip, storage_mode, storage_disk0size, dnsd; optional
+   *                                ctx, cc_mode (0..15), policy (set once: 'raw_ecdh_enabled',
+   *                                'pubkey_in_search', 'pubkey_in_list'), gen_csr. masterkey /
+   *                                userkey are filled in and override any value passed here.
+   * @returns {Promise<{instanceid: string, token: string, csr?: string, genuine?: string,
+   *          reboot_required?: boolean}>}  The token (system:config, 8 h) is also cached
    */
   async initialize(admin, userPassword, cfg = {}) {
     // Phase 1 -- challenge
@@ -1549,7 +1600,11 @@ export class HEM {
 
     // eJWT signed with the ADMIN key
     const ejwt = await this.#buildEjwt(adminKeys.privKey, challenge.spk, payload);
-    return this.#req('POST', `${this.#baseUrl}/api/auth/init`, { init: ejwt });
+    const result = await this.#req('POST', `${this.#baseUrl}/api/auth/init`, { init: ejwt });
+    // The answer carries a system:config token (8 h): what the personalisation
+    // does next (format wait, domain, certificate) needs no second sign-in.
+    if (result?.token) this.#cacheStore('system:config', result.token);
+    return result;
   }
 
   // -- External Authenticator: Registration ------------------------------------
@@ -1910,46 +1965,34 @@ export class HEM {
   }
 
   // -- Cryptography ------------------------------------------------------------
+  //
+  // Every /api/crypto/* call needs a token with 'keymgmt:use:<KID>' for the key
+  // it names (both keys for X-Wing and HPKE with an ext_kid: one token with a
+  // scope array, see authorizePassword), and TLS. Data in and out is bytes;
+  // a string argument is taken as UTF-8. `msg` is at most 2048 bytes.
 
   /**
-   * Sign a message with an EdDSA or ECDSA key stored in the HSM.
-   * Mirrors PHP api_exdsa_sign().
+   * Sign with an ECDSA (NIST, secp256k1) or EdDSA (Ed25519, Ed448) key in the HEM.
+   * ECDSA comes back as raw r ‖ s (64 / 96 / 132 bytes, as JWS and WebCrypto
+   * take it), Ed25519 64 bytes, Ed448 114 bytes.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string} token           Bearer JWT
-   * @param {string} kid             Key ID (32-char hex)
-   * @param {string} msg             Message to sign (string -- encoded to UTF-8 bytes then base64)
-   * @param {string} [alg='Ed25519'] Signature algorithm (Ed25519, Ed25519ph, Ed25519ctx, Ed448, ...)
-   * @param {string|null} [ctx=null] Optional context (base64-encoded) for Ed25519ctx / Ed448
-   * @returns {Promise<Uint8Array>}  Raw signature bytes (convert to base64url before use in JWT)
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} data  The message, 1..2048 bytes; for `ECDSA` the digest (20..64 B)
+   * @param {string} [alg='Ed25519']  'SHA256WithECDSA', 'SHA384WithECDSA', 'SHA512WithECDSA',
+   *   'ECDSA' (prehashed), 'Ed25519', 'Ed25519ph', 'Ed25519ctx', 'Ed448', 'Ed448ph' - fitting the key's curve
+   * @param {object} [opts]
+   * @param {Uint8Array|string} [opts.ctx]  RFC 8032 context, 1..255 bytes; required for Ed25519ctx
+   * @param {boolean} [opts.det=false]  Deterministic ECDSA (RFC 6979): same key and
+   *   message, same signature, no dependence on the RNG
+   * @returns {Promise<Uint8Array>}
    */
-  async exdsaSign(token, kid, msg, alg = 'Ed25519', ctx = null) {
-    const body = { kid, alg, msg: toB64(strToBytes(msg)) };
-    if (ctx !== null) body.ctx = ctx;
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/sign`, body, token);
-    if (!ret.sign) throw new HemError('No sign in exdsa/sign response', { code: 'sign_error' });
-    // Convert standard base64 response to base64url for JWT use
-    return fromB64(ret.sign);
-  }
-
-  /**
-   * Sign arbitrary binary data with an EdDSA key stored in the HSM.
-   * Like exdsaSign but accepts Uint8Array directly (no UTF-8 conversion).
-   * Use this for cryptographic protocols (OpenPGP, TLS, etc.) that sign raw bytes.
-   *
-   * Required scope: 'keymgmt:use:<KID>'
-   *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex)
-   * @param {Uint8Array} data   Raw bytes to sign
-   * @param {string}     [alg='Ed25519']
-   * @param {string|null} [ctx=null]
-   * @returns {Promise<Uint8Array>}  Raw 64-byte Ed25519 signature (R || S)
-   */
-  async exdsaSignBytes(token, kid, data, alg = 'Ed25519', ctx = null) {
-    const body = { kid, alg, msg: toB64(data) };
-    if (ctx !== null) body.ctx = ctx;
+  async exdsaSign(token, kid, data, alg = 'Ed25519', { ctx = null, det = false } = {}) {
+    const body = { kid, alg, msg: toB64(asBytes(data)) };
+    if (ctx !== null) body.ctx = toB64(asBytes(ctx));
+    if (det) body.det = true;
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/sign`, body, token);
     if (!ret.sign) throw new HemError('No sign in exdsa/sign response', { code: 'sign_error' });
     return fromB64(ret.sign);
@@ -1963,90 +2006,112 @@ export class HEM {
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex) of the public key in HSM
-   * @param {Uint8Array} data   Raw bytes that were signed
-   * @param {Uint8Array} sig    Raw signature bytes (64 bytes for Ed25519)
-   * @param {string}     [alg='Ed25519']
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} data  As signed
+   * @param {Uint8Array} sig          ECDSA r ‖ s (exactly twice the curve size), EdDSA raw
+   * @param {string} [alg='Ed25519']  As exdsaSign
+   * @param {object} [opts]
+   * @param {Uint8Array|string} [opts.ctx]  As signed
    * @returns {Promise<boolean>}  true: the signature is valid; false: it is not
    */
-  async exdsaVerify(token, kid, data, sig, alg = 'Ed25519') {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/verify`,
-      { kid, alg, msg: toB64(data), sign: toB64(sig) }, token);
+  async exdsaVerify(token, kid, data, sig, alg = 'Ed25519', { ctx = null } = {}) {
+    const body = { kid, alg, msg: toB64(asBytes(data)), sign: toB64(sig) };
+    if (ctx !== null) body.ctx = toB64(asBytes(ctx));
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/verify`, body, token);
     return ret?.verified === true;
   }
 
   /**
-   * Perform a Curve25519 ECDH operation on the HSM.
-   * The private key never leaves the device — only the shared secret is returned.
+   * ECDH between a private key in the HEM and a peer public key: raw bytes
+   * (`Uint8Array`: SECP* compressed point 33 / 49 / 67 B, X25519 32, X448 56)
+   * or another key in the HEM (its KID, a 32-hex string). An Ed25519 key with
+   * ECDH works as X25519.
+   *
+   * Without `alg` the raw secret comes back, as long as the curve (X25519 /
+   * P-256 / secp256k1 32 B, P-384 48, P-521 66, X448 56) - and only on a
+   * device personalised with the `raw_ecdh_enabled` policy (else 403). `alg`
+   * 'SHA2-256' ... 'SHA3-512' returns its digest; 'HKDF-SHA2-256/384/512'
+   * runs HKDF over it with `hkdfSalt`, `hkdfCtx` (info) and `hkdfLen`.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string} token             Bearer JWT
-   * @param {string} kid               Key ID (32-char hex) of the X25519 private key in HSM
-   * @param {string} peerPubKeyBase64  Peer's raw 32-byte X25519 public key in standard base64
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} peer  Raw public key, or the KID of a stored one
    * @param {object} [opts]
-   * @param {string|null} [opts.alg=null]  Hash applied to the shared secret
-   *                       ('SHA2-256'…'SHA3-512'). Omit for the raw secret —
-   *                       that is what a Noise handshake needs.
-   * @returns {Promise<Uint8Array>}    Shared secret: raw 32 bytes, or the digest when alg is set
+   * @param {string} [opts.alg]
+   * @param {Uint8Array|string} [opts.hkdfSalt]  1..128 bytes (HKDF-* only)
+   * @param {Uint8Array|string} [opts.hkdfCtx]   1..128 bytes, not 'encedo-...' (HKDF-* only)
+   * @param {number} [opts.hkdfLen]  16..128; default the hash size (HKDF-* only)
+   * @returns {Promise<Uint8Array>}
    */
-  async ecdh(token, kid, peerPubKeyBase64, { alg = null } = {}) {
-    const body = { kid, pubkey: peerPubKeyBase64 };
+  async ecdh(token, kid, peer, { alg = null, hkdfSalt = null, hkdfCtx = null, hkdfLen = null } = {}) {
+    const body = { kid };
+    peerField(body, peer, 'ecdh');
     if (alg) body.alg = alg;
-    return this.#ecdhCall(body, token, alg);
-  }
-
-  /**
-   * Curve25519 ECDH between two keys that already live in the HSM: my private
-   * key (`kid`) and a peer public key imported into the HSM (`extKid`). Both
-   * operands stay in-device — only the shared secret is returned.
-   * The two-KID counterpart of {@link ecdh} (which takes a raw peer pubkey).
-   *
-   * Required scope: 'keymgmt:use:<KID>'
-   *
-   * @param {string} token   Bearer JWT
-   * @param {string} kid     Key ID (32-char hex) of my X25519 private key in HSM
-   * @param {string} extKid  Key ID of the peer's X25519 public key in HSM
-   * @param {object} [opts]
-   * @param {string|null} [opts.alg=null]  Hash applied to the shared secret; omit for raw
-   * @returns {Promise<Uint8Array>}  Shared secret: raw 32 bytes, or the digest when alg is set
-   */
-  async ecdhKid(token, kid, extKid, { alg = null } = {}) {
-    const body = { kid, ext_kid: extKid };
-    if (alg) body.alg = alg;
-    return this.#ecdhCall(body, token, alg);
-  }
-
-  async #ecdhCall(body, token, alg) {
+    if (alg?.startsWith('HKDF-')) {
+      applyHkdf(body, { hkdfSalt, hkdfCtx }, 'ecdh');
+      if (hkdfLen !== null) body.hkdf_len = hkdfLen;
+    }
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/ecdh`, body, token);
     if (!ret.ecdh) throw new HemError('No ecdh in response', { code: 'ecdh_error' });
-    // Raw: as long as the curve (X25519 / P-256 / secp256k1 32 B, P-384 48,
-    // P-521 66, X448 56); hashed: as long as the digest.
     return fromB64(ret.ecdh);
   }
 
   /**
-   * Compute an HMAC over arbitrary data using a key in the HSM (max 2048 bytes).
-   *
-   * With `extKid` or `pubkey` the MAC key is not the key at `kid` but the ECDH
-   * shared secret between the two, so pointing at `kid`'s own public key gives a
-   * MAC key that never exists outside the device.
+   * One ECDH, several HKDF outputs (1..8): each item its own salt, context
+   * and length, all with the hash of `alg`. The shared secret itself never
+   * leaves the device - the way to get, say, an encryption key and a MAC key
+   * from one agreement.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex) of the HMAC key
-   * @param {Uint8Array} data   Raw bytes to authenticate
-   * @param {string|null} [alg=null]  Hash algorithm, e.g. 'SHA2-256' (device default if null)
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} peer  As ecdh()
+   * @param {'HKDF-SHA2-256'|'HKDF-SHA2-384'|'HKDF-SHA2-512'} alg
+   * @param {Array<{hkdfSalt?: Uint8Array|string, hkdfCtx?: Uint8Array|string, hkdfLen?: number}>} items
+   * @returns {Promise<Uint8Array[]>}  In the order of `items`
+   */
+  async ecdhHkdf(token, kid, peer, alg, items) {
+    if (!Array.isArray(items) || items.length < 1 || items.length > 8) {
+      throw new HemError('ecdhHkdf: 1..8 items', { code: 'invalid_arg' });
+    }
+    const body = { kid, alg };
+    peerField(body, peer, 'ecdhHkdf');
+    body.hkdf_args = items.map(({ hkdfSalt = null, hkdfCtx = null, hkdfLen = null } = {}) => {
+      const item = {};
+      applyHkdf(item, { hkdfSalt, hkdfCtx }, 'ecdhHkdf');
+      if (hkdfLen !== null) item.hkdf_len = hkdfLen;
+      return item;
+    });
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/ecdh`, body, token);
+    if (!Array.isArray(ret.hkdf)) throw new HemError('No hkdf in response', { code: 'ecdh_error' });
+    return ret.hkdf.map(fromB64);
+  }
+
+  /**
+   * HMAC over data with a key in the HEM: a stored HMAC key (the hash is the
+   * key's), or - with `extKid` / `pubkey` - the ECDH secret of the private key
+   * `kid` and that peer, so pointing at `kid`'s own public key gives a MAC key
+   * that never exists outside the device. The peer modes need `alg`.
+   *
+   * Required scope: 'keymgmt:use:<KID>'
+   *
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} data  1..2048 bytes
+   * @param {string|null} [alg=null]  'SHA2-256' ... 'SHA3-512'
    * @param {object} [opts]
-   * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
-   * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
-   * @returns {Promise<Uint8Array>}  Raw MAC bytes
+   * @param {string} [opts.extKid]      Peer public key stored in the HEM
+   * @param {Uint8Array} [opts.pubkey]  Raw peer public key; not with extKid
+   * @returns {Promise<Uint8Array>}  32 / 48 / 64 bytes
    */
   async hmacHash(token, kid, data, alg = null, opts = {}) {
-    checkMsgSize('hmacHash', data);
-    const body = { kid, msg: toB64(data) };
+    const bytes = asBytes(data);
+    checkMsgSize('hmacHash', bytes);
+    const body = { kid, msg: toB64(bytes) };
     if (alg !== null) body.alg = alg;
     applyPeerKey(body, opts, 'hmacHash');
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/hash`, body, token);
@@ -2064,19 +2129,18 @@ export class HEM {
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex) of the HMAC key
-   * @param {Uint8Array} data   Raw bytes that were authenticated
-   * @param {Uint8Array} mac    Raw MAC bytes to verify
-   * @param {string|null} [alg=null]  Hash algorithm (must match hmacHash)
-   * @param {object} [opts]
-   * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
-   * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} data
+   * @param {Uint8Array} mac
+   * @param {string|null} [alg=null]
+   * @param {object} [opts]  extKid / pubkey, as hmacHash
    * @returns {Promise<boolean>}  true: the MAC matches
    */
   async hmacVerify(token, kid, data, mac, alg = null, opts = {}) {
-    checkMsgSize('hmacVerify', data);
-    const body = { kid, msg: toB64(data), mac: toB64(mac) };
+    const bytes = asBytes(data);
+    checkMsgSize('hmacVerify', bytes);
+    const body = { kid, msg: toB64(bytes), mac: toB64(mac) };
     if (alg !== null) body.alg = alg;
     applyPeerKey(body, opts, 'hmacVerify');
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/verify`, body, token);
@@ -2084,29 +2148,30 @@ export class HEM {
   }
 
   /**
-   * Encrypt data with a symmetric key stored in the HSM (max 2048 bytes).
-   * The IV is generated by the device and returned alongside the ciphertext;
-   * GCM modes also return the authentication tag. All three are needed to
-   * decrypt, so the result is an object rather than a bare byte array.
+   * Encrypt with a symmetric key in the HEM, or - with `extKid` / `pubkey` -
+   * with a key derived by HKDF from the ECDH secret of the private key `kid`
+   * and that peer. The device makes the IV; GCM and ChaCha20-Poly1305 add a
+   * 16-byte tag. All of it is needed to decrypt.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex) of the symmetric key
-   * @param {Uint8Array} data   Plaintext bytes, 1..2048
-   * @param {string}     alg    'AES128-CBC' ... 'AES256-GCM' or 'CHACHA20-POLY1305' (a 256-bit
-   *                            key: an AES256 key in the HEM). No ECB.
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} data  1..2048 bytes
+   * @param {string} alg  'AES128-CBC' ... 'AES256-GCM' or 'CHACHA20-POLY1305' (a 256-bit
+   *   key: an AES256 key in the HEM). No ECB.
    * @param {object} [opts]
-   * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
-   * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
-   * @param {Uint8Array|null} [opts.aad=null]  Additional authenticated data (GCM only)
-   * @param {Uint8Array|string|null} [opts.hkdfCtx=null]   HKDF context (info), 1..128 bytes; peer-key modes only
-   * @param {Uint8Array|string|null} [opts.hkdfSalt=null]  HKDF salt, 1..128 bytes; peer-key modes only
+   * @param {string} [opts.extKid]      Peer public key stored in the HEM
+   * @param {Uint8Array} [opts.pubkey]  Raw peer public key; not with extKid
+   * @param {Uint8Array|string} [opts.hkdfCtx]   HKDF context (info), 1..128 bytes; peer modes only
+   * @param {Uint8Array|string} [opts.hkdfSalt]  HKDF salt, 1..128 bytes; peer modes only
+   * @param {Uint8Array} [opts.aad]  1..256 bytes; GCM and ChaCha20-Poly1305
    * @returns {Promise<{ciphertext: Uint8Array, iv: Uint8Array, tag: Uint8Array|null}>}
    */
   async cipherEncrypt(token, kid, data, alg, opts = {}) {
-    checkMsgSize('cipherEncrypt', data);
-    const body = { kid, msg: toB64(data), alg };
+    const bytes = asBytes(data);
+    checkMsgSize('cipherEncrypt', bytes);
+    const body = { kid, msg: toB64(bytes), alg };
     applyPeerKey(body, opts, 'cipherEncrypt');
     applyHkdf(body, opts, 'cipherEncrypt');
     if (opts.aad) body.aad = toB64(opts.aad);
@@ -2114,29 +2179,28 @@ export class HEM {
     if (!ret.ciphertext) throw new HemError('No ciphertext in encrypt response', { code: 'cipher_error' });
     return {
       ciphertext: fromB64(ret.ciphertext),
-      iv: ret.iv ? fromB64(ret.iv) : null,
-      tag: ret.tag ? fromB64(ret.tag) : null,
+      iv: fromB64(ret.iv),
+      tag: b64OrNull(ret.tag),
     };
   }
 
   /**
-   * Decrypt data with a symmetric key stored in the HSM. `opts.iv` is required
-   * for CBC and GCM and `opts.tag` for GCM — pass back what cipherEncrypt
-   * returned, along with the same peer key, aad and ctx.
+   * Decrypt what cipherEncrypt (or any standard implementation with the same
+   * key) made. Pass back its `iv` and `tag`, and the same peer key, HKDF
+   * fields and aad. A failed GCM / ChaCha20 tag or a bad CBC padding is 406.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token       Bearer JWT
-   * @param {string}     kid         Key ID (32-char hex) of the symmetric key
-   * @param {Uint8Array} ciphertext  Ciphertext bytes
-   * @param {string}     alg         Cipher + mode (must match cipherEncrypt)
-   * @param {object} [opts]  As cipherEncrypt, plus:
-   * @param {Uint8Array|null} [opts.iv=null]   IV returned by cipherEncrypt
-   * @param {Uint8Array|null} [opts.tag=null]  GCM tag returned by cipherEncrypt
-   * @returns {Promise<Uint8Array>}  Plaintext bytes
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array} ciphertext  1..2064 bytes
+   * @param {string} alg
+   * @param {object} opts  As cipherEncrypt, plus:
+   * @param {Uint8Array} opts.iv     CBC 16 B, GCM 12 B (16 B before firmware 1.3), ChaCha20 12 B
+   * @param {Uint8Array} [opts.tag]  GCM, ChaCha20-Poly1305: 16 B
+   * @returns {Promise<Uint8Array>}
    */
   async cipherDecrypt(token, kid, ciphertext, alg, opts = {}) {
-    checkMsgSize('cipherDecrypt', ciphertext);
     const body = { kid, msg: toB64(ciphertext), alg };
     applyPeerKey(body, opts, 'cipherDecrypt');
     applyHkdf(body, opts, 'cipherDecrypt');
@@ -2144,35 +2208,33 @@ export class HEM {
     if (opts.tag) body.tag = toB64(opts.tag);
     if (opts.aad) body.aad = toB64(opts.aad);
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/decrypt`, body, token);
-    if (!ret.plaintext) throw new HemError('No plaintext in decrypt response', { code: 'cipher_error' });
+    if (typeof ret.plaintext !== 'string') throw new HemError('No plaintext in decrypt response', { code: 'cipher_error' });
     return fromB64(ret.plaintext);
   }
 
   /**
-   * Key-wrap: encrypt key material with a key-encryption key held in the HSM
-   * (NIST AES key wrap — deterministic, 32 bytes in, 40 bytes out).
-   *
-   * With `extKid` or `pubkey` the KEK is the ECDH shared secret rather than the
-   * key at `kid`; `ctx` then domain-separates that KEK from other wrap uses of
-   * the same key and must be repeated verbatim on unwrap.
+   * AES key wrap (RFC 3394) of key material, deterministic: n bytes in, n + 8
+   * out. The KEK is an AES key in the HEM, or - with `extKid` / `pubkey` - an
+   * HKDF of the ECDH secret with that peer.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex) of the wrapping key
-   * @param {string}     alg    Wrapping algorithm (key type, e.g. 'AES256')
-   * @param {Uint8Array} data   Key material to wrap (max 2048 bytes)
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array} data  16..2048 bytes, a multiple of 8
    * @param {object} [opts]
-   * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
-   * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
-   * @param {Uint8Array|string|null} [opts.hkdfCtx=null]   HKDF context (info), 1..128 bytes; peer-key modes only
-   * @param {Uint8Array|string|null} [opts.hkdfSalt=null]  HKDF salt, 1..128 bytes; peer-key modes only
-   * @param {Uint8Array|null} [opts.iv=null]             Explicit IV; omit for the default
-   * @returns {Promise<Uint8Array>}  Wrapped key bytes
+   * @param {'AES128'|'AES192'|'AES256'} [opts.alg='AES256']  KEK size
+   * @param {Uint8Array} [opts.iv]  8 bytes; default the RFC 3394 IV
+   * @param {string} [opts.extKid]
+   * @param {Uint8Array} [opts.pubkey]
+   * @param {Uint8Array|string} [opts.hkdfCtx]
+   * @param {Uint8Array|string} [opts.hkdfSalt]
+   * @returns {Promise<Uint8Array>}
    */
-  async cipherWrap(token, kid, alg, data, opts = {}) {
+  async cipherWrap(token, kid, data, opts = {}) {
     checkMsgSize('cipherWrap', data);
-    const body = { kid, alg, msg: toB64(data) };
+    const body = { kid, msg: toB64(data) };
+    if (opts.alg) body.alg = opts.alg;
     applyPeerKey(body, opts, 'cipherWrap');
     applyHkdf(body, opts, 'cipherWrap');
     if (opts.iv) body.iv = toB64(opts.iv);
@@ -2182,22 +2244,20 @@ export class HEM {
   }
 
   /**
-   * Key-unwrap: recover key material wrapped by {@link cipherWrap}. Every option
-   * must match the wrap call — a differing `ctx` derives a different KEK and the
-   * unwrap fails.
+   * Unwrap what cipherWrap made. Every option must match the wrap: a
+   * different context derives a different KEK and the unwrap fails (406).
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token    Bearer JWT
-   * @param {string}     kid      Key ID (32-char hex) of the wrapping key
-   * @param {string}     alg      Wrapping algorithm (must match cipherWrap)
-   * @param {Uint8Array} wrapped  Wrapped key bytes
-   * @param {object} [opts]  Same shape as cipherWrap; must match it
-   * @returns {Promise<Uint8Array>}  Unwrapped key material
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array} wrapped  24..2064 bytes, a multiple of 8
+   * @param {object} [opts]  As cipherWrap
+   * @returns {Promise<Uint8Array>}
    */
-  async cipherUnwrap(token, kid, alg, wrapped, opts = {}) {
-    checkMsgSize('cipherUnwrap', wrapped);
-    const body = { kid, alg, msg: toB64(wrapped) };
+  async cipherUnwrap(token, kid, wrapped, opts = {}) {
+    const body = { kid, msg: toB64(wrapped) };
+    if (opts.alg) body.alg = opts.alg;
     applyPeerKey(body, opts, 'cipherUnwrap');
     applyHkdf(body, opts, 'cipherUnwrap');
     if (opts.iv) body.iv = toB64(opts.iv);
@@ -2207,73 +2267,90 @@ export class HEM {
   }
 
   /**
-   * ML-KEM (post-quantum) encapsulation against an ML-KEM key in the HSM.
+   * ML-KEM encapsulation to a key in the HEM - one made there, or (to
+   * encrypt for someone else) an imported public key.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string} token  Bearer JWT
-   * @param {string} kid    Key ID (32-char hex) of the ML-KEM key
-   * @returns {Promise<{ss: Uint8Array, ct: Uint8Array}>}
-   *          ss — shared secret, ct — ciphertext to send to the peer
+   * @param {string} token
+   * @param {string} kid
+   * @returns {Promise<{alg: string, ss: Uint8Array, ct: Uint8Array}>}
+   *          ss: 32-byte shared secret; ct: 768 / 1088 / 1568 bytes for the peer
    */
   async mlkemEncaps(token, kid) {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mlkem/encaps`,
-      { kid }, token);
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mlkem/encaps`, { kid }, token);
     if (!ret.ss || !ret.ct) throw new HemError('Missing ss/ct in mlkem/encaps response', { code: 'pqc_error' });
-    return { ss: fromB64(ret.ss), ct: fromB64(ret.ct) };
+    return { alg: ret.alg, ss: fromB64(ret.ss), ct: fromB64(ret.ct) };
   }
 
   /**
-   * ML-KEM (post-quantum) decapsulation with an ML-KEM key in the HSM.
+   * ML-KEM decapsulation with a key made in the HEM (not an HPKE-only one).
+   * A ciphertext of the right size but wrong content gives an unrelated
+   * secret, not an error (FIPS 203 implicit rejection).
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex) of the ML-KEM key
-   * @param {Uint8Array} ct     Ciphertext from the peer's encapsulation
-   * @returns {Promise<Uint8Array>}  Shared secret
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array} ct
+   * @returns {Promise<Uint8Array>}  32-byte shared secret
    */
   async mlkemDecaps(token, kid, ct) {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mlkem/decaps`,
-      { kid, ct: toB64(ct) }, token);
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mlkem/decaps`, { kid, ct: toB64(ct) }, token);
     if (!ret.ss) throw new HemError('No ss in mlkem/decaps response', { code: 'pqc_error' });
     return fromB64(ret.ss);
   }
 
   /**
-   * ML-DSA (post-quantum) signature with an ML-DSA key in the HSM.
+   * ML-DSA signature (FIPS 204) with a key made in the HEM: 2420 / 3309 /
+   * 4627 bytes for ML-DSA-44 / 65 / 87. The signing engine is serialised; a
+   * caller may wait up to 30 s for it.
+   *
+   * `mode`: 'ML-DSA' (default) signs the message; 'HashML-DSA-SHA256/384/512'
+   * signs a digest the caller made (32 / 48 / 64 B); 'ML-DSA-mu' signs the
+   * 64-byte μ the caller computed (no ctx) - an ordinary ML-DSA signature of
+   * a message too long to send (over 2 KB).
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex) of the ML-DSA key
-   * @param {Uint8Array} data   Raw bytes to sign
-   * @returns {Promise<Uint8Array>}  Signature bytes
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} data  Message, digest or μ, per `mode`
+   * @param {object} [opts]
+   * @param {Uint8Array|string} [opts.ctx]  FIPS 204 context, 1..255 bytes
+   * @param {string} [opts.mode]
+   * @returns {Promise<Uint8Array>}
    */
-  async mldsaSign(token, kid, data) {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/sign`,
-      { kid, msg: toB64(data) }, token);
+  async mldsaSign(token, kid, data, { ctx = null, mode = null } = {}) {
+    const body = { kid, msg: toB64(asBytes(data)) };
+    if (ctx !== null) body.ctx = toB64(asBytes(ctx));
+    if (mode) body.mode = mode;
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/sign`, body, token);
     if (!ret.sign) throw new HemError('No sign in mldsa/sign response', { code: 'pqc_error' });
     return fromB64(ret.sign);
   }
 
   /**
-   * ML-DSA (post-quantum) signature verification on the HEM, with a key pair
-   * or an imported public key. Resolves to the device's `verified` (false also
-   * when the signature has the wrong size, or the engine stayed busy for 30 s);
-   * any status other than 200 throws.
+   * ML-DSA verification on the HEM, with a key pair or an imported public key
+   * (signatures made elsewhere, e.g. OpenSSL 3.5). Resolves to the device's
+   * `verified` (false also when the signature has the wrong size, or the
+   * engine stayed busy for 30 s); any status other than 200 throws. The JSON
+   * body limit leaves about 780 bytes of message next to an ML-DSA-87 signature.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
-   * @param {string}     token  Bearer JWT
-   * @param {string}     kid    Key ID (32-char hex) of the ML-DSA key
-   * @param {Uint8Array} data   Raw bytes that were signed
-   * @param {Uint8Array} sign   Signature bytes
+   * @param {string} token
+   * @param {string} kid
+   * @param {Uint8Array|string} data  As signed
+   * @param {Uint8Array} sign
+   * @param {object} [opts]  ctx / mode, as signed
    * @returns {Promise<boolean>}  true: the signature is valid
    */
-  async mldsaVerify(token, kid, data, sign) {
-    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/verify`,
-      { kid, msg: toB64(data), sign: toB64(sign) }, token);
+  async mldsaVerify(token, kid, data, sign, { ctx = null, mode = null } = {}) {
+    const body = { kid, msg: toB64(asBytes(data)), sign: toB64(sign) };
+    if (ctx !== null) body.ctx = toB64(asBytes(ctx));
+    if (mode) body.mode = mode;
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/verify`, body, token);
     return ret?.verified === true;
   }
 
@@ -2562,11 +2639,10 @@ export class HEM {
   // -- Storage -----------------------------------------------------------------
 
   /**
-   * Lock an embedded storage disk. The disk (disk0 / disk1) and access mode are
-   * selected by the token's scope — e.g. a token scoped to 'storage:disk0:rw'
-   * locks disk0.
+   * Hide a disk from the USB host (PPA). The disk is the one in the token's
+   * scope, e.g. 'storage:disk0' locks disk0.
    *
-   * Required scope: 'storage:disk<N>:rw'
+   * Required scope: 'storage:disk<N>' (or 'storage:disk<N>:rw')
    *
    * @param {string} token  Bearer JWT scoped to a specific disk
    * @returns {Promise<object>}
@@ -2576,15 +2652,21 @@ export class HEM {
   }
 
   /**
-   * Unlock an embedded storage disk. The disk is selected by the token's scope.
+   * Show a disk to the USB host (PPA). The disk is the one in the token's
+   * scope; without `mode` it is writable when the scope ends in ':rw' and
+   * read-only otherwise. 'rw' needs a ':rw' scope (403 without), 'ro' forces
+   * read-only.
    *
-   * Required scope: 'storage:disk<N>:rw'
+   * Required scope: 'storage:disk<N>' or 'storage:disk<N>:rw'
    *
-   * @param {string} token  Bearer JWT scoped to a specific disk
-   * @returns {Promise<object>}
+   * @param {string} token
+   * @param {object} [opts]
+   * @param {'ro'|'rw'} [opts.mode]
+   * @returns {Promise<void>}
    */
-  async unlockStorage(token) {
-    return this.#req('GET', `${this.#baseUrl}/api/storage/unlock`, null, token);
+  async unlockStorage(token, { mode = null } = {}) {
+    if (mode && mode !== 'ro' && mode !== 'rw') throw new HemError(`unlockStorage: mode is 'ro' or 'rw', not '${mode}'`, { code: 'invalid_arg' });
+    await this.#req('GET', `${this.#baseUrl}/api/storage/unlock${mode ? '/' + mode : ''}`, null, token);
   }
 
   // -- Logger / Audit Log ------------------------------------------------------
