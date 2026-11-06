@@ -972,11 +972,44 @@ export async function verifyLoggerKey(loggerKey, expectedNonce = null) {
 
 // --- /api/crypto/* shared options ---------------------------------------------
 
-// Device limits. Exceeding either surfaces as an opaque HTTP 400, so the SDK
-// checks them where the caller can still see which argument was at fault.
-const MAX_CRYPTO_MSG = 2048;
-const MAX_HKDF_FIELD = 128;
-const HKDF_RESERVED = strToBytes('encedo-');   // prefix of the device's own HKDF labels
+/**
+ * Device limits the SDK checks before a request goes out. Exceeding one
+ * surfaces from the device as an opaque HTTP 400, so the SDK checks them where
+ * the caller can still see which argument was at fault. Each value comes from
+ * `encedo_firmware/docs/HEM_API_reference_1.3.x.md`; the section is named next
+ * to it, so a firmware change is one line here.
+ */
+const LIMITS = Object.freeze({
+  cryptoMsg: 2048,                // "Common rules (HMAC, ExDSA, cipher endpoints)": msg
+  hkdfField: 128,                 // POST /api/crypto/ecdh: hkdf_salt / hkdf_ctx, 1..128 B
+  hkdfLenMin: 16,                 // POST /api/crypto/ecdh: hkdf_len 16..128
+  hkdfLenMax: 128,
+  hkdfItems: 8,                   // POST /api/crypto/ecdh: hkdf_args, 1..8 items
+  hkdfReserved: 'encedo-',        // POST /api/crypto/ecdh: an hkdf_ctx starting with it -> 400
+  pageSize: 15,                   // POST /api/keymgmt/search, GET list: at most 15 a page
+});
+const HKDF_RESERVED = strToBytes(LIMITS.hkdfReserved);
+
+const KID_RE = /^[0-9a-fA-F]{32}$/;
+
+/**
+ * The options object of a method whose required arguments are `n` positional
+ * ones. Anything else in that place - a number, a string, bytes, or one more
+ * argument after it - is a call written for the older positional signature
+ * (MIGRATION.md): destructuring it would quietly run with defaults the caller
+ * never chose (`authorizePassword(pw, scope, 900)` would get 300 s), so throw.
+ */
+function optsArg(op, args, n) {
+  const opts = args[n];
+  const bad = args.length > n + 1
+    || (opts !== undefined && opts !== null
+      && (typeof opts !== 'object' || Array.isArray(opts) || ArrayBuffer.isView(opts)));
+  if (bad) {
+    throw new HemError(`${op}: takes ${n} arguments and an options object - an older positional call? See MIGRATION.md`,
+      { code: 'invalid_arg' });
+  }
+  return opts ?? {};
+}
 
 /**
  * Write the ext_kid / pubkey selector into a request body.
@@ -987,26 +1020,34 @@ const HKDF_RESERVED = strToBytes('encedo-');   // prefix of the device's own HKD
  * Naming the key's *own* public key is legal and yields a self-ECDH key — the
  * construction the config-free WireGuard client uses to authenticate its
  * configuration. The peer key must be of the same type as `kid`.
+ *
+ * `required`: the operation has no meaning without a peer (ecdh), so neither
+ * field is an error here rather than a 400 from the device.
  */
-function applyPeerKey(body, opts, op) {
+function applyPeerKey(body, opts, op, { required = false } = {}) {
   const { extKid = null, pubkey = null } = opts;
   if (extKid && pubkey) {
     throw new HemError(`${op}: pass extKid or pubkey, not both`, { code: 'invalid_arg' });
   }
+  if (required && !extKid && !pubkey) {
+    throw new HemError(`${op}: needs the peer, as extKid or pubkey`, { code: 'invalid_arg' });
+  }
   if (pubkey && !(pubkey instanceof Uint8Array)) {
     throw new HemError(`${op}: pubkey must be a Uint8Array (raw key bytes)`, { code: 'invalid_arg' });
+  }
+  if (extKid && !(typeof extKid === 'string' && KID_RE.test(extKid))) {
+    throw new HemError(`${op}: extKid is a KID, 32 hex characters`, { code: 'invalid_arg' });
   }
   if (extKid) body.ext_kid = extKid;
   else if (pubkey) body.pubkey = toB64(pubkey);
 }
 
-const KID_RE = /^[0-9a-fA-F]{32}$/;
-
-/** A peer given as raw key bytes, or as the KID of a key stored in the HEM. */
-function peerField(body, peer, op) {
-  if (peer instanceof Uint8Array) body.pubkey = toB64(peer);
-  else if (typeof peer === 'string' && KID_RE.test(peer)) body.ext_kid = peer;
-  else throw new HemError(`${op}: the peer is raw key bytes (Uint8Array) or a 32-hex KID`, { code: 'invalid_arg' });
+/** `hkdf_len`: an integer in the device's range (a fraction is a 400 since DEV-502). */
+function checkHkdfLen(op, len) {
+  if (!Number.isInteger(len) || len < LIMITS.hkdfLenMin || len > LIMITS.hkdfLenMax) {
+    throw new HemError(`${op}: hkdfLen is an integer ${LIMITS.hkdfLenMin}..${LIMITS.hkdfLenMax}, got ${len}`,
+      { code: 'invalid_arg' });
+  }
 }
 
 /**
@@ -1022,11 +1063,11 @@ function applyHkdf(body, opts, op) {
     const v = opts[name];
     if (v === null || v === undefined) continue;
     const bytes = v instanceof Uint8Array ? v : strToBytes(v);
-    if (bytes.length < 1 || bytes.length > MAX_HKDF_FIELD) {
-      throw new HemError(`${op}: ${name} is ${bytes.length} bytes, must be 1..${MAX_HKDF_FIELD}`, { code: 'invalid_arg' });
+    if (bytes.length < 1 || bytes.length > LIMITS.hkdfField) {
+      throw new HemError(`${op}: ${name} is ${bytes.length} bytes, must be 1..${LIMITS.hkdfField}`, { code: 'invalid_arg' });
     }
     if (field === 'hkdf_ctx' && bytesEqual(bytes.subarray(0, HKDF_RESERVED.length), HKDF_RESERVED)) {
-      throw new HemError(`${op}: hkdfCtx may not start with "encedo-" (reserved)`, { code: 'invalid_arg' });
+      throw new HemError(`${op}: hkdfCtx may not start with "${LIMITS.hkdfReserved}" (reserved by the device)`, { code: 'invalid_arg' });
     }
     body[field] = toB64(bytes);
   }
@@ -1126,8 +1167,8 @@ function otpBody(kid, { mode = 'TOTP', digits = null, period = null, time = null
 }
 
 function checkMsgSize(op, data) {
-  if (data.length > MAX_CRYPTO_MSG) {
-    throw new HemError(`${op}: message is ${data.length} bytes, max ${MAX_CRYPTO_MSG}`,
+  if (data.length > LIMITS.cryptoMsg) {
+    throw new HemError(`${op}: message is ${data.length} bytes, max ${LIMITS.cryptoMsg}`,
       { code: 'invalid_arg' });
   }
 }
@@ -1324,8 +1365,9 @@ export class HEM {
    * @param {string} password    Local password (plain text)
    * @param {string|string[]} scope  e.g. 'keymgmt:list', 'keymgmt:use:<KID>', or 1..8 of them
    *   in an array for one token that does several things (both keys of X-Wing / HPKE)
-   * @param {number} [expSeconds=300]  Requested token lifetime
    * @param {object} [opts]
+   * @param {number} [opts.expSeconds=300]  Requested token lifetime (the device's own
+   *   default without one would be 60 s)
    * @param {string} [opts.ctx]  1..64 characters, copied into the token
    * @param {boolean} [opts.remember=true]  Keep the derived key for the scopes
    *   that follow. With `false` it is used for this call alone and the next
@@ -1333,7 +1375,8 @@ export class HEM {
    *   session", unticked. Tokens are cached either way.
    * @returns {Promise<string>}  JWT token
    */
-  async authorizePassword(password, scope, expSeconds = 300, { remember = true, ctx = null } = {}) {
+  async authorizePassword(password, scope, opts) {
+    const { expSeconds = 300, remember = true, ctx = null } = optsArg('authorizePassword', arguments, 2);
     checkScope(scope);
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
@@ -1376,14 +1419,15 @@ export class HEM {
    *
    * @param {string} mnemonic   12-24 BIP39 words
    * @param {string|string[]} scope  As authorizePassword
-   * @param {number} [expSeconds=300]
    * @param {object} [opts]
+   * @param {number} [opts.expSeconds=300]  As authorizePassword
    * @param {string} [opts.ctx]  1..64 characters, copied into the token
    * @param {boolean} [opts.legacy=false]  Device personalised by the v1 Manager,
    *   whose master key came from the BIP39 seed at a one-nibble offset.
    * @returns {Promise<string>}  JWT token
    */
-  async authorizeMaster(mnemonic, scope, expSeconds = 300, { legacy = false, ctx = null } = {}) {
+  async authorizeMaster(mnemonic, scope, opts) {
+    const { expSeconds = 300, legacy = false, ctx = null } = optsArg('authorizeMaster', arguments, 2);
     checkScope(scope);
     // No cache read here, deliberately. A cached token for this scope may have
     // come from the password, and a caller asking to authorise with the master
@@ -1916,8 +1960,8 @@ export class HEM {
     applyPeerKey(body, { extKid, pubkey }, 'deriveKey');
     if (hkdfSalt !== null) {
       const salt = asBytes(hkdfSalt);
-      if (salt.length < 1 || salt.length > MAX_HKDF_FIELD) {
-        throw new HemError(`deriveKey: hkdfSalt is ${salt.length} bytes, must be 1..${MAX_HKDF_FIELD}`, { code: 'invalid_arg' });
+      if (salt.length < 1 || salt.length > LIMITS.hkdfField) {
+        throw new HemError(`deriveKey: hkdfSalt is ${salt.length} bytes, must be 1..${LIMITS.hkdfField}`, { code: 'invalid_arg' });
       }
       body.hkdf_salt = toB64(salt);
     }
@@ -2021,6 +2065,58 @@ export class HEM {
   }
 
   /**
+   * Every key listKeys() would page through, one at a time, so no caller
+   * writes the paging loop (and stops at the first 15). Pages run on `listed`
+   * until `offset` reaches `total`. A page that lists nothing ends the walk
+   * too, so a device that answered short can not spin it forever.
+   *
+   *   for await (const k of hem.listKeysAll(token)) ...
+   *   const all = await Array.fromAsync(hem.listKeysAll(token))
+   *
+   * Required scope: 'keymgmt:list'
+   *
+   * @param {string} token
+   * @param {object} [opts]
+   * @param {boolean} [opts.returnPubkey=false]  As listKeys
+   * @returns {AsyncGenerator<KeyEntry>}
+   */
+  async *listKeysAll(token, { returnPubkey = false } = {}) {
+    let offset = 0;
+    for (;;) {
+      const page = await this.listKeys(token, { offset, limit: LIMITS.pageSize, returnPubkey });
+      yield* page.list;
+      if (page.listed <= 0) return;
+      offset += page.listed;
+      if (offset >= page.total || offset > 0xffff) return;
+    }
+  }
+
+  /**
+   * Every key searchKeys() would find, one at a time, across pages. A search
+   * page can end early (after 3 PQC keys with public keys) and its `total`
+   * counts every record, not the matches, so the walk goes on from
+   * `offset + listed` until a page comes back empty - the device's rule, at
+   * the price of one request that finds nothing.
+   *
+   * Required scope: as searchKeys
+   *
+   * @param {string|null} token
+   * @param {Uint8Array|string} pattern
+   * @param {object} [opts]  match, type, mode, returnPubkey - as searchKeys (no offset / limit)
+   * @returns {AsyncGenerator<KeyEntry>}
+   */
+  async *searchKeysAll(token, pattern, { match = 'prefix', type = null, mode = null, returnPubkey = false } = {}) {
+    let offset = 0;
+    for (;;) {
+      const page = await this.searchKeys(token, pattern, { match, offset, limit: LIMITS.pageSize, type, mode, returnPubkey });
+      yield* page.list;
+      if (page.listed <= 0) return;
+      offset += page.listed;
+      if (offset > 0xffff) return;
+    }
+  }
+
+  /**
    * Delete a key - any record, the TLS key and certificate and a paired
    * phone's key (which unpairs it) included.
    *
@@ -2051,15 +2147,16 @@ export class HEM {
    * @param {string} token
    * @param {string} kid
    * @param {Uint8Array|string} data  The message, 1..2048 bytes; for `ECDSA` the digest (20..64 B)
-   * @param {string} [alg='Ed25519']  'SHA256WithECDSA', 'SHA384WithECDSA', 'SHA512WithECDSA',
-   *   'ECDSA' (prehashed), 'Ed25519', 'Ed25519ph', 'Ed25519ctx', 'Ed448', 'Ed448ph' - fitting the key's curve
    * @param {object} [opts]
+   * @param {string} [opts.alg='Ed25519']  'SHA256WithECDSA', 'SHA384WithECDSA', 'SHA512WithECDSA',
+   *   'ECDSA' (prehashed), 'Ed25519', 'Ed25519ph', 'Ed25519ctx', 'Ed448', 'Ed448ph' - fitting the key's curve
    * @param {Uint8Array|string} [opts.ctx]  RFC 8032 context, 1..255 bytes; required for Ed25519ctx
    * @param {boolean} [opts.det=false]  Deterministic ECDSA (RFC 6979): same key and
    *   message, same signature, no dependence on the RNG
    * @returns {Promise<Uint8Array>}
    */
-  async exdsaSign(token, kid, data, alg = 'Ed25519', { ctx = null, det = false } = {}) {
+  async exdsaSign(token, kid, data, opts) {
+    const { alg = 'Ed25519', ctx = null, det = false } = optsArg('exdsaSign', arguments, 3);
     const body = { kid, alg, msg: toB64(asBytes(data)) };
     if (ctx !== null) body.ctx = toB64(asBytes(ctx));
     if (det) body.det = true;
@@ -2080,12 +2177,13 @@ export class HEM {
    * @param {string} kid
    * @param {Uint8Array|string} data  As signed
    * @param {Uint8Array} sig          ECDSA r ‖ s (exactly twice the curve size), EdDSA raw
-   * @param {string} [alg='Ed25519']  As exdsaSign
    * @param {object} [opts]
+   * @param {string} [opts.alg='Ed25519']  As exdsaSign
    * @param {Uint8Array|string} [opts.ctx]  As signed
    * @returns {Promise<boolean>}  true: the signature is valid; false: it is not
    */
-  async exdsaVerify(token, kid, data, sig, alg = 'Ed25519', { ctx = null } = {}) {
+  async exdsaVerify(token, kid, data, sig, opts) {
+    const { alg = 'Ed25519', ctx = null } = optsArg('exdsaVerify', arguments, 4);
     const body = { kid, alg, msg: toB64(asBytes(data)), sign: toB64(sig) };
     if (ctx !== null) body.ctx = toB64(asBytes(ctx));
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/verify`, body, token);
@@ -2093,36 +2191,45 @@ export class HEM {
   }
 
   /**
-   * ECDH between a private key in the HEM and a peer public key: raw bytes
-   * (`Uint8Array`: SECP* compressed point 33 / 49 / 67 B, X25519 32, X448 56)
-   * or another key in the HEM (its KID, a 32-hex string). An Ed25519 key with
-   * ECDH works as X25519.
+   * ECDH between a private key in the HEM and a peer public key: a key stored
+   * in the HEM (`extKid`) or raw bytes (`pubkey`: SECP* compressed point
+   * 33 / 49 / 67 B, X25519 32, X448 56). The peer is named the way deriveKey,
+   * hmacHash and the cipher calls name it; unlike theirs it is required here.
+   * An Ed25519 key with ECDH works as X25519. The key's own public key is a
+   * legal peer (a self-ECDH).
    *
    * Without `alg` the raw secret comes back, as long as the curve (X25519 /
    * P-256 / secp256k1 32 B, P-384 48, P-521 66, X448 56) - and only on a
    * device personalised with the `raw_ecdh_enabled` policy (else 403). `alg`
    * 'SHA2-256' ... 'SHA3-512' returns its digest; 'HKDF-SHA2-256/384/512'
-   * runs HKDF over it with `hkdfSalt`, `hkdfCtx` (info) and `hkdfLen`.
+   * runs HKDF over it with `hkdfSalt`, `hkdfCtx` (info) and `hkdfLen`; the
+   * three are not sent with any other `alg`.
    *
-   * Required scope: 'keymgmt:use:<KID>'
+   * Required scope: 'keymgmt:use:<KID>' ('keymgmt:use:<extKid>' too for a
+   * stored peer: one token with a scope array)
    *
    * @param {string} token
    * @param {string} kid
-   * @param {Uint8Array|string} peer  Raw public key, or the KID of a stored one
-   * @param {object} [opts]
+   * @param {object} opts
+   * @param {string} [opts.extKid]      The peer, stored in the HEM
+   * @param {Uint8Array} [opts.pubkey]  The peer, raw key bytes; exactly one of the two
    * @param {string} [opts.alg]
    * @param {Uint8Array|string} [opts.hkdfSalt]  1..128 bytes (HKDF-* only)
    * @param {Uint8Array|string} [opts.hkdfCtx]   1..128 bytes, not 'encedo-...' (HKDF-* only)
    * @param {number} [opts.hkdfLen]  16..128; default the hash size (HKDF-* only)
    * @returns {Promise<Uint8Array>}
    */
-  async ecdh(token, kid, peer, { alg = null, hkdfSalt = null, hkdfCtx = null, hkdfLen = null } = {}) {
+  async ecdh(token, kid, opts) {
+    const { extKid = null, pubkey = null, alg = null, hkdfSalt = null, hkdfCtx = null, hkdfLen = null } = optsArg('ecdh', arguments, 2);
     const body = { kid };
-    peerField(body, peer, 'ecdh');
+    applyPeerKey(body, { extKid, pubkey }, 'ecdh', { required: true });
     if (alg) body.alg = alg;
     if (alg?.startsWith('HKDF-')) {
       applyHkdf(body, { hkdfSalt, hkdfCtx }, 'ecdh');
-      if (hkdfLen !== null) body.hkdf_len = hkdfLen;
+      if (hkdfLen !== null) {
+        checkHkdfLen('ecdh', hkdfLen);
+        body.hkdf_len = hkdfLen;
+      }
     }
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/ecdh`, body, token);
     if (!ret.ecdh) throw new HemError('No ecdh in response', { code: 'ecdh_error' });
@@ -2133,27 +2240,37 @@ export class HEM {
    * One ECDH, several HKDF outputs (1..8): each item its own salt, context
    * and length, all with the hash of `alg`. The shared secret itself never
    * leaves the device - the way to get, say, an encryption key and a MAC key
-   * from one agreement.
+   * from one agreement. Each item is a separate HKDF over the same secret,
+   * not one expansion cut into pieces.
    *
-   * Required scope: 'keymgmt:use:<KID>'
+   * Required scope: as ecdh()
    *
    * @param {string} token
    * @param {string} kid
-   * @param {Uint8Array|string} peer  As ecdh()
-   * @param {'HKDF-SHA2-256'|'HKDF-SHA2-384'|'HKDF-SHA2-512'} alg
-   * @param {Array<{hkdfSalt?: Uint8Array|string, hkdfCtx?: Uint8Array|string, hkdfLen?: number}>} items
+   * @param {object} opts
+   * @param {string} [opts.extKid]      As ecdh()
+   * @param {Uint8Array} [opts.pubkey]  As ecdh(); exactly one of the two
+   * @param {'HKDF-SHA2-256'|'HKDF-SHA2-384'|'HKDF-SHA2-512'} [opts.alg='HKDF-SHA2-256']
+   * @param {Array<{hkdfSalt?: Uint8Array|string, hkdfCtx?: Uint8Array|string, hkdfLen?: number}>} opts.items  1..8
    * @returns {Promise<Uint8Array[]>}  In the order of `items`
    */
-  async ecdhHkdf(token, kid, peer, alg, items) {
-    if (!Array.isArray(items) || items.length < 1 || items.length > 8) {
-      throw new HemError('ecdhHkdf: 1..8 items', { code: 'invalid_arg' });
+  async ecdhHkdf(token, kid, opts) {
+    const { extKid = null, pubkey = null, alg = 'HKDF-SHA2-256', items = null } = optsArg('ecdhHkdf', arguments, 2);
+    if (typeof alg !== 'string' || !alg.startsWith('HKDF-')) {
+      throw new HemError(`ecdhHkdf: alg is HKDF-SHA2-256 / -384 / -512, not ${alg}`, { code: 'invalid_arg' });
+    }
+    if (!Array.isArray(items) || items.length < 1 || items.length > LIMITS.hkdfItems) {
+      throw new HemError(`ecdhHkdf: items is an array of 1..${LIMITS.hkdfItems}`, { code: 'invalid_arg' });
     }
     const body = { kid, alg };
-    peerField(body, peer, 'ecdhHkdf');
+    applyPeerKey(body, { extKid, pubkey }, 'ecdhHkdf', { required: true });
     body.hkdf_args = items.map(({ hkdfSalt = null, hkdfCtx = null, hkdfLen = null } = {}) => {
       const item = {};
       applyHkdf(item, { hkdfSalt, hkdfCtx }, 'ecdhHkdf');
-      if (hkdfLen !== null) item.hkdf_len = hkdfLen;
+      if (hkdfLen !== null) {
+        checkHkdfLen('ecdhHkdf', hkdfLen);
+        item.hkdf_len = hkdfLen;
+      }
       return item;
     });
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/ecdh`, body, token);
@@ -2172,18 +2289,19 @@ export class HEM {
    * @param {string} token
    * @param {string} kid
    * @param {Uint8Array|string} data  1..2048 bytes
-   * @param {string|null} [alg=null]  'SHA2-256' ... 'SHA3-512'
    * @param {object} [opts]
+   * @param {string} [opts.alg]  'SHA2-256' ... 'SHA3-512'; required with a peer
    * @param {string} [opts.extKid]      Peer public key stored in the HEM
    * @param {Uint8Array} [opts.pubkey]  Raw peer public key; not with extKid
    * @returns {Promise<Uint8Array>}  32 / 48 / 64 bytes
    */
-  async hmacHash(token, kid, data, alg = null, opts = {}) {
+  async hmacHash(token, kid, data, opts) {
+    const { alg = null, extKid = null, pubkey = null } = optsArg('hmacHash', arguments, 3);
     const bytes = asBytes(data);
     checkMsgSize('hmacHash', bytes);
     const body = { kid, msg: toB64(bytes) };
     if (alg !== null) body.alg = alg;
-    applyPeerKey(body, opts, 'hmacHash');
+    applyPeerKey(body, { extKid, pubkey }, 'hmacHash');
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/hash`, body, token);
     if (!ret.mac) throw new HemError('No mac in hmac/hash response', { code: 'hmac_error' });
     return fromB64(ret.mac);
@@ -2195,7 +2313,7 @@ export class HEM {
    * comparison happens inside the device, so the caller never has to write a
    * constant-time compare. Any status other than 200 throws.
    *
-   * `alg` and `opts` must match the hmacHash call that produced the MAC.
+   * `opts` must match the hmacHash call that produced the MAC.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
@@ -2203,16 +2321,16 @@ export class HEM {
    * @param {string} kid
    * @param {Uint8Array|string} data
    * @param {Uint8Array} mac
-   * @param {string|null} [alg=null]
-   * @param {object} [opts]  extKid / pubkey, as hmacHash
+   * @param {object} [opts]  alg, extKid / pubkey, as hmacHash
    * @returns {Promise<boolean>}  true: the MAC matches
    */
-  async hmacVerify(token, kid, data, mac, alg = null, opts = {}) {
+  async hmacVerify(token, kid, data, mac, opts) {
+    const { alg = null, extKid = null, pubkey = null } = optsArg('hmacVerify', arguments, 4);
     const bytes = asBytes(data);
     checkMsgSize('hmacVerify', bytes);
     const body = { kid, msg: toB64(bytes), mac: toB64(mac) };
     if (alg !== null) body.alg = alg;
-    applyPeerKey(body, opts, 'hmacVerify');
+    applyPeerKey(body, { extKid, pubkey }, 'hmacVerify');
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/verify`, body, token);
     return ret?.verified === true;
   }
@@ -2434,10 +2552,13 @@ export class HEM {
    *
    * @param {string} token
    * @param {string} kid     The MLKEM768 key
-   * @param {string} extKid  The CURVE25519 key
+   * @param {object} opts
+   * @param {string} opts.extKid  The CURVE25519 key
    * @returns {Promise<{alg: string, ss: Uint8Array, ct: Uint8Array}>}  ss 32 B; ct 1120 B (ct_M ‖ ct_X)
    */
-  async xwingEncaps(token, kid, extKid) {
+  async xwingEncaps(token, kid, opts) {
+    const { extKid = null } = optsArg('xwingEncaps', arguments, 2);
+    if (!extKid) throw new HemError('xwingEncaps: needs extKid, the CURVE25519 half', { code: 'invalid_arg' });
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/xwing/encaps`, { kid, ext_kid: extKid }, token);
     if (!ret.ss || !ret.ct) throw new HemError('Missing ss/ct in xwing/encaps response', { code: 'pqc_error' });
     return { alg: ret.alg, ss: fromB64(ret.ss), ct: fromB64(ret.ct) };
@@ -2452,11 +2573,14 @@ export class HEM {
    *
    * @param {string} token
    * @param {string} kid     The MLKEM768 key
-   * @param {string} extKid  The CURVE25519 key
    * @param {Uint8Array} ct  1120 bytes
+   * @param {object} opts
+   * @param {string} opts.extKid  The CURVE25519 key
    * @returns {Promise<Uint8Array>}  32-byte shared secret
    */
-  async xwingDecaps(token, kid, extKid, ct) {
+  async xwingDecaps(token, kid, ct, opts) {
+    const { extKid = null } = optsArg('xwingDecaps', arguments, 3);
+    if (!extKid) throw new HemError('xwingDecaps: needs extKid, the CURVE25519 half', { code: 'invalid_arg' });
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/xwing/decaps`, { kid, ext_kid: extKid, ct: toB64(ct) }, token);
     if (!ret.ss) throw new HemError('No ss in xwing/decaps response', { code: 'pqc_error' });
     return fromB64(ret.ss);

@@ -117,6 +117,10 @@ section "Firmware 1.3", lists what each has to change. Rows touched so far:
 (`searchKeys`, `getPubKey`, `createKeyPair`, `importPublicKey`, `exdsaSignBytes`,
 `exdsaVerify`, `ecdh`),
 `encedo-meet` (`authorizeRemote` `expSeconds`), `www` (`createKeyPair`).
+The 2026-11-07 rule (optional values and peers in the options; MIGRATION.md
+"One rule for every signature") touches `authorizePassword` / `authorizeMaster`
+with an `expSeconds` (Manager), `exdsaSign` with an `alg` (`encedo-oidc`),
+`exdsaVerify` with an `alg` (`encedo-pgp`) and every `ecdh` caller.
 
 As it stands nobody reads `hemCheckin()`'s value, nobody catches `AbortError`
 by name, and everybody constructs `new HEM(url, {debug?})`, so the current
@@ -199,7 +203,14 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
    base64 encoding/decoding happens inside the method (`toB64` / `fromB64`).
    A string where bytes are expected is UTF-8 text; a peer public key is
    always bytes. Required arguments go positionally, the rest in one options
-   object. Match `exdsaSign` / `ecdh` as the style reference.
+   object - an optional value never sits in front of the options (no
+   `alg = 'Ed25519'`, `expSeconds = 300` positionally). A peer key is always
+   `{ extKid }` or `{ pubkey }` in the options, even where it is required
+   (`ecdh`: `applyPeerKey(..., { required: true })`), never told apart by its
+   type. Read the options with `optsArg(op, arguments, n)`, which throws on a
+   call written for an older positional form instead of letting it run with
+   defaults. Device limits go in `LIMITS`, with the section of the API
+   reference they come from. Match `exdsaSign` / `ecdh` as the style reference.
 3. `*Verify` methods resolve to the device's `verified` (`true` / `false`):
    the device answers 200 for every well-formed request, a wrong signature
    included, and puts the verdict in the body. Any other status throws.

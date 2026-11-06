@@ -73,8 +73,9 @@ const listToken = await hem.authorizePassword('my-password', 'keymgmt:list');
 // so the password is not needed (and not re-derived) again.
 const useToken = await hem.authorizePassword(null, `keymgmt:use:${kid}`);
 
-// expSeconds — requested token lifetime (default 300).
-const longToken = await hem.authorizePassword('my-password', 'keymgmt:list', 3600);
+// expSeconds — requested token lifetime (default 300). Optional values go in
+// the options object; a number in its place throws (MIGRATION.md).
+const longToken = await hem.authorizePassword('my-password', 'keymgmt:list', { expSeconds: 3600 });
 ```
 
 ### Mobile-push login (remote)
@@ -138,7 +139,7 @@ A device personalised by the **v1 Manager** has a master key derived the old
 way (the BIP39 seed at a one-nibble offset). Only for those:
 
 ```js
-await hem.authorizeMaster(mnemonic, 'system:config', 300, { legacy: true });
+await hem.authorizeMaster(mnemonic, 'system:config', { legacy: true });
 ```
 
 ### Device initialization (provisioning)
@@ -200,8 +201,7 @@ decode that string before searching; remove the entry too when unpairing:
 
 ```js
 const field = Uint8Array.from(atob('RVhUQUlE' + phones[0].pid), (c) => c.charCodeAt(0));
-const entries = await hem.searchKeys(listToken, field);
-for (const k of entries) await hem.deleteKey(delToken, k.kid);
+for await (const k of hem.searchKeysAll(listToken, field)) await hem.deleteKey(delToken, k.kid);
 ```
 
 `getExtAuthMac(token)` returns the `{ nonce, mac, eid, epk }` the two calls
@@ -273,7 +273,11 @@ const found = await hem.searchKeys(token, 'CCTEST:');                       // {
 const wgPeers = await hem.searchKeys(token, new Uint8Array([0x57, 0x47, 0x3a]), { match: 'contains' });
 const signers = await hem.searchKeys(token, 'git', { type: 'ED25519', mode: 'ExDSA' });
 
-// Paginate: `total` counts every record, not the matches - read on until a page is empty.
+// Every match, across pages (at most 15 a page; fewer with public keys of PQC keys):
+for await (const k of hem.searchKeysAll(token, 'CCTEST:', { returnPubkey: true })) console.log(k.kid);
+const everyKey = await Array.fromAsync(hem.listKeysAll(token));
+
+// By hand: `total` counts every record, not the matches - read on until a page is empty.
 for (let offset = 0, page; ; offset += page.listed) {
   page = await hem.searchKeys(token, 'CCTEST:', { offset });
   if (!page.listed) break;
@@ -346,11 +350,11 @@ const sig2 = await hem.exdsaSign(token, kid, 'text works too');
 
 // ECDSA comes back as raw r ‖ s (JWS / WebCrypto form). `det: true` makes it
 // deterministic (RFC 6979); alg 'ECDSA' signs a digest the caller made.
-const es256 = await hem.exdsaSign(token, p256Kid, data, 'SHA256WithECDSA', { det: true });
-const pre = await hem.exdsaSign(token, p256Kid, digest32, 'ECDSA');
+const es256 = await hem.exdsaSign(token, p256Kid, data, { alg: 'SHA256WithECDSA', det: true });
+const pre = await hem.exdsaSign(token, p256Kid, digest32, { alg: 'ECDSA' });
 
 // A context for Ed25519ctx / Ed25519ph / Ed448, as bytes or text:
-const sig3 = await hem.exdsaSign(token, kid, data, 'Ed25519ctx', { ctx: 'my-app' });
+const sig3 = await hem.exdsaSign(token, kid, data, { alg: 'Ed25519ctx', ctx: 'my-app' });
 
 // Verify (a key pair or an imported public key). The device answers 200 either
 // way and the SDK returns its verdict: false is an invalid signature.
@@ -360,19 +364,24 @@ if (!(await hem.exdsaVerify(token, kid, data, sig))) throw new Error('bad signat
 ### ECDH
 
 ```js
-// The peer is raw key bytes, or the KID of a key already in the HEM.
-// Without alg: the raw secret, as long as the curve - only on a device
-// personalised with the raw_ecdh_enabled policy (403 otherwise).
-const secret = await hem.ecdh(token, kid, peerPubKeyBytes);           // Uint8Array
-const secret2 = await hem.ecdh(token, kid, peerKid);                  // both operands in the HEM
+// The peer is named as in deriveKey: `pubkey` (raw bytes) or `extKid` (a key
+// already in the HEM) - exactly one. Without alg: the raw secret, as long as
+// the curve - only on a device personalised with the raw_ecdh_enabled policy
+// (403 otherwise).
+const secret = await hem.ecdh(token, kid, { pubkey: peerPubKeyBytes });   // Uint8Array
+const secret2 = await hem.ecdh(token, kid, { extKid: peerKid });          // both operands in the HEM
 
-// A digest of it, or HKDF over it:
-const hashed = await hem.ecdh(token, kid, peerPubKeyBytes, { alg: 'SHA2-256' });
-const okm = await hem.ecdh(token, kid, peerPubKeyBytes, { alg: 'HKDF-SHA2-256', hkdfSalt: salt, hkdfCtx: 'wg:v1', hkdfLen: 32 });
+// A digest of it, or HKDF over it (hkdfCtx is the HKDF info; 'encedo-...' is
+// reserved by the device; hkdfLen 16..128):
+const hashed = await hem.ecdh(token, kid, { pubkey: peerPubKeyBytes, alg: 'SHA2-256' });
+const okm = await hem.ecdh(token, kid, { pubkey: peerPubKeyBytes, alg: 'HKDF-SHA2-256', hkdfSalt: salt, hkdfCtx: 'wg:v1', hkdfLen: 32 });
 
-// Several keys from one agreement; the shared secret never leaves the device:
-const [encKey, macKey] = await hem.ecdhHkdf(token, kid, peerPubKeyBytes, 'HKDF-SHA2-256',
-  [{ hkdfCtx: 'enc', hkdfLen: 32 }, { hkdfCtx: 'mac', hkdfLen: 32 }]);
+// Several keys from one agreement (1..8, HKDF-SHA2-256 unless alg says
+// otherwise); the shared secret never leaves the device:
+const [encKey, macKey] = await hem.ecdhHkdf(token, kid, {
+  pubkey: peerPubKeyBytes,
+  items: [{ hkdfCtx: 'enc', hkdfLen: 32 }, { hkdfCtx: 'mac', hkdfLen: 32 }],
+});
 ```
 
 ### Indirect operations (ECDH-derived keys)
@@ -394,12 +403,12 @@ configuration without a separate secret.
 ### HMAC
 
 ```js
-const mac = await hem.hmacHash(token, kid, data, 'SHA2-256');      // Uint8Array
-const ok = await hem.hmacVerify(token, kid, data, mac, 'SHA2-256'); // true / false
+const mac = await hem.hmacHash(token, kid, data, { alg: 'SHA2-256' });      // Uint8Array
+const ok = await hem.hmacVerify(token, kid, data, mac, { alg: 'SHA2-256' }); // true / false
 
 // MAC key = ECDH(kid, myOwnPubKey) — never leaves the device. The peer modes need alg.
-const mac2 = await hem.hmacHash(token, kid, data, 'SHA2-256', { pubkey: myPubKeyBytes });
-await hem.hmacVerify(token, kid, data, mac2, 'SHA2-256', { pubkey: myPubKeyBytes });
+const mac2 = await hem.hmacHash(token, kid, data, { alg: 'SHA2-256', pubkey: myPubKeyBytes });
+await hem.hmacVerify(token, kid, data, mac2, { alg: 'SHA2-256', pubkey: myPubKeyBytes });
 ```
 
 ### Symmetric encryption
@@ -455,8 +464,8 @@ const sigH = await hem.mldsaSign(token, dsaKid, sha512Digest, { mode: 'HashML-DS
 // Both operations take two keys for X-Wing (an MLKEM768 and a CURVE25519 key):
 // one token with both scopes.
 const t2 = await hem.authorizePassword('my-password', [`keymgmt:use:${kemKid}`, `keymgmt:use:${xKid}`]);
-const { ss, ct } = await hem.xwingEncaps(t2, kemKid, xKid);       // ct: 1120 bytes
-const ss2 = await hem.xwingDecaps(t2, kemKid, xKid, ct);
+const { ss, ct } = await hem.xwingEncaps(t2, kemKid, { extKid: xKid });   // ct: 1120 bytes
+const ss2 = await hem.xwingDecaps(t2, kemKid, ct, { extKid: xKid });
 
 // HPKE (RFC 9180), Base mode, one message: to a key of the HEM ...
 const sealed = await hem.hpkeSeal(token, { kid: inboxKid }, 'for the inbox', { info: 'app:v1' });

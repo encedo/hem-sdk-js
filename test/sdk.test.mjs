@@ -128,7 +128,16 @@ async function handle(req, res) {
     const list = slots.filter((k) => !k.broken).map((k) => (path.endsWith('/pubkey') ? { ...k, pubkey: b64([7]) } : k));
     return json(res, 200, { offset, deleted: 1, invalid: slots.length - list.length, total: state.keys.length, listed: slots.length, list });
   }
-  if (path === '/dev/api/keymgmt/search') return json(res, 200, { offset: body.offset, deleted: 0, invalid: 0, total: 9, listed: 1, list: [state.keys[0]] });
+  if (path === '/dev/api/keymgmt/search') {
+    // state.matches: a paged search - `offset` skips matches, a page holds at most
+    // `limit` and at most state.pageCut of them (the device's 3-PQC-keys cut).
+    if (state.matches) {
+      const n = Math.min(body.limit, state.pageCut ?? body.limit);
+      const list = state.matches.slice(body.offset, body.offset + n);
+      return json(res, 200, { offset: body.offset, deleted: 0, invalid: 0, total: 99, listed: list.length, list });
+    }
+    return json(res, 200, { offset: body.offset, deleted: 0, invalid: 0, total: 9, listed: 1, list: [state.keys[0]] });
+  }
   if (path === '/dev/api/crypto/exdsa/verify' || path === '/dev/api/crypto/hmac/verify' || path === '/dev/api/crypto/pqc/mldsa/verify') {
     return json(res, 200, { verified: Buffer.from(body.msg, 'base64').toString() === 'good' });   // 200 either way, as the device does
   }
@@ -238,7 +247,7 @@ test('a shared Broker instance can be passed in', async () => {
 
 test('authorizePassword signs an eJWT the device accepts and caches the token', async () => {
   const hem = mk();
-  const t1 = await hem.authorizePassword('correct horse', 'keymgmt:list', 120);
+  const t1 = await hem.authorizePassword('correct horse', 'keymgmt:list', { expSeconds: 120 });
   const p = jwtParse(t1);
   assert.equal(p.scope, 'keymgmt:list');
   const before = state.log.length;
@@ -251,12 +260,12 @@ test('authorizePassword signs an eJWT the device accepts and caches the token', 
 
 test('a password can be used once and not kept, and tokens are cached either way', async () => {
   const hem = mk();
-  await hem.authorizePassword('correct horse', 'keymgmt:list', 300, { remember: false });
+  await hem.authorizePassword('correct horse', 'keymgmt:list', { remember: false });
   // The token is cached, so the scope it was taken for needs nothing more.
   assert.ok(await hem.authorizePassword(null, 'keymgmt:list'));
   // Another scope has no token and no key to make one with.
   await assert.rejects(hem.authorizePassword(null, 'keymgmt:gen'), (e) => e.code === 'auth_password_required');
-  assert.ok(await hem.authorizePassword('correct horse', 'keymgmt:gen', 300, { remember: false }));
+  assert.ok(await hem.authorizePassword('correct horse', 'keymgmt:gen', { remember: false }));
 
   // Remembered, the key answers for every scope that follows.
   const kept = mk();
@@ -312,7 +321,7 @@ test('authorising with the master secret never reuses a token the words did not 
 test('the token cache can be looked at without handing out the tokens', async () => {
   const hem = mk();
   assert.deepEqual(hem.tokens, []);
-  await hem.authorizePassword('correct horse', 'keymgmt:list', 120);
+  await hem.authorizePassword('correct horse', 'keymgmt:list', { expSeconds: 120 });
   await hem.authorizePassword(null, 'logger:get');
   assert.deepEqual(hem.tokens.map((t) => t.scope).sort(), ['keymgmt:list', 'logger:get']);
   assert.ok(hem.tokens.every((t) => typeof t.exp === 'number' && !('token' in t)), 'scope and expiry, nothing else');
@@ -613,6 +622,38 @@ test('searchKeys anchors the pattern on the base64 text and passes the filters',
   assert.equal(sent().descr, enc);
 });
 
+test('listKeysAll and searchKeysAll walk every page, so nobody stops at the first 15', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', ['keymgmt:list', 'keymgmt:search']);
+  const keys = state.keys;
+  try {
+    state.keys = Array.from({ length: 40 }, (_, i) => ({ kid: `L${i}`, type: 'PKEY,ECDH,CURVE25519', label: `k${i}` }));
+    state.keys[16].broken = true;
+    const listed = await Array.fromAsync(hem.listKeysAll(token));
+    assert.equal(listed.length, 39, 'every readable key of 40, the broken one skipped');
+    assert.equal(listed.at(-1).kid, 'L39');
+    const listPaths = state.log.filter((e) => e.path.startsWith('/dev/api/keymgmt/list/')).slice(-3).map((e) => e.path);
+    assert.deepEqual(listPaths, ['/dev/api/keymgmt/list/0/15', '/dev/api/keymgmt/list/15/15', '/dev/api/keymgmt/list/30/15'],
+      'paged on listed (the broken record kept its slot), stopped at total');
+
+    state.matches = Array.from({ length: 20 }, (_, i) => ({ kid: `S${i}`, type: 'PKEY,ECDH,CURVE25519', label: `s${i}` }));
+    state.pageCut = 3;                       // pages end early, as with PQC keys and public keys
+    const n = state.log.length;
+    const found = await Array.fromAsync(hem.searchKeysAll(token, 'ETSEIC:', { returnPubkey: true }));
+    assert.deepEqual(found.map((k) => k.kid), state.matches.map((k) => k.kid), 'all 20, in order, across short pages');
+    const bodies = state.log.slice(n).filter((e) => e.path === '/dev/api/keymgmt/search').map((e) => e.body);
+    assert.deepEqual(bodies.map((b) => b.offset), [0, 3, 6, 9, 12, 15, 18, 20], 'on from offset + listed until an empty page');
+    assert.ok(bodies.every((b) => b.limit === 15 && b.return_pubkey === true && b.descr === '^' + b64(Buffer.from('ETSEIC:'))));
+
+    state.matches = [];
+    assert.deepEqual(await Array.fromAsync(hem.searchKeysAll(token, 'none')), [], 'nothing found is one request');
+  } finally {
+    state.keys = keys;
+    delete state.matches;
+    delete state.pageCut;
+  }
+});
+
 test('key modes are checked against the type, as the device would', async () => {
   const hem = mk();
   const token = await hem.authorizePassword('correct horse', 'keymgmt:gen');
@@ -682,24 +723,71 @@ test('the HKDF fields of a peer-key cipher are hkdf_ctx / hkdf_salt, checked bef
   await assert.rejects(hem.cipherEncrypt(token, kid, Buffer.from('hi'), 'AES256-GCM', { hkdfSalt: new Uint8Array(129) }), (e) => e.code === 'invalid_arg');
 });
 
-test('a raw ECDH secret is as long as the curve makes it; the peer is bytes or a KID', async () => {
+test('a raw ECDH secret is as long as the curve makes it; the peer is extKid or pubkey, as in deriveKey', async () => {
   const hem = mk();
   const kid = '00112233445566778899aabbccddeeff';
+  const peerKid = 'ffeeddccbbaa99887766554433221100';
   const token = await hem.authorizePassword('correct horse', `keymgmt:use:${kid}`);
   const sent = () => state.log.filter((e) => e.path === '/dev/api/crypto/ecdh').at(-1).body;
-  assert.equal((await hem.ecdh(token, kid, 'ffeeddccbbaa99887766554433221100')).length, 48, 'P-384');
-  assert.deepEqual(sent(), { kid, ext_kid: 'ffeeddccbbaa99887766554433221100' });
-  await hem.ecdh(token, kid, new Uint8Array(32), { alg: 'HKDF-SHA2-256', hkdfSalt: new Uint8Array([1]), hkdfCtx: 'wg:v1', hkdfLen: 64 });
+  assert.equal((await hem.ecdh(token, kid, { extKid: peerKid })).length, 48, 'P-384');
+  assert.deepEqual(sent(), { kid, ext_kid: peerKid });
+  await hem.ecdh(token, kid, { pubkey: new Uint8Array(32), alg: 'HKDF-SHA2-256', hkdfSalt: new Uint8Array([1]), hkdfCtx: 'wg:v1', hkdfLen: 64 });
   assert.deepEqual(sent(), { kid, pubkey: b64(new Uint8Array(32)), alg: 'HKDF-SHA2-256', hkdf_salt: b64([1]), hkdf_ctx: b64(Buffer.from('wg:v1')), hkdf_len: 64 });
-  await hem.ecdh(token, kid, new Uint8Array(32), { alg: 'SHA2-256', hkdfCtx: 'ignored' });
+  await hem.ecdh(token, kid, { pubkey: new Uint8Array(32), alg: 'SHA2-256', hkdfCtx: 'ignored' });
   assert.deepEqual(sent(), { kid, pubkey: b64(new Uint8Array(32)), alg: 'SHA2-256' }, 'HKDF fields only with an HKDF-* alg');
-  await assert.rejects(hem.ecdh(token, kid, b64(new Uint8Array(32))), (e) => e.code === 'invalid_arg', 'a base64 string is neither bytes nor a KID');
 
-  const [enc, mac] = await hem.ecdhHkdf(token, kid, new Uint8Array(32), 'HKDF-SHA2-256', [{ hkdfCtx: 'enc', hkdfLen: 32 }, { hkdfCtx: 'mac' }]);
+  const n = state.log.length;
+  const refused = (p, why) => assert.rejects(p, (e) => e.code === 'invalid_arg', why);
+  await refused(hem.ecdh(token, kid, {}), 'no peer: ecdh has no meaning without one');
+  await refused(hem.ecdh(token, kid), 'no options at all');
+  await refused(hem.ecdh(token, kid, { extKid: peerKid, pubkey: new Uint8Array(32) }), 'both peers');
+  await refused(hem.ecdh(token, kid, { pubkey: b64(new Uint8Array(32)) }), 'a base64 string is not key bytes');
+  await refused(hem.ecdh(token, kid, { extKid: 'not-a-kid' }), 'extKid is 32 hex');
+  await refused(hem.ecdh(token, kid, { pubkey: new Uint8Array(32), alg: 'HKDF-SHA2-256', hkdfLen: 15 }), 'hkdfLen below 16');
+  await refused(hem.ecdh(token, kid, { pubkey: new Uint8Array(32), alg: 'HKDF-SHA2-256', hkdfLen: 16.5 }), 'hkdfLen a fraction');
+  await refused(hem.ecdh(token, kid, { pubkey: new Uint8Array(32), alg: 'HKDF-SHA2-256', hkdfCtx: 'encedo-x' }), 'reserved context');
+  await refused(hem.ecdh(token, kid, new Uint8Array(32)), 'the 1.3 positional peer (bytes)');
+  await refused(hem.ecdh(token, kid, peerKid), 'the 1.3 positional peer (a KID)');
+  await refused(hem.ecdh(token, kid, peerKid, { alg: 'SHA2-256' }), 'the 1.3 positional peer with options');
+  assert.equal(state.log.length, n, 'every refusal before a request');
+
+  const [enc, mac] = await hem.ecdhHkdf(token, kid, { pubkey: new Uint8Array(32), items: [{ hkdfCtx: 'enc', hkdfLen: 32 }, { hkdfCtx: 'mac' }] });
+  assert.equal(sent().alg, 'HKDF-SHA2-256', 'the default hash');
   assert.deepEqual(sent().hkdf_args, [{ hkdf_ctx: b64(Buffer.from('enc')), hkdf_len: 32 }, { hkdf_ctx: b64(Buffer.from('mac')) }]);
   assert.deepEqual([...enc], [1]);
   assert.deepEqual([...mac], [2]);
-  await assert.rejects(hem.ecdhHkdf(token, kid, new Uint8Array(32), 'HKDF-SHA2-256', []), (e) => e.code === 'invalid_arg');
+  await hem.ecdhHkdf(token, kid, { extKid: peerKid, alg: 'HKDF-SHA2-512', items: [{}] });
+  assert.equal(sent().ext_kid, peerKid);
+  assert.equal(sent().alg, 'HKDF-SHA2-512');
+  const m = state.log.length;
+  await refused(hem.ecdhHkdf(token, kid, { pubkey: new Uint8Array(32), items: [] }), 'no items');
+  await refused(hem.ecdhHkdf(token, kid, { pubkey: new Uint8Array(32), items: Array(9).fill({}) }), 'nine items');
+  await refused(hem.ecdhHkdf(token, kid, { pubkey: new Uint8Array(32), alg: 'SHA2-256', items: [{}] }), 'not an HKDF alg');
+  await refused(hem.ecdhHkdf(token, kid, { items: [{}] }), 'no peer');
+  await refused(hem.ecdhHkdf(token, kid, { pubkey: new Uint8Array(32), items: [{ hkdfLen: 200 }] }), 'an item over 128');
+  await refused(hem.ecdhHkdf(token, kid, new Uint8Array(32), 'HKDF-SHA2-256', [{}]), 'the 1.3 positional form');
+  assert.equal(state.log.length, m, 'every refusal before a request');
+});
+
+test('a call in an older positional form throws instead of running with defaults', async () => {
+  const hem = mk();
+  const kid = '00112233445566778899aabbccddeeff';
+  const token = await hem.authorizePassword('correct horse', `keymgmt:use:${kid}`);
+  const n = state.log.length;
+  const refused = (p, why) => assert.rejects(p, (e) => e.code === 'invalid_arg' && /MIGRATION/.test(e.message), why);
+  await refused(hem.authorizePassword('correct horse', 'keymgmt:list', 900), 'expSeconds positionally would have become 300');
+  await refused(hem.authorizePassword('correct horse', 'keymgmt:list', 900, { remember: false }), 'expSeconds before the options');
+  await refused(hem.authorizeMaster('a b c', 'x', 300), 'authorizeMaster likewise');
+  await refused(hem.exdsaSign(token, kid, 'm', 'SHA256WithECDSA'), 'alg positionally would have signed Ed25519');
+  await refused(hem.exdsaVerify(token, kid, 'm', new Uint8Array(64), 'Ed25519'), 'exdsaVerify likewise');
+  await refused(hem.hmacHash(token, kid, 'm', null, { extKid: kid }), 'hmacHash with alg before the options');
+  await refused(hem.hmacVerify(token, kid, 'm', new Uint8Array(32), 'SHA2-256'), 'hmacVerify likewise');
+  await refused(hem.xwingEncaps(token, kid, kid), 'xwingEncaps with a positional extKid');
+  await refused(hem.xwingDecaps(token, kid, kid, new Uint8Array(1120)), 'xwingDecaps likewise');
+  assert.equal(state.log.length, n, 'nothing reached the device');
+  // The new forms with nothing optional still work.
+  assert.ok(await hem.authorizePassword(null, 'keymgmt:gen'));
+  assert.ok(await hem.authorizePassword(null, 'keymgmt:list', null), 'null options are no options');
 });
 
 test('signatures take bytes or text, a context as bytes, and deterministic ECDSA', async () => {
@@ -709,11 +797,11 @@ test('signatures take bytes or text, a context as bytes, and deterministic ECDSA
   const sent = (p) => state.log.filter((e) => e.path === `/dev/api/crypto/${p}`).at(-1).body;
   assert.deepEqual([...await hem.exdsaSign(token, kid, 'hello')], [7, 7]);
   assert.deepEqual(sent('exdsa/sign'), { kid, alg: 'Ed25519', msg: b64(Buffer.from('hello')) });
-  await hem.exdsaSign(token, kid, new Uint8Array(32), 'ECDSA', { det: true });
+  await hem.exdsaSign(token, kid, new Uint8Array(32), { alg: 'ECDSA', det: true });
   assert.deepEqual(sent('exdsa/sign'), { kid, alg: 'ECDSA', msg: b64(new Uint8Array(32)), det: true });
-  await hem.exdsaSign(token, kid, 'x', 'Ed25519ctx', { ctx: 'app' });
+  await hem.exdsaSign(token, kid, 'x', { alg: 'Ed25519ctx', ctx: 'app' });
   assert.equal(sent('exdsa/sign').ctx, b64(Buffer.from('app')), 'the context is encoded here, not by the caller');
-  await hem.exdsaVerify(token, kid, 'good', new Uint8Array(64), 'Ed25519ctx', { ctx: 'app' });
+  await hem.exdsaVerify(token, kid, 'good', new Uint8Array(64), { alg: 'Ed25519ctx', ctx: 'app' });
   assert.equal(sent('exdsa/verify').ctx, b64(Buffer.from('app')));
 
   await hem.mldsaSign(token, kid, new Uint8Array(64), { mode: 'ML-DSA-mu' });
@@ -725,7 +813,7 @@ test('signatures take bytes or text, a context as bytes, and deterministic ECDSA
   assert.deepEqual(sent('cipher/wrap'), { kid, msg: b64(new Uint8Array(32)), alg: 'AES128', pubkey: b64(new Uint8Array(32)), hkdf_ctx: b64(Buffer.from('psk')) });
   await hem.cipherWrap(token, kid, new Uint8Array(32));
   assert.deepEqual(sent('cipher/wrap'), { kid, msg: b64(new Uint8Array(32)) }, 'AES256 by default, the device\'s');
-  await assert.rejects(hem.hmacHash(token, kid, 'x', 'SHA2-256', { pubkey: b64(new Uint8Array(32)) }), (e) => e.code === 'invalid_arg', 'a peer key is bytes');
+  await assert.rejects(hem.hmacHash(token, kid, 'x', { alg: 'SHA2-256', pubkey: b64(new Uint8Array(32)) }), (e) => e.code === 'invalid_arg', 'a peer key is bytes');
 });
 
 test('one token for several scopes, cached for each of them', async () => {
@@ -739,7 +827,7 @@ test('one token for several scopes, cached for each of them', async () => {
   assert.equal(state.log.length - before, 2, 'one challenge and one exchange in all');
   assert.deepEqual(hem.tokens.map((t) => t.scope), [[a, b]]);
 
-  const withCtx = await hem.authorizePassword(null, a, 300, { ctx: 'job-7' });
+  const withCtx = await hem.authorizePassword(null, a, { ctx: 'job-7' });
   assert.notEqual(withCtx, token, 'a token with another ctx is another token');
   assert.equal(jwtParse(withCtx).ctx, 'job-7');
   for (const bad of [[], Array(9).fill(a).map((s, i) => s + i), [a, a], ['storage:disk0', 'storage:disk1:rw']]) {
@@ -766,12 +854,12 @@ test('X-Wing and HPKE: two keys under one token, or a recipient outside the HEM'
   const m = '00112233445566778899aabbccddeeff', x = 'ffeeddccbbaa99887766554433221100';
   const token = await hem.authorizePassword('correct horse', [`keymgmt:use:${m}`, `keymgmt:use:${x}`]);
   const sent = (p) => state.log.filter((e) => e.path === `/dev/api/crypto/${p}`).at(-1).body;
-  const { alg, ss, ct } = await hem.xwingEncaps(token, m, x);
+  const { alg, ss, ct } = await hem.xwingEncaps(token, m, { extKid: x });
   assert.equal(alg, 'X-Wing');
   assert.equal(ss.length, 32);
   assert.equal(ct.length, 1120);
   assert.deepEqual(sent('pqc/xwing/encaps'), { kid: m, ext_kid: x });
-  assert.equal((await hem.xwingDecaps(token, m, x, ct)).length, 32);
+  assert.equal((await hem.xwingDecaps(token, m, ct, { extKid: x })).length, 32);
   assert.deepEqual(sent('pqc/xwing/decaps'), { kid: m, ext_kid: x, ct: b64(ct) });
 
   const sealed = await hem.hpkeSeal(token, { kid: m, extKid: x }, 'secret', { info: 'app:v1', aead: 'CHACHA20-POLY1305' });
@@ -1073,7 +1161,7 @@ test('initialize with a mnemonic writes that key as masterkey', async () => {
 test('the v1 derivation is available for an existing device and differs from the new one', async () => {
   const hem = mk();
   const mnemonic = VECTORS[1][1];   // 24 x abandon ... art
-  await hem.authorizeMaster(mnemonic, 'legacy-scope', 300, { legacy: true });
+  await hem.authorizeMaster(mnemonic, 'legacy-scope', { legacy: true });
   const ejwt = state.log.filter((l) => l.path === '/dev/api/auth/token' && l.method === 'POST').pop();
   const legacyIss = JSON.parse(Buffer.from(ejwt.body.auth.split('.')[1], 'base64url').toString()).iss;
 

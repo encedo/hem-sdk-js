@@ -151,6 +151,18 @@ export interface HemPeerKeyOpts {
   pubkey?: Uint8Array | null;
 }
 
+/** A peer that must be given (ecdh, ecdhHkdf): exactly one of the two. */
+export type HemPeer =
+  | { extKid: string; pubkey?: null }
+  | { pubkey: Uint8Array; extKid?: null };
+
+/** One HKDF output of ecdhHkdf(); hkdfLen 16..128, default the hash size. */
+export interface HemHkdfItem {
+  hkdfSalt?: Uint8Array | string | null;
+  hkdfCtx?: Uint8Array | string | null;
+  hkdfLen?: number | null;
+}
+
 /** A token scope: one value, or 1..8 distinct values (at most one storage:*). */
 export type HemScope = string | string[];
 
@@ -224,7 +236,7 @@ export declare class HEM {
   /** Pass null or '' to reuse cached derived keys (set on first call with a real password). */
   /** `remember: false` uses the derived key for this call alone; the next scope needs the password again. */
   /** A cached token answers for every scope it holds; `ctx` (1..64 chars) is copied into the token. */
-  authorizePassword(password: string | null, scope: HemScope, expSeconds?: number, opts?: { remember?: boolean; ctx?: string | null }): Promise<string>;
+  authorizePassword(password: string | null, scope: HemScope, opts?: { expSeconds?: number; remember?: boolean; ctx?: string | null } | null): Promise<string>;
 
   /**
    * Mobile push authorisation. Cancelling (`signal`) or timing out withdraws
@@ -254,7 +266,7 @@ export declare class HEM {
   }>;
 
   /** Authenticate with the 24-word master secret. `legacy`: device personalised by the v1 Manager. */
-  authorizeMaster(mnemonic: string, scope: HemScope, expSeconds?: number, opts?: { legacy?: boolean; ctx?: string | null }): Promise<string>;
+  authorizeMaster(mnemonic: string, scope: HemScope, opts?: { expSeconds?: number; legacy?: boolean; ctx?: string | null } | null): Promise<string>;
 
   /** Broker MAC data for the paired-authenticator calls; listExtAuth / deleteExtAuth do the round trip. */
   getExtAuthMac(token: string): Promise<ExtAuthMac>;
@@ -287,6 +299,12 @@ export declare class HEM {
     match?: 'prefix' | 'suffix' | 'contains'; offset?: number; limit?: number;
     type?: string | null; mode?: HemKeyMode | null; returnPubkey?: boolean;
   }): Promise<HemKeyPage>;
+  /** Every key of listKeys(), across pages: `for await`, or `Array.fromAsync(...)`. Scope: keymgmt:list. */
+  listKeysAll(token: string, opts?: { returnPubkey?: boolean }): AsyncGenerator<HemKey, void, undefined>;
+  /** Every match of searchKeys(), across pages (until a page comes back empty). Scope: as searchKeys. */
+  searchKeysAll(token: string | null, pattern: string | Uint8Array, opts?: {
+    match?: 'prefix' | 'suffix' | 'contains'; type?: string | null; mode?: HemKeyMode | null; returnPubkey?: boolean;
+  }): AsyncGenerator<HemKey, void, undefined>;
   /** Metadata and public part of one key; never private material. Scope: keymgmt:get, keymgmt:gen or keymgmt:use:<kid>. */
   getKeyPublicInfo(token: string, kid: string): Promise<HemKey>;
   /** Generate a key inside the HEM. Scope: keymgmt:gen. Label 1..64 ASCII, descr up to 128 bytes. */
@@ -303,23 +321,26 @@ export declare class HEM {
    * ECDSA (raw r ‖ s) or EdDSA signature. `data` is bytes or UTF-8 text; for alg 'ECDSA' the digest.
    * `ctx` (1..255 B) for Ed25519ctx / Ed25519ph / Ed448; `det` for RFC 6979 ECDSA.
    */
-  exdsaSign(token: string, kid: string, data: Uint8Array | string, alg?: string, opts?: { ctx?: Uint8Array | string | null; det?: boolean }): Promise<Uint8Array>;
+  exdsaSign(token: string, kid: string, data: Uint8Array | string, opts?: { alg?: string; ctx?: Uint8Array | string | null; det?: boolean } | null): Promise<Uint8Array>;
   /** The device's `verified`: false for an invalid signature. Other errors throw. */
-  exdsaVerify(token: string, kid: string, data: Uint8Array | string, sig: Uint8Array, alg?: string, opts?: { ctx?: Uint8Array | string | null }): Promise<boolean>;
+  exdsaVerify(token: string, kid: string, data: Uint8Array | string, sig: Uint8Array, opts?: { alg?: string; ctx?: Uint8Array | string | null } | null): Promise<boolean>;
   /**
-   * ECDH with a peer given as raw key bytes or as the KID of a stored key. No alg: the raw secret
-   * (needs the `raw_ecdh_enabled` policy); 'SHA2-*' / 'SHA3-*': its digest; 'HKDF-SHA2-*': HKDF.
+   * ECDH with a peer - `extKid` (stored) or `pubkey` (raw bytes), exactly one, as deriveKey names it.
+   * No alg: the raw secret (needs the `raw_ecdh_enabled` policy); 'SHA2-*' / 'SHA3-*': its digest;
+   * 'HKDF-SHA2-*': HKDF with hkdfSalt / hkdfCtx (info, not 'encedo-...') / hkdfLen (16..128).
    */
-  ecdh(token: string, kid: string, peer: Uint8Array | string, opts?: {
+  ecdh(token: string, kid: string, opts: HemPeer & {
     alg?: string | null; hkdfSalt?: Uint8Array | string | null; hkdfCtx?: Uint8Array | string | null; hkdfLen?: number | null;
   }): Promise<Uint8Array>;
   /** One ECDH, 1..8 HKDF outputs; the shared secret never leaves the device. */
-  ecdhHkdf(token: string, kid: string, peer: Uint8Array | string, alg: 'HKDF-SHA2-256' | 'HKDF-SHA2-384' | 'HKDF-SHA2-512',
-    items: Array<{ hkdfSalt?: Uint8Array | string | null; hkdfCtx?: Uint8Array | string | null; hkdfLen?: number | null }>): Promise<Uint8Array[]>;
+  ecdhHkdf(token: string, kid: string, opts: HemPeer & {
+    alg?: 'HKDF-SHA2-256' | 'HKDF-SHA2-384' | 'HKDF-SHA2-512'; items: HemHkdfItem[];
+  }): Promise<Uint8Array[]>;
 
-  hmacHash(token: string, kid: string, data: Uint8Array | string, alg?: string | null, opts?: HemPeerKeyOpts): Promise<Uint8Array>;
+  /** `alg` is required with a peer (extKid / pubkey). */
+  hmacHash(token: string, kid: string, data: Uint8Array | string, opts?: HemPeerKeyOpts & { alg?: string | null } | null): Promise<Uint8Array>;
   /** The device's `verified`: false for a wrong MAC. Other errors throw. */
-  hmacVerify(token: string, kid: string, data: Uint8Array | string, mac: Uint8Array, alg?: string | null, opts?: HemPeerKeyOpts): Promise<boolean>;
+  hmacVerify(token: string, kid: string, data: Uint8Array | string, mac: Uint8Array, opts?: HemPeerKeyOpts & { alg?: string | null } | null): Promise<boolean>;
   /** 'AES128-CBC' ... 'AES256-GCM', 'CHACHA20-POLY1305'. */
   cipherEncrypt(token: string, kid: string, data: Uint8Array | string, alg: string, opts?: HemCipherOpts): Promise<HemCipherResult>;
   cipherDecrypt(token: string, kid: string, ciphertext: Uint8Array, alg: string, opts?: HemCipherOpts): Promise<Uint8Array>;
@@ -332,8 +353,8 @@ export declare class HEM {
   /** `mode`: 'ML-DSA' (default), 'HashML-DSA-SHA256/384/512' (data = digest), 'ML-DSA-mu' (data = μ, no ctx). */
   mldsaSign(token: string, kid: string, data: Uint8Array | string, opts?: { ctx?: Uint8Array | string | null; mode?: string | null }): Promise<Uint8Array>;
   /** X-Wing (ML-KEM-768 + X25519) to an MLKEM768 key and a CURVE25519 key; one token with both scopes. */
-  xwingEncaps(token: string, kid: string, extKid: string): Promise<{ alg: string; ss: Uint8Array; ct: Uint8Array }>;
-  xwingDecaps(token: string, kid: string, extKid: string, ct: Uint8Array): Promise<Uint8Array>;
+  xwingEncaps(token: string, kid: string, opts: { extKid: string }): Promise<{ alg: string; ss: Uint8Array; ct: Uint8Array }>;
+  xwingDecaps(token: string, kid: string, ct: Uint8Array, opts: { extKid: string }): Promise<Uint8Array>;
   /** HPKE (RFC 9180) Base, single shot, to a key in the HEM or to { pubkey, kem } outside it. */
   hpkeSeal(token: string, recipient: { kid: string; extKid?: string | null } | { pubkey: Uint8Array; kem: HemHpkeKem },
     data: Uint8Array | string, opts?: HemHpkeOpts): Promise<{ enc: Uint8Array; ct: Uint8Array; suite: string; kem: string; kdf: string; aead: string }>;

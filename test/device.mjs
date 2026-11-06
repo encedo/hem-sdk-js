@@ -31,7 +31,7 @@ async function step(name, fn) {
 }
 const ok = (cond, msg) => { if (!cond) throw new Error(msg); };
 const eq = (a, b, msg) => ok(Buffer.from(a).equals(Buffer.from(b)), msg ?? 'bytes differ');
-const tok = (scope) => hem.authorizePassword(PASS, scope, 600);
+const tok = (scope) => hem.authorizePassword(PASS, scope, { expSeconds: 600 });
 const use = (...kids) => tok(kids.length === 1 ? `keymgmt:use:${kids[0]}` : kids.map((k) => `keymgmt:use:${k}`));
 const k = {};
 async function create(name, type, opts = {}) {
@@ -52,7 +52,7 @@ await step('getStatus / getVersion (with token: sd_csd)', async () => {
 await step('getConfig (policy)', async () => { cfg = await hem.getConfig(await tok('system:config')); return `policy [${cfg.policy}]`; });
 await step('scope array: one token, cached for each scope', async () => {
   hem.clearCache();
-  const t = await hem.authorizePassword(PASS, ['keymgmt:list', 'keymgmt:get'], 600);
+  const t = await hem.authorizePassword(PASS, ['keymgmt:list', 'keymgmt:get'], { expSeconds: 600 });
   ok(Array.isArray(jwtParse(t).scope), 'not an array token');
   ok(await hem.authorizePassword(null, 'keymgmt:get') === t, 'not reused');
 });
@@ -87,6 +87,17 @@ await step('listKeys pages on listed to total', async () => {
   while (page.offset + page.listed < page.total) { page = await hem.listKeys(t, { offset: page.offset + page.listed }); n += page.list.length; pages++; }
   const mine = n;
   return `${page.total} records, ${mine} listed over ${pages} pages, invalid ${page.invalid}`;
+});
+await step('listKeysAll / searchKeysAll match a hand-paged walk', async () => {
+  const t = await hem.authorizePassword(null, ['keymgmt:list', 'keymgmt:search']);
+  let page = await hem.listKeys(t), byHand = [...page.list];
+  while (page.offset + page.listed < page.total) { page = await hem.listKeys(t, { offset: page.offset + page.listed }); byHand.push(...page.list); }
+  const all = await Array.fromAsync(hem.listKeysAll(t));
+  ok(all.map((e) => e.kid).join() === byHand.map((e) => e.kid).join(), `listKeysAll ${all.length} vs by hand ${byHand.length}`);
+  const found = await Array.fromAsync(hem.searchKeysAll(t, 'SDK-TEST:', { returnPubkey: true }));
+  const first = await hem.searchKeys(t, 'SDK-TEST:');
+  ok(found.length >= first.list.length && found.length >= 9, `searchKeysAll ${found.length}, first page ${first.list.length}`);
+  return `list ${all.length}, search SDK-TEST: ${found.length}`;
 });
 await step('listKeys returnPubkey (policy pubkey_in_list)', async () => {
   const p = await hem.listKeys(await tok('keymgmt:list'), { returnPubkey: true });
@@ -129,13 +140,13 @@ await step('exdsaSign / exdsaVerify Ed25519 (true / false, ctx)', async () => {
   ok(await hem.exdsaVerify(t, k.ed.kid, 'hellO', sig) === false, 'invalid not false');
   const pub = await crypto.subtle.importKey('raw', k.ed.pubkey, 'Ed25519', false, ['verify']);
   ok(await crypto.subtle.verify('Ed25519', pub, sig, Buffer.from('hello')), 'WebCrypto rejects it');
-  const sc = await hem.exdsaSign(t, k.ed.kid, 'hello', 'Ed25519ctx', { ctx: 'app' });
-  ok(await hem.exdsaVerify(t, k.ed.kid, 'hello', sc, 'Ed25519ctx', { ctx: 'app' }), 'ctx verify');
+  const sc = await hem.exdsaSign(t, k.ed.kid, 'hello', { alg: 'Ed25519ctx', ctx: 'app' });
+  ok(await hem.exdsaVerify(t, k.ed.kid, 'hello', sc, { alg: 'Ed25519ctx', ctx: 'app' }), 'ctx verify');
 });
 await step('ECDSA P-256 r||s, det, prehashed', async () => {
   const t = await use(k.p256.kid);
-  const a = await hem.exdsaSign(t, k.p256.kid, 'msg', 'SHA256WithECDSA', { det: true });
-  const b = await hem.exdsaSign(t, k.p256.kid, 'msg', 'SHA256WithECDSA', { det: true });
+  const a = await hem.exdsaSign(t, k.p256.kid, 'msg', { alg: 'SHA256WithECDSA', det: true });
+  const b = await hem.exdsaSign(t, k.p256.kid, 'msg', { alg: 'SHA256WithECDSA', det: true });
   eq(a, b, 'det signatures differ');
   ok(a.length === 64, 'not r||s');
   const ecdh = nodeCrypto.createECDH('prime256v1');
@@ -143,8 +154,8 @@ await step('ECDSA P-256 r||s, det, prehashed', async () => {
   const pub = await crypto.subtle.importKey('raw', unc, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
   ok(await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, pub, a, Buffer.from('msg')), 'WebCrypto rejects r||s');
   const dig = nodeCrypto.createHash('sha256').update('msg').digest();
-  const p = await hem.exdsaSign(t, k.p256.kid, dig, 'ECDSA');
-  ok(await hem.exdsaVerify(t, k.p256.kid, dig, p, 'ECDSA'), 'prehashed verify');
+  const p = await hem.exdsaSign(t, k.p256.kid, dig, { alg: 'ECDSA' });
+  ok(await hem.exdsaVerify(t, k.p256.kid, dig, p, { alg: 'ECDSA' }), 'prehashed verify');
 });
 await step('ecdh: HKDF, ecdhHkdf, raw per policy, peer as KID', async () => {
   const t = await use(k.x.kid);
@@ -152,17 +163,17 @@ await step('ecdh: HKDF, ecdhHkdf, raw per policy, peer as KID', async () => {
   const peerPub = new Uint8Array(peer.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32));
   const xPub = nodeCrypto.createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), k.x.pubkey]), format: 'der', type: 'spki' });
   const ss = nodeCrypto.diffieHellman({ privateKey: peer.privateKey, publicKey: xPub });
-  const okm = await hem.ecdh(t, k.x.kid, peerPub, { alg: 'HKDF-SHA2-256', hkdfSalt: 'salt', hkdfCtx: 'ctx', hkdfLen: 32 });
+  const okm = await hem.ecdh(t, k.x.kid, { pubkey: peerPub, alg: 'HKDF-SHA2-256', hkdfSalt: 'salt', hkdfCtx: 'ctx', hkdfLen: 32 });
   eq(okm, Buffer.from(nodeCrypto.hkdfSync('sha256', ss, 'salt', 'ctx', 32)), 'HKDF differs from local');
-  const [a, b] = await hem.ecdhHkdf(t, k.x.kid, peerPub, 'HKDF-SHA2-256', [{ hkdfCtx: 'enc' }, { hkdfCtx: 'mac', hkdfLen: 16 }]);
+  const [a, b] = await hem.ecdhHkdf(t, k.x.kid, { pubkey: peerPub, items: [{ hkdfCtx: 'enc' }, { hkdfCtx: 'mac', hkdfLen: 16 }] });
   eq(a, Buffer.from(nodeCrypto.hkdfSync('sha256', ss, Buffer.alloc(0), 'enc', 32)), 'hkdf_args[0]');
   ok(b.length === 16, 'hkdf_args[1] length');
-  const h = await hem.ecdh(t, k.x.kid, peerPub, { alg: 'SHA2-256' });
+  const h = await hem.ecdh(t, k.x.kid, { pubkey: peerPub, alg: 'SHA2-256' });
   eq(h, nodeCrypto.createHash('sha256').update(ss).digest(), 'digest');
   let raw;
-  try { raw = await hem.ecdh(t, k.x.kid, peerPub); eq(raw, ss, 'raw'); } catch (e) { if (e.code !== 'http_403') throw e; raw = '403 (policy off)'; }
+  try { raw = await hem.ecdh(t, k.x.kid, { pubkey: peerPub }); eq(raw, ss, 'raw'); } catch (e) { if (e.code !== 'http_403') throw e; raw = '403 (policy off)'; }
   const t2 = await use(k.x.kid, k.imp.kid);
-  await hem.ecdh(t2, k.x.kid, k.imp.kid, { alg: 'SHA2-256' });
+  await hem.ecdh(t2, k.x.kid, { extKid: k.imp.kid, alg: 'SHA2-256' });
   return `raw: ${typeof raw === 'string' ? raw : 'ok'}`;
 });
 await step('hmacHash / hmacVerify true / false', async () => {
@@ -210,8 +221,8 @@ await step('ML-DSA sign / verify (ctx, false)', async () => {
 });
 await step('X-Wing encaps / decaps (scope array)', async () => {
   const t = await use(k.kem.kid, k.x.kid);
-  const { ss, ct } = await hem.xwingEncaps(t, k.kem.kid, k.x.kid);
-  eq(await hem.xwingDecaps(t, k.kem.kid, k.x.kid, ct), ss);
+  const { ss, ct } = await hem.xwingEncaps(t, k.kem.kid, { extKid: k.x.kid });
+  eq(await hem.xwingDecaps(t, k.kem.kid, ct, { extKid: k.x.kid }), ss);
 });
 await step('HPKE seal / open (HEM key, and pubkey outside)', async () => {
   const t = await use(k.xh.kid);

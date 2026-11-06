@@ -79,11 +79,13 @@ is wanted.
 
 ```js
 // before                                                // now
-exdsaSign(token, kid, msgString, alg, ctxB64)            exdsaSign(token, kid, data, alg, { ctx, det })   // data: bytes or text
-exdsaSignBytes(token, kid, bytes, alg, ctxB64)           exdsaSign(token, kid, bytes, alg, { ctx })
-exdsaVerify(token, kid, data, sig, alg)                  exdsaVerify(token, kid, data, sig, alg, { ctx })
-ecdh(token, kid, peerPubKeyBase64, { alg })              ecdh(token, kid, peerBytes, { alg, hkdfSalt, hkdfCtx, hkdfLen })
-ecdhKid(token, kid, extKid, { alg })                     ecdh(token, kid, extKid, { alg })                // a 32-hex KID
+exdsaSign(token, kid, msgString, alg, ctxB64)            exdsaSign(token, kid, data, { alg, ctx, det })   // data: bytes or text
+exdsaSignBytes(token, kid, bytes, alg, ctxB64)           exdsaSign(token, kid, bytes, { alg, ctx })
+exdsaVerify(token, kid, data, sig, alg)                  exdsaVerify(token, kid, data, sig, { alg, ctx })
+ecdh(token, kid, peerPubKeyBase64, { alg })              ecdh(token, kid, { pubkey: peerBytes, alg, hkdfSalt, hkdfCtx, hkdfLen })
+ecdhKid(token, kid, extKid, { alg })                     ecdh(token, kid, { extKid, alg })
+hmacHash(token, kid, data, alg, { pubkey })              hmacHash(token, kid, data, { alg, pubkey })
+hmacVerify(token, kid, data, mac, alg, { pubkey })       hmacVerify(token, kid, data, mac, { alg, pubkey })
 cipherWrap(token, kid, alg, data, opts)                  cipherWrap(token, kid, data, { alg, ... })      // alg optional, AES256
 cipherUnwrap(token, kid, alg, wrapped, opts)             cipherUnwrap(token, kid, wrapped, { alg, ... })
 mldsaSign(token, kid, data)                              mldsaSign(token, kid, data, { ctx, mode })
@@ -114,9 +116,50 @@ mldsaVerify(token, kid, data, sig)                       mldsaVerify(token, kid,
 - `getAttestation(token, { nonce })` binds `genuine` to the request;
   `unlockStorage(token, { mode: 'ro' | 'rw' })`.
 
+### One rule for every signature (2026-11-07)
+
+Required arguments go positionally; everything optional, and every peer key,
+goes in the one options object. The 1.3 pass had left a few optional values
+in front of the options (`expSeconds`, `alg`) and a peer that was told apart
+by its type (bytes = a public key, a 32-hex string = a KID). Now:
+
+```js
+// the first 1.3 form                                     // now
+authorizePassword(pw, scope, 900, { remember })           authorizePassword(pw, scope, { expSeconds: 900, remember })
+authorizeMaster(words, scope, 300, { legacy })            authorizeMaster(words, scope, { legacy })
+exdsaSign(t, kid, data, 'ECDSA', { det })                 exdsaSign(t, kid, data, { alg: 'ECDSA', det })
+exdsaVerify(t, kid, data, sig, 'ECDSA')                   exdsaVerify(t, kid, data, sig, { alg: 'ECDSA' })
+hmacHash(t, kid, data, 'SHA2-256', { pubkey })            hmacHash(t, kid, data, { alg: 'SHA2-256', pubkey })
+hmacVerify(t, kid, data, mac, 'SHA2-256', { pubkey })     hmacVerify(t, kid, data, mac, { alg: 'SHA2-256', pubkey })
+ecdh(t, kid, peerBytes, { alg })                          ecdh(t, kid, { pubkey: peerBytes, alg })
+ecdh(t, kid, peerKid, { alg })                            ecdh(t, kid, { extKid: peerKid, alg })
+ecdhHkdf(t, kid, peer, 'HKDF-SHA2-256', items)            ecdhHkdf(t, kid, { pubkey | extKid, alg?, items })   // alg defaults to HKDF-SHA2-256
+xwingEncaps(t, kemKid, xKid)                              xwingEncaps(t, kemKid, { extKid: xKid })
+xwingDecaps(t, kemKid, xKid, ct)                          xwingDecaps(t, kemKid, ct, { extKid: xKid })
+```
+
+- **`ecdh` names its peer as `deriveKey`, `hmacHash` and the cipher calls do**
+  (`extKid` / `pubkey`), but requires one: no peer, both, a base64 string as
+  `pubkey` or an `extKid` that is not 32 hex throw `invalid_arg` before a
+  request.
+- **An old positional call throws, it does not run with defaults.** Every
+  method above checks that the place of the options holds an object (or
+  nothing) and that nothing follows it, and throws `invalid_arg` naming this
+  file otherwise. Without that, `authorizePassword(pw, scope, 900)` would have
+  quietly asked for 300 s and `exdsaSign(t, kid, m, 'SHA256WithECDSA')` would
+  have signed Ed25519.
+- `hkdfLen` is checked (an integer 16..128) and so is the number of
+  `ecdhHkdf` items (1..8), against `LIMITS` in the source.
+- New: `listKeysAll(token, { returnPubkey })` and
+  `searchKeysAll(token, pattern, { match, type, mode, returnPubkey })` walk
+  every page (async generators; `Array.fromAsync(...)` for an array). A caller
+  that read only the first page of a search got at most 15 keys.
+
 ### Who this touches
 
-Fixed with the change: `encedo-manager`. To fix in the second pass:
+Fixed with the change: `encedo-manager` (the first 1.3 form; the 2026-11-07
+rule above still has to be applied there: `authorizePassword` /
+`authorizeMaster` with `SIGNIN_EXP` in `app/session.js`, and `dev/*.mjs`). To fix in the second pass:
 `encedo-oidc`, `encedo-chat`, `encedo-pgp`, `encedo-meet`, `www` — see the
 table in [CLAUDE.md](CLAUDE.md#downstream-compatibility-checked-2026-09-03).
 
