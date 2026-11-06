@@ -270,7 +270,9 @@ async function requestNode(method, url, headers, body, { signal = null, timeoutM
       path: parsed.pathname + parsed.search,
       headers: reqHeaders,
       agent: false,   // fresh TLS connection per request (HSM doesn't pool)
-      timeout: timeoutMs || 15000,
+      // No default limit, as with fetch: ML-DSA signing waits up to 30 s for
+      // the engine and a firmware upload over a slow link takes longer still.
+      ...(timeoutMs ? { timeout: timeoutMs } : {}),
     }, (res) => {
       let raw = '';
       res.setEncoding('utf8');
@@ -293,7 +295,7 @@ async function requestNode(method, url, headers, body, { signal = null, timeoutM
     });
     req.on('timeout', () => {
       req.destroy();
-      reject(new HemError('Request timeout', { code: 'timeout' }));
+      reject(new HemError(`Request timeout after ${timeoutMs} ms`, { code: 'timeout' }));
     });
     req.on('error', e => {
       if (debug) console.debug(`[${tag}] req error:`, e.message);
@@ -859,57 +861,84 @@ class Broker {
 
 // --- Audit log verification ---------------------------------------------------
 
+const LOG_KEY_ROTATE = '32';      // LOGGER_KEY_ROTATE: data = the next per-file public key
+const LOG_EVENTS_LOST = '33';     // LOGGER_EVENTS_LOST: data = u32 LE count of dropped events
+
 /**
- * Verify an audit-log file against the device's logger key.
+ * Verify an audit-log file (format v2, firmware 1.3+) against the device log key.
  *
- * The log is a text file, one entry per line, fields separated by `|`, the
- * first field a hex counter. A line whose third and fourth fields are 0 is a
- * key line: field 5 carries a fresh HMAC key (a nonce) and field 6 the logger
- * key's Ed25519 signature over it. Every line, key lines included, ends with
- * the first 16 bytes of HMAC-SHA256(current nonce, line up to and including
- * the last `|`). Counters must run without gaps (a repeat is allowed).
- * Comment lines start with `#`.
+ * One line per event, seven `|`-separated fields:
+ * `seq|ts|type|result|subject|data|sig`. `seq` is hex and runs from 0 by one;
+ * `data` and `sig` are base64url. Every line is signed (Ed25519, `sig`, over
+ * the text up to and including the last `|`) with a per-file key. That key is
+ * announced by a header line - type 0, result 0, subject `v2`, data = the
+ * per-file public key (32 B) followed by the device log key's signature over
+ * it (64 B) - and replaced at a UTC day change by a LOGGER_KEY_ROTATE line
+ * naming the next key, followed by the next header. Lines starting with `#`
+ * are comments.
+ *
+ * A gap in `seq` is a deleted line: provable, because nobody else can sign the
+ * missing number, so the rest of the file still verifies and the gap is
+ * reported. Lines missing at the very end cannot be detected - the device
+ * stops by power-off and there is no end marker.
  *
  * Pure Web Crypto, no device call: pass what getLoggerKey() and getLogEntry()
  * returned. Requires Ed25519 in Web Crypto (Chrome 137+ / Firefox 130+ / Node 18+).
  *
- * @param {string} signerKey  `key` from HEM.getLoggerKey(): base64 Ed25519 public key
- * @param {string} logText    The log file
- * @returns {Promise<{ok: boolean, lines: number, line?: number, reason?: 'signature'|'sequence'|'no_key'|'hmac'}>}
- *          `line` and `reason` name the first entry that failed
+ * @param {string|Uint8Array} deviceKey  `key` from HEM.getLoggerKey() (base64), or its 32 bytes
+ * @param {string} logText               The log file
+ * @returns {Promise<{ok: boolean, lines: number, headers: number, rotations: number, lost: number,
+ *           gaps: Array<{after: number, next: number}>, line?: number, reason?: string}>}
+ *          `ok` is true when every line verifies and `seq` has no gap. `line`
+ *          (1-based line of the file) and `reason` name the first failure:
+ *          'format', 'cut_front', 'no_header', 'header', 'rotate', 'signature'.
  */
-async function verifyLog(signerKey, logText) {
-  const pubKey = await crypto.subtle.importKey('raw', fromB64(signerKey), { name: 'Ed25519' }, false, ['verify']);
-  let hmacKey = null;
-  let counter = 0;
-  let lines = 0;
+async function verifyLog(deviceKey, logText) {
+  const report = { ok: false, lines: 0, headers: 0, rotations: 0, lost: 0, gaps: [] };
+  const fail = (line, reason) => ({ ...report, line, reason });
+  const ed25519 = (raw) => crypto.subtle.importKey('raw', raw, { name: 'Ed25519' }, false, ['verify']);
+  const devKey = await ed25519(deviceKey instanceof Uint8Array ? deviceKey : fromB64(deviceKey));
 
-  for (const line of logText.split('\n')) {
-    if (!line || line[0] === '#' || line.length < 3) continue;
-
+  let fileKey = null;       // the per-file key of the last header
+  let rotated = null;       // the key a LOGGER_KEY_ROTATE line announced
+  let prevSeq = null;
+  const rows = logText.split('\n');
+  for (let i = 0; i < rows.length; i++) {
+    const line = rows[i].replace(/\r$/, '');
+    if (!line || line[0] === '#') continue;
     const f = line.split('|');
-    const n = parseInt(f[0], 16);
+    if (f.length !== 7) return fail(i + 1, 'format');
 
-    if (f[2] == 0 && f[3] == 0) {
-      // Key line: the nonce becomes the HMAC key for what follows.
-      const nonce = fromB64(f[4]);
-      const sig = fromB64(f[5]);
-      const ok = await crypto.subtle.verify({ name: 'Ed25519' }, pubKey, sig, nonce);
-      if (!ok) return { ok: false, lines, line: n, reason: 'signature' };
-      hmacKey = await crypto.subtle.importKey('raw', nonce, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-      counter = n;
+    const seq = parseInt(f[0], 16);
+    if (prevSeq === null && seq !== 0) return fail(i + 1, 'cut_front');
+    if (prevSeq !== null && seq !== prevSeq + 1) report.gaps.push({ after: prevSeq, next: seq });
+    prevSeq = seq;
+
+    if (f[2] === '0' && f[3] === '0' && f[4] === 'v2') {
+      const cert = fromB64(f[5]);
+      if (cert.length !== 96) return fail(i + 1, 'header');
+      const pub = cert.subarray(0, 32);
+      if (!await crypto.subtle.verify({ name: 'Ed25519' }, devKey, cert.subarray(32), pub)) return fail(i + 1, 'header');
+      if (report.headers > 0 && !(rotated && bytesEqual(rotated, pub))) return fail(i + 1, 'rotate');
+      fileKey = await ed25519(pub);
+      rotated = null;
+      report.headers++;
     }
+    if (!fileKey) return fail(i + 1, 'no_header');
 
-    if (n !== counter + 1 && n !== counter) return { ok: false, lines, line: n, reason: 'sequence' };
-    counter = n;
+    const sig = fromB64(f[6]);
+    const text = strToBytes(line.slice(0, line.lastIndexOf('|') + 1));
+    if (sig.length !== 64 || !await crypto.subtle.verify({ name: 'Ed25519' }, fileKey, sig, text)) return fail(i + 1, 'signature');
 
-    if (!hmacKey) return { ok: false, lines, line: n, reason: 'no_key' };
-    const cut = line.lastIndexOf('|') + 1;
-    const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, strToBytes(line.slice(0, cut)))).subarray(0, 16);
-    if (!bytesEqual(mac, fromB64(line.slice(cut)))) return { ok: false, lines, line: n, reason: 'hmac' };
-    lines++;
+    if (f[2] === LOG_KEY_ROTATE) { rotated = fromB64(f[5]); report.rotations++; }
+    if (f[2] === LOG_EVENTS_LOST) {
+      const d = fromB64(f[5]);
+      if (d.length >= 4) report.lost += (d[0] | d[1] << 8 | d[2] << 16 | d[3] << 24) >>> 0;
+    }
+    report.lines++;
   }
-  return { ok: true, lines };
+  if (!report.lines) return fail(0, 'no_header');
+  return { ...report, ok: report.gaps.length === 0 };
 }
 
 /**
@@ -920,11 +949,14 @@ async function verifyLog(signerKey, logText) {
  * first and treat a false as "this device did not sign anything".
  *
  * @param {{key: string, nonce: string, nonce_signed: string}} loggerKey  getLoggerKey()'s answer
+ * @param {Uint8Array} [expectedNonce]  The nonce passed to getLoggerKey(); the
+ *   device must have signed exactly that, or the answer may be a replay
  * @returns {Promise<boolean>}
  */
-async function verifyLoggerKey(loggerKey) {
+async function verifyLoggerKey(loggerKey, expectedNonce = null) {
   const { key, nonce, nonce_signed: signature } = loggerKey ?? {};
   if (!key || !nonce || !signature) return false;
+  if (expectedNonce && !bytesEqual(fromB64(nonce), expectedNonce)) return false;
   try {
     const pubKey = await crypto.subtle.importKey('raw', fromB64(key), { name: 'Ed25519' }, false, ['verify']);
     return await crypto.subtle.verify({ name: 'Ed25519' }, pubKey, fromB64(signature), fromB64(nonce));
@@ -938,7 +970,8 @@ async function verifyLoggerKey(loggerKey) {
 // Device limits. Exceeding either surfaces as an opaque HTTP 400, so the SDK
 // checks them where the caller can still see which argument was at fault.
 const MAX_CRYPTO_MSG = 2048;
-const MAX_CRYPTO_CTX = 64;
+const MAX_HKDF_FIELD = 128;
+const HKDF_RESERVED = strToBytes('encedo-');   // prefix of the device's own HKDF labels
 
 /**
  * Write the ext_kid / pubkey selector into a request body.
@@ -959,16 +992,81 @@ function applyPeerKey(body, opts, op) {
   else if (pubkey) body.pubkey = pubkey instanceof Uint8Array ? toB64(pubkey) : pubkey;
 }
 
-/** Write the optional HKDF context, which domain-separates a derived key. */
-function applyCtx(body, opts, op) {
-  const { ctx = null } = opts;
-  if (ctx === null || ctx === undefined) return;
-  const bytes = ctx instanceof Uint8Array ? ctx : strToBytes(ctx);
-  if (bytes.length > MAX_CRYPTO_CTX) {
-    throw new HemError(`${op}: ctx is ${bytes.length} bytes, max ${MAX_CRYPTO_CTX}`,
-      { code: 'invalid_arg' });
+/**
+ * Write the optional HKDF salt and context (`hkdf_salt`, `hkdf_ctx`). With a
+ * peer key the device derives the operation key by HKDF over the ECDH secret;
+ * the context domain-separates that key and the salt varies it, and both must
+ * be repeated verbatim to get the same key back. Each is 1..128 bytes; a
+ * context starting with `encedo-` is reserved for the device's own labels.
+ * Ignored by the device without a peer key.
+ */
+function applyHkdf(body, opts, op) {
+  for (const [name, field] of [['hkdfSalt', 'hkdf_salt'], ['hkdfCtx', 'hkdf_ctx']]) {
+    const v = opts[name];
+    if (v === null || v === undefined) continue;
+    const bytes = v instanceof Uint8Array ? v : strToBytes(v);
+    if (bytes.length < 1 || bytes.length > MAX_HKDF_FIELD) {
+      throw new HemError(`${op}: ${name} is ${bytes.length} bytes, must be 1..${MAX_HKDF_FIELD}`, { code: 'invalid_arg' });
+    }
+    if (field === 'hkdf_ctx' && bytesEqual(bytes.subarray(0, HKDF_RESERVED.length), HKDF_RESERVED)) {
+      throw new HemError(`${op}: hkdfCtx may not start with "encedo-" (reserved)`, { code: 'invalid_arg' });
+    }
+    body[field] = toB64(bytes);
   }
-  body.ctx = toB64(bytes);
+}
+
+/** Bytes as given, or a string as UTF-8. */
+function asBytes(v) {
+  return v instanceof Uint8Array ? v : strToBytes(String(v));
+}
+
+const b64OrNull = (v) => (typeof v === 'string' && v ? fromB64(v) : null);
+
+/**
+ * @typedef {object} KeyEntry
+ * @property {string} kid            32 hex characters
+ * @property {string} label
+ * @property {string} type           The key type, e.g. 'SECP256R1', 'AES256', 'GENERIC_DER'
+ * @property {string[]} flags        Device flags: 'ATT' (made inside the HEM), 'PKEY'
+ *                                   (private half stored), 'ECDH', 'ExDSA', 'CERT', 'PQC', 'HPKE'
+ * @property {Uint8Array|null} description
+ * @property {number|null} created   Unix seconds
+ * @property {number|null} updated
+ * @property {Uint8Array|null} pubkey  When the call asked for it (or getKeyPublicInfo)
+ * @property {Uint8Array|null} der     Certificate records, getKeyPublicInfo only
+ */
+
+/**
+ * One key as the SDK hands it out, from a list, search, get, create or derive
+ * answer. The device's `type` is the flags and the type joined by commas
+ * ('ATT,PKEY,ECDH,ExDSA,SECP256R1'); it is split here so no caller has to.
+ */
+function keyEntry(e) {
+  const parts = String(e.type ?? '').split(',').filter(Boolean);
+  return {
+    kid: e.kid ?? '',
+    label: e.label ?? '',
+    type: parts.at(-1) ?? '',
+    flags: parts.slice(0, -1),
+    description: b64OrNull(e.descr),
+    created: e.created ?? null,
+    updated: e.updated ?? null,
+    pubkey: b64OrNull(e.pubkey),
+    der: b64OrNull(e.der),
+  };
+}
+
+/** A list or search page; `listed` drives the paging (see listKeys). */
+function keyPage(data, offset) {
+  const list = (data.list ?? []).map(keyEntry);
+  return {
+    list,
+    offset: data.offset ?? offset,
+    total: data.total ?? list.length,
+    listed: data.listed ?? list.length,
+    deleted: data.deleted ?? 0,
+    invalid: data.invalid ?? 0,
+  };
 }
 
 function checkMsgSize(op, data) {
@@ -982,35 +1080,37 @@ function checkMsgSize(op, data) {
 
 /**
  * `mode` on a create, derive or import request says what an asymmetric key may
- * be used for. Only a key that can do two jobs needs telling, which means the
- * NIST curves: the same key there does ECDH and ExDSA. Nothing else takes one
- * — not the 25519 and 448 curves, which each do one thing, and not a symmetric
- * or post-quantum key.
+ * be used for (API 1.3, keymgmt/create, key types). The SDK sends it when, and
+ * only when, the caller passes one, and checks it against this table first:
+ * the device answers a mode that does not fit the type with a bare 400.
  *
- * So the SDK sends `mode` when, and only when, the caller passes one. The
- * published reference calls the field "Key operation mode (for NIST ECC only)"
- * and gives it three values — 'ECDH', 'ExDSA', 'ECDH,ExDSA'
- * (docs.encedo.com/hem-api, key management, create a key) — and hem-api-tester
- * test_10 creates all 23 key types the device supports, sending `mode` for
- * SECP256R1, SECP384R1, SECP521R1 and SECP256K1 and for none of the other 19.
+ * - NIST curves: 'ECDH', 'ExDSA' or both; P-256/384/521 also 'HPKE' alone
+ *   (an HPKE-only key pair, DEV-503). No mode: neither flag.
+ * - ED25519 signs; 'ECDH' adds key agreement (the key is used as X25519).
+ * - CURVE25519 / CURVE448 agree keys; 'HPKE' makes them HPKE-only instead.
+ * - ML-KEM: 'HPKE' makes an HPKE-only key.
+ * - Everything else (ED448, ML-DSA, HMAC, OTP, AES) takes no mode.
  *
- * A mode on a single-use key is allowed but pointless, and it is checked: ask
- * for `ECDH` on an ED25519 key and the device answers 4xx, because that key
- * signs and cannot agree anything. An opaque status for an argument the caller
- * can still see is worth catching here, as with the crypto field limits below.
+ * Import takes no 'HPKE': a public key needs no flag to be sealed to.
  */
-const SINGLE_USE = { ED25519: 'ExDSA', ED448: 'ExDSA', CURVE25519: 'ECDH', CURVE448: 'ECDH' };
+const NIST_MODES = ['ECDH', 'ExDSA', 'ECDH,ExDSA'];
+const KEY_MODES = {
+  SECP256R1: [...NIST_MODES, 'HPKE'], SECP384R1: [...NIST_MODES, 'HPKE'], SECP521R1: [...NIST_MODES, 'HPKE'],
+  SECP256K1: NIST_MODES,
+  ED25519: ['ExDSA', 'ECDH', 'ECDH,ExDSA'],
+  CURVE25519: ['ECDH', 'HPKE'], CURVE448: ['ECDH', 'HPKE'],
+  MLKEM512: ['HPKE'], MLKEM768: ['HPKE'], MLKEM1024: ['HPKE'],
+};
 
-/**
- * Throw before the request when a mode contradicts the key type. Anything not
- * in the table above — the NIST curves, the symmetric and post-quantum types —
- * is the device's business, and is sent as given.
- */
-function checkMode(type, mode) {
-  const only = SINGLE_USE[type];
-  if (!mode || !only || mode === only) return;
+/** Throw `bad_mode` before the request when a mode does not fit the key type. */
+function checkMode(type, mode, { importing = false } = {}) {
+  if (!mode) return;
+  const allowed = (KEY_MODES[type] ?? []).filter(m => !(importing && m === 'HPKE'));
+  if (allowed.includes(mode)) return;
   throw new HemError(
-    `A key of type ${type} can only ${only === 'ECDH' ? 'agree a shared secret (ECDH)' : 'sign (ExDSA)'}, so mode '${mode}' is not something it can be given`,
+    allowed.length
+      ? `A key of type ${type} takes mode ${allowed.map(m => `'${m}'`).join(', ')}, not '${mode}'`
+      : `A key of type ${type} takes no mode, got '${mode}'`,
     { code: 'bad_mode' });
 }
 
@@ -1310,7 +1410,7 @@ class HEM {
    *
    * Flow:
    *   1. GET  {broker}/notify/session         -> { epk } (broker session pubkey)
-   *   2. POST /api/auth/ext/request { epk, scope, exp } -> challenge
+   *   2. POST /api/auth/ext/request { epk, scope, ctx?, note? } -> challenge
    *   3. POST {broker}/notify/event/new       -> { eventid }
    *   4. Poll GET {broker}/notify/event/check/{eventid}  (202 = pending, 200 = done)
    *   5. POST /api/auth/ext/token { authreply } -> { token: JWT }
@@ -1322,7 +1422,8 @@ class HEM {
    *
    * @param {string} scope       e.g. 'keymgmt:list'
    * @param {object} [opts]
-   * @param {number} [opts.expSeconds=300]     How long the token should be good for
+   * @param {string} [opts.ctx]        1..64 chars, copied into the token
+   * @param {string} [opts.note]       1..128 chars shown with the request on the phone
    * @param {number} [opts.pollInterval=2000]  Poll interval in ms
    * @param {number} [opts.pollTimeout=60000]  Max wait time in ms
    * @param {Function} [opts.onPending]        Called each poll while waiting (no args)
@@ -1331,7 +1432,8 @@ class HEM {
    * @returns {Promise<string>}  JWT token
    */
   async authorizeRemote(scope, {
-    expSeconds = 300,
+    ctx = null,
+    note = null,
     pollInterval = 2_000,
     pollTimeout = 60_000,
     onPending = null,
@@ -1344,18 +1446,12 @@ class HEM {
     // Step 1: broker session EPK
     const session = await this.#broker.session();
 
-    // Step 2: request auth from device (session data, the scope, and how long
-    // the token should be good for). `exp` is required — the published
-    // reference calls it "Requested lifetime of the token" and the reference
-    // client sends an absolute epoch second (hem-api-tester test_6:
-    // `'exp' => time()+120`), which is the form that runs against hardware.
-    // Leaving it out is what the SDK used to do, and a device reading a
-    // missing field as zero sees a request that expired in 1970.
-    const challenge = await this.#req('POST', `${this.#baseUrl}/api/auth/ext/request`, {
-      ...session,
-      scope,
-      exp: Math.floor(Date.now() / 1000) + expSeconds,
-    });
+    // Step 2: the device seals the scope for every paired phone. How long the
+    // token lives is the phone's answer (`exp` of its authreply), not ours.
+    const request = { ...session, scope };
+    if (ctx) request.ctx = ctx;
+    if (note) request.note = note;
+    const challenge = await this.#req('POST', `${this.#baseUrl}/api/auth/ext/request`, request);
 
     // Step 3: forward challenge to broker -> eventid
     const { eventid } = await this.#broker.eventNew(challenge);
@@ -1605,137 +1701,212 @@ class HEM {
 
   // -- Key Management ----------------------------------------------------------
   //
-  // Field sizes, confirmed by the product owner on 2026-09-04: a label is ASCII
-  // 0x20-0x7F, up to 32 characters, and a description is a 64-byte field carried
-  // as base64. The firmware in preparation doubles both — 64 characters and 128
-  // bytes. A caller that has to work with modules already in the field holds to
-  // the smaller sizes; the SDK polices neither, it sends what it is given and
-  // the device rejects what will not fit.
+  // Field rules (API 1.3): a label is 1..64 printable ASCII characters
+  // (0x20..0x7E); a description is a byte field of up to 128 bytes, carried as
+  // base64 - the SDK takes and returns it as a Uint8Array (a string is taken as
+  // UTF-8 text). The SDK polices neither; the device answers 400 to what will
+  // not fit. Every key entry the SDK returns has the same shape, see keyEntry().
 
   /**
-   * Generate a new key in the HSM.
+   * Generate a new key inside the HEM from its RNG. The private half, or the
+   * secret of a symmetric key, never leaves the device.
    *
    * Required scope: 'keymgmt:gen'
    *
-   * @param {string}      token   Bearer JWT
-   * @param {string}      label   Human-readable key label
-   * @param {string}      type    Key type, e.g. 'ED25519'
-   * @param {string}      descr   Base64-encoded description (see the field sizes above)
-   * @param {string|null} [mode]  Usage constraint. The NIST curves (SECP*) can
-   *                              do both jobs, so they need one: 'ECDH',
-   *                              'ExDSA' or 'ECDH,ExDSA'. Everything else has
-   *                              exactly one use and the field is left out —
-   *                              it may be given, but a wrong one is refused.
-   * @returns {Promise<{kid: string}>}
+   * @param {string} token
+   * @param {string} label  1..64 printable ASCII
+   * @param {string} type   'SECP256R1', 'ED25519', 'CURVE25519', 'MLKEM768',
+   *                        'MLDSA65', 'SHA2-256', 'SHA1', 'AES256', ... (API key types)
+   * @param {object} [opts]
+   * @param {Uint8Array|string} [opts.descr]  Description, up to 128 bytes
+   * @param {string} [opts.mode]  What the key may do, see KEY_MODES: 'ECDH',
+   *   'ExDSA', 'ECDH,ExDSA' or 'HPKE'. Only the types that can do more than one
+   *   thing take one; a mode that does not fit the type throws `bad_mode`.
+   * @param {boolean} [opts.returnPubkey=false]  Return the public key with the answer
+   * @returns {Promise<KeyEntry>}  The key as stored; `pubkey` only when asked for
    */
-  async createKeyPair(token, label, type, descr, mode = null) {
+  async createKeyPair(token, label, type, { descr = null, mode = null, returnPubkey = false } = {}) {
     checkMode(type, mode);
-    const body = { type, label, descr };
+    const body = { type, label };
+    if (descr !== null) body.descr = toB64(asBytes(descr));
     if (mode) body.mode = mode;
-    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/create`, body, token);
+    if (returnPubkey) body.return_pubkey = true;
+    return keyEntry(await this.#req('POST', `${this.#baseUrl}/api/keymgmt/create`, body, token));
   }
 
   /**
-   * Import an external public key into the HSM repository.
+   * Store someone else's public key. It gets no private half and no `ATT`
+   * flag; ECDH, verify, ML-KEM encapsulation and HPKE sealing work against it.
    *
    * Required scope: 'keymgmt:imp'
    *
-   * @param {string}      token       Bearer JWT (must have keymgmt:imp scope)
-   * @param {string}      label       Key label (see the field sizes above)
-   * @param {string}      type        Key type, e.g. 'ED25519', 'CURVE25519', 'SECP384R1'
-   * @param {Uint8Array}  pubKeyBytes Public key bytes: raw 32/56/57 B for 25519/448 types,
-   *                                  compressed SEC1 point (0x02/0x03||X) for SECP* types
-   * @param {string|null} [descr]     Optional base64-encoded description (see the field sizes above)
-   * @param {string|null} [mode]      Optional usage constraint for NIST ECC keys:
-   *                                  'ECDH', 'ExDSA' or 'ECDH,ExDSA'
+   * @param {string} token
+   * @param {string} label
+   * @param {string} type    'SECP256R1/384R1/521R1/256K1', 'CURVE25519', 'CURVE448',
+   *                         'ED25519', 'ED448', 'MLKEM512/768/1024', 'MLDSA44/65/87'
+   * @param {Uint8Array} pubkey  Exactly the size of the type: SECP* compressed
+   *   SEC1 point (33 / 49 / 67 / 33 B), X25519 32, X448 56, Ed25519 32, Ed448 57,
+   *   ML-KEM 800 / 1184 / 1568, ML-DSA 1312 / 1952 / 2592
+   * @param {object} [opts]
+   * @param {Uint8Array|string} [opts.descr]
+   * @param {string} [opts.mode]  SECP*: 'ECDH', 'ExDSA' or both; ED25519: 'ECDH'
    * @returns {Promise<{kid: string}>}
    */
-  async importPublicKey(token, label, type, pubKeyBytes, descr = null, mode = null) {
-    checkMode(type, mode);
-    const body = { type, label, pubkey: toB64(pubKeyBytes) };
-    if (descr !== null) body.descr = descr;
-    if (mode !== null) body.mode = mode;
+  async importPublicKey(token, label, type, pubkey, { descr = null, mode = null } = {}) {
+    checkMode(type, mode, { importing: true });
+    const body = { type, label, pubkey: toB64(pubkey) };
+    if (descr !== null) body.descr = toB64(asBytes(descr));
+    if (mode) body.mode = mode;
     return this.#req('POST', `${this.#baseUrl}/api/keymgmt/import`, body, token);
   }
 
   /**
-   * Derive a new key in the HSM from an existing ECDH key and a peer public key.
+   * Derive a new key inside the HEM and store it (no `ATT` flag). The input is
+   * either the ECDH secret of the stored private key `kid` and a peer key
+   * (`extKid` stored in the HEM, or raw `pubkey`), or - with no peer - the
+   * stored HMAC key `kid` itself (SHA2-256/384/512), which builds a key
+   * hierarchy from one secret. HKDF-SHA512, info `encedo-derive:v1:<type>`,
+   * salt `hkdfSalt`: the same inputs always give the same key, and a host
+   * holding the peer's private key computes it too.
    *
-   * Required scope: 'keymgmt:gen'
+   * Required scope: 'keymgmt:derive' (or 'keymgmt:gen')
    *
-   * @param {string} token        Bearer JWT
-   * @param {string} label        Human-readable key label (see the field sizes above)
-   * @param {string} type         Key type of the derived key, e.g. 'ED25519'
-   * @param {string} descr        Base64-encoded description (see the field sizes above)
-   * @param {string} kid          KID of the existing ECDH key to derive from
-   * @param {string} peerPubKeyBase64  Peer's raw public key (standard base64)
-   * @param {string|null} [mode]  Usage constraint, as in createKeyPair()
-   * @returns {Promise<{kid: string}>}
+   * @param {string} token
+   * @param {string} label
+   * @param {string} type  Target: SECP*, CURVE25519, CURVE448, ED25519, ED448,
+   *                       SHA2-*, SHA3-*, SHA1, AES128/192/256 (not ML-KEM / ML-DSA)
+   * @param {string} kid   ECDH private key, or the HMAC parent key
+   * @param {object} [opts]
+   * @param {string} [opts.extKid]  Peer public key stored in the HEM
+   * @param {Uint8Array} [opts.pubkey]  Raw peer public key; not with extKid
+   * @param {Uint8Array|string} [opts.hkdfSalt]  1..128 bytes
+   * @param {Uint8Array|string} [opts.descr]
+   * @param {string} [opts.mode]  As createKeyPair
+   * @param {boolean} [opts.returnPubkey=false]
+   * @returns {Promise<KeyEntry>}
    */
-  async deriveKey(token, label, type, descr, kid, peerPubKeyBase64, mode = null) {
+  async deriveKey(token, label, type, kid, { extKid = null, pubkey = null, hkdfSalt = null, descr = null, mode = null, returnPubkey = false } = {}) {
     checkMode(type, mode);
-    const body = { type, label, descr, kid, pubkey: peerPubKeyBase64 };
+    const body = { type, label, kid };
+    applyPeerKey(body, { extKid, pubkey }, 'deriveKey');
+    if (hkdfSalt !== null) {
+      const salt = asBytes(hkdfSalt);
+      if (salt.length < 1 || salt.length > MAX_HKDF_FIELD) {
+        throw new HemError(`deriveKey: hkdfSalt is ${salt.length} bytes, must be 1..${MAX_HKDF_FIELD}`, { code: 'invalid_arg' });
+      }
+      body.hkdf_salt = toB64(salt);
+    }
+    if (descr !== null) body.descr = toB64(asBytes(descr));
     if (mode) body.mode = mode;
-    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/derive`, body, token);
+    if (returnPubkey) body.return_pubkey = true;
+    return keyEntry(await this.#req('POST', `${this.#baseUrl}/api/keymgmt/derive`, body, token));
   }
 
   /**
-   * Update a key's metadata (label and description) in the HSM repository.
+   * Replace a key's label and description; `updated` becomes now. The record
+   * is rewritten, so the key moves to the end of the list. System records
+   * (TLS key and certificate, EPA attestation key) are read-only: 409.
    *
    * Required scope: 'keymgmt:upd'
    *
-   * @param {string} token  Bearer JWT
-   * @param {string} kid    Key ID to update
-   * @param {string} label  New label (see the field sizes above)
-   * @param {string} descr  New base64-encoded description
-   * @returns {Promise<object>}
+   * @param {string} token
+   * @param {string} kid
+   * @param {string} label
+   * @param {Uint8Array|string|null} [descr=null]  null removes the description
+   * @returns {Promise<void>}
    */
-  async updateKey(token, kid, label, descr) {
-    return this.#req('POST', `${this.#baseUrl}/api/keymgmt/update`,
-      { kid, label, descr }, token);
+  async updateKey(token, kid, label, descr = null) {
+    const body = { kid, label };
+    const bytes = descr === null ? null : asBytes(descr);
+    if (bytes?.length) body.descr = toB64(bytes);
+    await this.#req('POST', `${this.#baseUrl}/api/keymgmt/update`, body, token);
   }
 
   /**
-   * Get public key metadata (type, pubkey) for a given KID.
+   * One key's metadata and public part (`GET /api/keymgmt/get/<kid>`). No
+   * private material ever comes back: an asymmetric key gives its public key,
+   * a stored private-key DER (TLS key, EPA attestation key) its public point,
+   * a certificate record its DER, a symmetric key metadata only.
    *
-   * Required scope: 'keymgmt:get' (the crypto operations on the same key are
-   * the ones that need 'keymgmt:use:<KID>')
+   * Required scope: 'keymgmt:get', 'keymgmt:gen' or 'keymgmt:use:<kid>'
    *
-   * @param {string} token   Bearer JWT
-   * @param {string} kid     Key ID (hex string)
-   * @returns {Promise<{type: string, pubkey: string, updated: number}>}
+   * @param {string} token
+   * @param {string} kid
+   * @returns {Promise<KeyEntry>}  With `der` (Uint8Array) for a certificate record
    */
-  async getPubKey(token, kid) {
-    return this.#req('GET', `${this.#baseUrl}/api/keymgmt/get/${kid}`, null, token);
+  async getKeyPublicInfo(token, kid) {
+    const data = await this.#req('GET', `${this.#baseUrl}/api/keymgmt/get/${kid}`, null, token);
+    return keyEntry({ ...data, kid });
   }
 
   /**
-   * One page of the HSM key repository, with the size of the whole repository
-   * so a caller knows whether to ask for another page. Entries carry the same
-   * fields as searchKeys(); `description` is a Uint8Array (the raw 128-byte
-   * field) or null, `created` and `updated` are Unix seconds or null.
+   * One page of the key repository, in storage order (a changed key moves to
+   * the end). The device gives at most 15 entries a page, and fewer when it
+   * includes public keys (a page ends after 3 PQC keys); the next page starts
+   * at `offset + listed`, until that reaches `total`. Records that fail their
+   * CRC take a slot (`invalid`) but are not in `list`.
    *
    * Required scope: 'keymgmt:list'
    *
-   * @param {string} token   Bearer JWT
-   * @param {number} [offset=0]
-   * @param {number} [limit=50]
-   * @returns {Promise<{list: Array<{kid:string, label:string, type:string, created:number|null, updated:number|null, description:Uint8Array|null}>, total:number}>}
+   * @param {string} token
+   * @param {object} [opts]
+   * @param {number} [opts.offset=0]
+   * @param {number} [opts.limit=15]  The device caps it at 15
+   * @param {boolean} [opts.returnPubkey=false]  Add public keys - only on a device
+   *   personalised with the `pubkey_in_list` policy, ignored without it
+   * @returns {Promise<{list: KeyEntry[], total: number, listed: number, deleted: number, invalid: number, offset: number}>}
    */
-  async listKeys(token, offset = 0, limit = 50) {
-    const data = await this.#req(
-      'GET', `${this.#baseUrl}/api/keymgmt/list/${offset}/${limit}`,
-      null, token
-    );
-    const list = (data.list ?? []).map(entry => ({
-      kid: entry.kid,
-      label: entry.label ?? '',
-      type: entry.type ?? '',
-      created: entry.created ?? null,
-      updated: entry.updated ?? null,
-      description: entry.descr ? fromB64(entry.descr) : null,
-    }));
-    return { list, total: Number.isFinite(data.total) ? data.total : offset + list.length };
+  async listKeys(token, { offset = 0, limit = 15, returnPubkey = false } = {}) {
+    const data = await this.#req('GET',
+      `${this.#baseUrl}/api/keymgmt/list/${offset}/${limit}${returnPubkey ? '/pubkey' : ''}`, null, token);
+    return keyPage(data, offset);
+  }
+
+  /**
+   * Keys whose description matches a byte pattern, with optional filters. The
+   * page rules are those of listKeys(), except that `total` counts every
+   * record, not the matches: read on from `offset + listed` until a page comes
+   * back empty.
+   *
+   * Without a token the device answers only a prefix search of at least 6
+   * bytes, and only when `allow_keysearch` is on; public keys are then left out.
+   *
+   * Required scope: one of 'keymgmt:search', 'keymgmt:list', 'auth:ext:pair'
+   *
+   * @param {string|null} token  null for an anonymous search
+   * @param {Uint8Array|string} pattern  1..128 bytes; a string is UTF-8
+   * @param {object} [opts]
+   * @param {'prefix'|'suffix'|'contains'} [opts.match='prefix']
+   * @param {number} [opts.offset=0]  Matches to skip
+   * @param {number} [opts.limit=15]
+   * @param {string} [opts.type]  Only keys of this type, e.g. 'ED25519'
+   * @param {string} [opts.mode]  Only keys with these flags: 'ECDH', 'ExDSA', 'ECDH,ExDSA', 'HPKE'
+   * @param {boolean} [opts.returnPubkey=false]  Add public keys (`pubkey_in_search` policy)
+   * @returns {Promise<{list: KeyEntry[], total: number, listed: number, deleted: number, invalid: number, offset: number}>}
+   */
+  async searchKeys(token, pattern, { match = 'prefix', offset = 0, limit = 15, type = null, mode = null, returnPubkey = false } = {}) {
+    const b64 = toB64(asBytes(pattern));
+    const descr = match === 'prefix' ? '^' + b64 : match === 'suffix' ? b64 + '$' : b64;
+    const body = { descr, offset, limit };
+    if (type) body.type = type;
+    if (mode) body.mode = mode;
+    if (returnPubkey) body.return_pubkey = true;
+    const data = await this.#req('POST', `${this.#baseUrl}/api/keymgmt/search`, body, token);
+    return keyPage(data, offset);
+  }
+
+  /**
+   * Delete a key - any record, the TLS key and certificate and a paired
+   * phone's key (which unpairs it) included.
+   *
+   * Required scope: 'keymgmt:del'
+   *
+   * @param {string} token
+   * @param {string} kid
+   * @returns {Promise<void>}
+   */
+  async deleteKey(token, kid) {
+    await this.#req('DELETE', `${this.#baseUrl}/api/keymgmt/delete/${kid}`, null, token);
   }
 
   // -- Cryptography ------------------------------------------------------------
@@ -1785,8 +1956,10 @@ class HEM {
   }
 
   /**
-   * Verify an EdDSA/ECDSA signature on the HSM using an imported public key.
-   * Returns true if valid; throws HemError (code 'verify_failed') if signature is invalid (HTTP 406).
+   * Verify an EdDSA/ECDSA signature with a key in the HEM (a key pair or an
+   * imported public key). The device answers 200 for every well-formed
+   * request and puts the result in the body: this resolves to that result.
+   * Any other status (unknown key, wrong curve for `alg`, bad length) throws.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
@@ -1795,12 +1968,12 @@ class HEM {
    * @param {Uint8Array} data   Raw bytes that were signed
    * @param {Uint8Array} sig    Raw signature bytes (64 bytes for Ed25519)
    * @param {string}     [alg='Ed25519']
-   * @returns {Promise<true>}   Resolves to true on success, throws on invalid signature
+   * @returns {Promise<boolean>}  true: the signature is valid; false: it is not
    */
   async exdsaVerify(token, kid, data, sig, alg = 'Ed25519') {
-    await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/verify`,
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/verify`,
       { kid, alg, msg: toB64(data), sign: toB64(sig) }, token);
-    return true;
+    return ret?.verified === true;
   }
 
   /**
@@ -1848,13 +2021,9 @@ class HEM {
   async #ecdhCall(body, token, alg) {
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/ecdh`, body, token);
     if (!ret.ecdh) throw new HemError('No ecdh in response', { code: 'ecdh_error' });
-    const result = fromB64(ret.ecdh);
-    // Only the raw secret has a known length; a hashed result is as long as the digest.
-    if (!alg && result.length !== 32) {
-      throw new HemError(`ECDH result length invalid: expected 32, got ${result.length}`,
-        { code: 'ecdh_error' });
-    }
-    return result;
+    // Raw: as long as the curve (X25519 / P-256 / secp256k1 32 B, P-384 48,
+    // P-521 66, X448 56); hashed: as long as the digest.
+    return fromB64(ret.ecdh);
   }
 
   /**
@@ -1886,9 +2055,10 @@ class HEM {
   }
 
   /**
-   * Verify an HMAC on the HSM. Resolves true on success; throws HemError if the
-   * MAC is invalid — the comparison happens inside the device, so the caller
-   * never has to write a constant-time compare.
+   * Verify an HMAC on the HEM. Resolves to the device's `verified`: false for
+   * a wrong MAC, and also when the key or peer cannot make one - the
+   * comparison happens inside the device, so the caller never has to write a
+   * constant-time compare. Any status other than 200 throws.
    *
    * `alg` and `opts` must match the hmacHash call that produced the MAC.
    *
@@ -1902,15 +2072,15 @@ class HEM {
    * @param {object} [opts]
    * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
    * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
-   * @returns {Promise<true>}
+   * @returns {Promise<boolean>}  true: the MAC matches
    */
   async hmacVerify(token, kid, data, mac, alg = null, opts = {}) {
     checkMsgSize('hmacVerify', data);
     const body = { kid, msg: toB64(data), mac: toB64(mac) };
     if (alg !== null) body.alg = alg;
     applyPeerKey(body, opts, 'hmacVerify');
-    await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/verify`, body, token);
-    return true;
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/verify`, body, token);
+    return ret?.verified === true;
   }
 
   /**
@@ -1923,21 +2093,22 @@ class HEM {
    *
    * @param {string}     token  Bearer JWT
    * @param {string}     kid    Key ID (32-char hex) of the symmetric key
-   * @param {Uint8Array} data   Plaintext bytes (for ECB the length must be a
-   *                            multiple of the 16-byte AES block size)
-   * @param {string}     alg    Cipher + mode, e.g. 'AES256-CBC', 'AES256-GCM', 'AES256-ECB'
+   * @param {Uint8Array} data   Plaintext bytes, 1..2048
+   * @param {string}     alg    'AES128-CBC' ... 'AES256-GCM' or 'CHACHA20-POLY1305' (a 256-bit
+   *                            key: an AES256 key in the HEM). No ECB.
    * @param {object} [opts]
    * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
    * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
    * @param {Uint8Array|null} [opts.aad=null]  Additional authenticated data (GCM only)
-   * @param {Uint8Array|string|null} [opts.ctx=null]  HKDF context, max 64 bytes
+   * @param {Uint8Array|string|null} [opts.hkdfCtx=null]   HKDF context (info), 1..128 bytes; peer-key modes only
+   * @param {Uint8Array|string|null} [opts.hkdfSalt=null]  HKDF salt, 1..128 bytes; peer-key modes only
    * @returns {Promise<{ciphertext: Uint8Array, iv: Uint8Array, tag: Uint8Array|null}>}
    */
   async cipherEncrypt(token, kid, data, alg, opts = {}) {
     checkMsgSize('cipherEncrypt', data);
     const body = { kid, msg: toB64(data), alg };
     applyPeerKey(body, opts, 'cipherEncrypt');
-    applyCtx(body, opts, 'cipherEncrypt');
+    applyHkdf(body, opts, 'cipherEncrypt');
     if (opts.aad) body.aad = toB64(opts.aad);
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/encrypt`, body, token);
     if (!ret.ciphertext) throw new HemError('No ciphertext in encrypt response', { code: 'cipher_error' });
@@ -1968,7 +2139,7 @@ class HEM {
     checkMsgSize('cipherDecrypt', ciphertext);
     const body = { kid, msg: toB64(ciphertext), alg };
     applyPeerKey(body, opts, 'cipherDecrypt');
-    applyCtx(body, opts, 'cipherDecrypt');
+    applyHkdf(body, opts, 'cipherDecrypt');
     if (opts.iv) body.iv = toB64(opts.iv);
     if (opts.tag) body.tag = toB64(opts.tag);
     if (opts.aad) body.aad = toB64(opts.aad);
@@ -1994,7 +2165,8 @@ class HEM {
    * @param {object} [opts]
    * @param {string|null} [opts.extKid=null]  Peer public key already in the HSM
    * @param {Uint8Array|string|null} [opts.pubkey=null]  Raw peer public key; not with extKid
-   * @param {Uint8Array|string|null} [opts.ctx=null]     HKDF context, max 64 bytes
+   * @param {Uint8Array|string|null} [opts.hkdfCtx=null]   HKDF context (info), 1..128 bytes; peer-key modes only
+   * @param {Uint8Array|string|null} [opts.hkdfSalt=null]  HKDF salt, 1..128 bytes; peer-key modes only
    * @param {Uint8Array|null} [opts.iv=null]             Explicit IV; omit for the default
    * @returns {Promise<Uint8Array>}  Wrapped key bytes
    */
@@ -2002,7 +2174,7 @@ class HEM {
     checkMsgSize('cipherWrap', data);
     const body = { kid, alg, msg: toB64(data) };
     applyPeerKey(body, opts, 'cipherWrap');
-    applyCtx(body, opts, 'cipherWrap');
+    applyHkdf(body, opts, 'cipherWrap');
     if (opts.iv) body.iv = toB64(opts.iv);
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/wrap`, body, token);
     if (!ret.wrapped) throw new HemError('No wrapped in wrap response', { code: 'cipher_error' });
@@ -2027,7 +2199,7 @@ class HEM {
     checkMsgSize('cipherUnwrap', wrapped);
     const body = { kid, alg, msg: toB64(wrapped) };
     applyPeerKey(body, opts, 'cipherUnwrap');
-    applyCtx(body, opts, 'cipherUnwrap');
+    applyHkdf(body, opts, 'cipherUnwrap');
     if (opts.iv) body.iv = toB64(opts.iv);
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/unwrap`, body, token);
     if (!ret.unwrapped) throw new HemError('No unwrapped in unwrap response', { code: 'cipher_error' });
@@ -2086,8 +2258,10 @@ class HEM {
   }
 
   /**
-   * ML-DSA (post-quantum) signature verification on the HSM. Resolves true on
-   * success; throws HemError if the signature is invalid.
+   * ML-DSA (post-quantum) signature verification on the HEM, with a key pair
+   * or an imported public key. Resolves to the device's `verified` (false also
+   * when the signature has the wrong size, or the engine stayed busy for 30 s);
+   * any status other than 200 throws.
    *
    * Required scope: 'keymgmt:use:<KID>'
    *
@@ -2095,68 +2269,12 @@ class HEM {
    * @param {string}     kid    Key ID (32-char hex) of the ML-DSA key
    * @param {Uint8Array} data   Raw bytes that were signed
    * @param {Uint8Array} sign   Signature bytes
-   * @returns {Promise<true>}
+   * @returns {Promise<boolean>}  true: the signature is valid
    */
   async mldsaVerify(token, kid, data, sign) {
-    await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/verify`,
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/verify`,
       { kid, msg: toB64(data), sign: toB64(sign) }, token);
-    return true;
-  }
-
-  /**
-   * Search the key repository by the description field.
-   *
-   * The pattern is matched as a prefix. The '^' anchor the device expects goes
-   * on the base64 text, not on the bytes, so the SDK adds it after encoding —
-   * pass the plain value. A Uint8Array pattern lets a caller search binary
-   * descriptions; a string is UTF-8 encoded. Only prefix matching is available:
-   * a '$' suffix anchor appears in neither the API reference nor the
-   * certification suite, so it is left out until the firmware is checked.
-   *
-   * The device returns at most `limit` entries (its own default is 15) starting
-   * at `offset`. Paginate by adding the page length to `offset` until a page
-   * comes back shorter than `limit`.
-   *
-   * Pass token=null for anonymous access, which the device permits when
-   * `allow_keysearch` is configured and the pattern is at least 6 bytes.
-   *
-   * Required scope: 'keymgmt:search' (or 'keymgmt:list' + 'auth:ext:pair')
-   *
-   * @param {string|null} token  Bearer JWT, or null for an anonymous search
-   * @param {string|Uint8Array} descr  Pattern the description must start with
-   * @param {number} [offset=0]  Entries to skip
-   * @param {number} [limit=0]   Max entries; <= 0 leaves the device default (15)
-   * @returns {Promise<Array<{kid:string, label:string, type:string, created:number|null, updated:number|null, description:Uint8Array|null}>>}
-   */
-  async searchKeys(token, descr, offset = 0, limit = 0) {
-    const bytes = descr instanceof Uint8Array ? descr : strToBytes(descr);
-    const body = { descr: '^' + toB64(bytes), offset: Math.max(0, offset) };
-    if (limit > 0) body.limit = limit;
-    const data = await this.#req(
-      'POST', `${this.#baseUrl}/api/keymgmt/search`,
-      body, token
-    );
-    return (data.list ?? []).map(entry => ({
-      kid: entry.kid,
-      label: entry.label ?? '',
-      type: entry.type ?? '',
-      created: entry.created ?? null,
-      updated: entry.updated ?? null,
-      description: entry.descr ? fromB64(entry.descr) : null,
-    }));
-  }
-
-  /**
-   * Delete a key from the HSM.
-   *
-   * Required scope: 'keymgmt:del'
-   *
-   * @param {string} token  Bearer JWT (must have keymgmt:del scope)
-   * @param {string} kid    Key ID to delete (32 hex chars)
-   * @returns {Promise<void>}
-   */
-  async deleteKey(token, kid) {
-    await this.#req('DELETE', `${this.#baseUrl}/api/keymgmt/delete/${kid}`, null, token);
+    return ret?.verified === true;
   }
 
   // -- System Management -------------------------------------------------------
@@ -2173,10 +2291,14 @@ class HEM {
    * @param   {object}      [opts]
    * @param   {number}      [opts.timeoutMs]  Cancel the request after this long
    * @param   {AbortSignal} [opts.signal]     Cancel it from outside
-   * @returns {Promise<{hwv:string, blv:string, fwv:string, fws:string, conf:string}>}
+   * @param   {string}      [opts.token]      Any valid token: adds `sd_csd` / `sd_cid` on an initialised PPA
+   * @returns {Promise<{hwv: string, fwv: string, fwk: string, fws: string, fwc?: string,
+   *          blv?: string, blk?: string, bls?: string, blc?: string, uis?: string,
+   *          sd_csd?: string, sd_cid?: string}>}  `fwc` / `blc` (release CIDs) only in
+   *          release builds; the bootloader fields only when its publisher is the firmware's
    */
-  async getVersion(opts = {}) {
-    return this.#req('GET', `${this.#baseUrl}/api/system/version`, null, null, opts);
+  async getVersion({ token = null, ...opts } = {}) {
+    return this.#req('GET', `${this.#baseUrl}/api/system/version`, null, token, opts);
   }
 
   /**
@@ -2226,9 +2348,9 @@ class HEM {
   }
 
   /**
-   * Read the device configuration.
+   * Read the device configuration, with `spk` and `nonce` for a password change.
    *
-   * Required scope: 'system:config'
+   * Required scope: 'system:config', 'logger:get' or 'auth:ext:pair'
    *
    * @param {string} token  Bearer JWT
    * @returns {Promise<object>}  Config object (eid, user, email, hostname, ...)
@@ -2252,7 +2374,10 @@ class HEM {
   }
 
   /**
-   * Reboot the device. Any valid token is accepted.
+   * Reboot the device (~2 s after the answer). Refused with 409 while software
+   * is being installed. Before personalisation no token is needed.
+   *
+   * Required scope: 'system:config', 'system:upgrade' or 'system:shutdown'
    *
    * @param {string} token  Bearer JWT
    * @returns {Promise<object>}
@@ -2262,7 +2387,10 @@ class HEM {
   }
 
   /**
-   * Shut the device down. Any valid token is accepted.
+   * Stop the device's services: the USB device and the worker that served the
+   * request. A token is always needed.
+   *
+   * Required scope: 'system:config' or 'system:shutdown'
    *
    * @param {string} token  Bearer JWT
    * @returns {Promise<object>}
@@ -2272,7 +2400,12 @@ class HEM {
   }
 
   /**
-   * Run the device self-test suite.
+   * Run the self-tests (also those disabled by `cc_mode`) and read the key
+   * repository statistics. The known-answer tests run in the background: the
+   * answer carries `kat_busy` while one is still running. A second call while
+   * a run is in progress gets 409.
+   *
+   * Required scope: 'system:config' (before personalisation: no token)
    *
    * @param {string} token  Bearer JWT
    * @returns {Promise<object>}
@@ -2284,14 +2417,16 @@ class HEM {
   // -- Firmware / UI Upgrade ---------------------------------------------------
 
   /**
-   * Query the device USB upgrade mode.
+   * Restart the device into the bootloader's low-level USB mode (~2 s after
+   * the answer). It leaves the running firmware: the module is gone until the
+   * bootloader is done with it.
    *
-   * Required scope: 'system:upgrade'
+   * Required scope: 'system:upgrade' or 'system:config'
    *
-   * @param {string} token  Bearer JWT
-   * @returns {Promise<object>}
+   * @param {string|null} token  Bearer JWT (none before personalisation)
+   * @returns {Promise<void>}
    */
-  async usbMode(token) {
+  async rebootToUsbMode(token) {
     return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/usbmode`, null, token);
   }
 
@@ -2315,16 +2450,23 @@ class HEM {
    * Required scope: 'system:upgrade'
    *
    * @param {string}     token       Bearer JWT
-   * @param {Uint8Array} bytes       Raw firmware image bytes
-   * @param {string}     [filename='firmware.bin']  Upload filename
-   * @param {object}     [opts]
-   * @param {Function}   [opts.onProgress]  (loaded, total) in bytes -- browser only
-   * @param {AbortSignal} [opts.signal]     Cancels the upload
-   * @returns {Promise<object>}
+   * The device takes the image under one of two names only, `firmware.bin`
+   * (raw) or `firmware.hex` (Intel HEX), and below 3 MiB. The SDK picks the
+   * name from the content - Intel HEX text starts with `:` - unless `format`
+   * says otherwise.
+   *
+   * @param {string|null} token      Bearer JWT (none before personalisation)
+   * @param {Uint8Array}  bytes      The image
+   * @param {object}      [opts]
+   * @param {'bin'|'hex'} [opts.format]  Default: from the first byte
+   * @param {Function}    [opts.onProgress]  (loaded, total) in bytes -- browser only
+   * @param {AbortSignal} [opts.signal]      Cancels the upload
+   * @returns {Promise<void>}
    */
-  async uploadFirmware(token, bytes, filename = 'firmware.bin', { onProgress = null, signal = null } = {}) {
-    return this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_fw`,
-      bytes, token, { binary: true, filename, onProgress, signal });
+  async uploadFirmware(token, bytes, { format = null, onProgress = null, signal = null } = {}) {
+    const hex = format ? format === 'hex' : bytes[0] === 0x3a;
+    await this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_fw`,
+      bytes, token, { binary: true, filename: hex ? 'firmware.hex' : 'firmware.bin', onProgress, signal });
   }
 
   /**
@@ -2369,20 +2511,20 @@ class HEM {
   }
 
   /**
-   * Upload a UI bundle image to the device.
-   * See uploadFirmware() for how to obtain the byte stream from a local file
-   * or a URL — the SDK takes the raw bytes either way.
+   * Upload a signed Manager archive (PPA). The device stores it as
+   * `webroot.tar`, the only name it accepts, for checkUi() / installUi().
+   * See uploadFirmware() for how to obtain the bytes.
    *
    * Required scope: 'system:upgrade'
    *
-   * @param {string}     token       Bearer JWT
-   * @param {Uint8Array} bytes       Raw UI bundle bytes
-   * @param {string}     [filename='ui.bin']  Upload filename
-   * @returns {Promise<object>}
+   * @param {string|null} token      Bearer JWT (none before personalisation)
+   * @param {Uint8Array}  bytes      The signed tar
+   * @param {object}      [opts]     onProgress, signal - as uploadFirmware()
+   * @returns {Promise<void>}
    */
-  async uploadUi(token, bytes, filename = 'ui.bin', { onProgress = null, signal = null } = {}) {
-    return this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_ui`,
-      bytes, token, { binary: true, filename, onProgress, signal });
+  async uploadUi(token, bytes, { onProgress = null, signal = null } = {}) {
+    await this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_ui`,
+      bytes, token, { binary: true, filename: 'webroot.tar', onProgress, signal });
   }
 
   /**
@@ -2448,41 +2590,57 @@ class HEM {
   // -- Logger / Audit Log ------------------------------------------------------
 
   /**
-   * Get the Ed25519 public key the device uses to sign audit-log entries.
-   * Use it to verify log integrity (rotating HMAC chain + entry signatures).
+   * The device log key (Ed25519) and its signature over a nonce. The log key
+   * certifies the per-file keys that sign every log line (verifyLog()).
+   * Pass a fresh `nonce` of your own to make the answer a proof that the
+   * device holds the key now; without one the device signs a time-based nonce
+   * of its own, which can be replayed. verifyLoggerKey() checks the answer.
    *
    * Required scope: 'logger:get'
    *
-   * @param {string} token  Bearer JWT
-   * @returns {Promise<object>}
+   * @param {string} token
+   * @param {object} [opts]
+   * @param {Uint8Array} [opts.nonce]  32..64 random bytes
+   * @returns {Promise<{key: string, nonce: string, nonce_signed: string}>}  base64
    */
-  async getLoggerKey(token) {
-    return this.#req('GET', `${this.#baseUrl}/api/logger/key`, null, token);
+  async getLoggerKey(token, { nonce = null } = {}) {
+    if (nonce && (nonce.length < 32 || nonce.length > 64)) {
+      throw new HemError(`getLoggerKey: nonce is ${nonce.length} bytes, must be 32..64`, { code: 'invalid_arg' });
+    }
+    const path = nonce ? `/api/logger/key/${toB64url(nonce)}` : '/api/logger/key';
+    return this.#req('GET', `${this.#baseUrl}${path}`, null, token);
   }
 
   /**
-   * List audit-log entries starting at an offset.
+   * One page of the downloadable log files (PPA): one file per power-up, id =
+   * the power-up time as 8 hex digits, so sorting by id sorts by time. The
+   * file of the current session is still being written; it is not listed and
+   * its id comes back as `current`.
    *
    * Required scope: 'logger:get'
    *
-   * @param {string} token   Bearer JWT
-   * @param {number} [offset=0]
-   * @returns {Promise<object>}
+   * @param {string} token
+   * @param {object} [opts]
+   * @param {number} [opts.offset=0]
+   * @param {number} [opts.limit=128]  The device caps it at 128
+   * @returns {Promise<{id: string[], offset: number, total: number, listed: number,
+   *          oldest?: string, newest?: string, current?: string}>}
    */
-  async listLog(token, offset = 0) {
-    return this.#req('GET', `${this.#baseUrl}/api/logger/list/${offset}`, null, token);
+  async listLogFiles(token, { offset = 0, limit = 128 } = {}) {
+    return this.#req('GET', `${this.#baseUrl}/api/logger/list/${offset}/${limit}`, null, token);
   }
 
   /**
-   * Fetch a single audit-log entry by id.
+   * Download one log file as text (PPA). The file the device is writing gives
+   * HTTP 409 (`http_409`): it is not listed, but an id can still be asked for.
    *
    * Required scope: 'logger:get'
    *
-   * @param {string} token        Bearer JWT
-   * @param {string|number} id    Log entry id
-   * @returns {Promise<object>}
+   * @param {string} token
+   * @param {string} id  8 hex digits, from listLogFiles()
+   * @returns {Promise<string>}
    */
-  async getLogEntry(token, id) {
+  async getLogFile(token, id) {
     return this.#req('GET', `${this.#baseUrl}/api/logger/${id}`, null, token);
   }
 
@@ -2548,10 +2706,9 @@ class HEM {
       genuine = req.genuine;
       csr = req.csr;
     }
-    if (!genuine) {
-      const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
-      genuine = challenge.genuine;
-    }
+    // The device attestation of an initialised module comes from
+    // config/attestation (any token); the auth challenge carries none.
+    if (!genuine) genuine = (await this.getAttestation(token)).genuine;
     if (!genuine) throw new HemError('No attestation (genuine) available for domain registration', { code: 'domain_error' });
 
     let tls = await this.#broker.domainRegister(prefix, { genuine, csr, ip });
@@ -2565,20 +2722,24 @@ class HEM {
   // -- Audit log verification --------------------------------------------------
 
   /**
-   * Fetch one log file and verify it against the device's logger key.
-   * See verifyLog() for the format and the result.
+   * Fetch one log file and verify it against the device log key, after the
+   * device has proved it holds that key by signing a fresh nonce of ours.
+   * See verifyLog() for the format and the result; `keyProven` false means the
+   * key did not sign the nonce, so a verified file proves nothing about this device.
    *
    * Required scope: 'logger:get'
    *
    * @param {string} token
-   * @param {string|number} id   Log entry id from listLog()
-   * @returns {Promise<{ok: boolean, lines: number, line?: number, reason?: string, text: string}>}
+   * @param {string} id   From listLogFiles()
+   * @returns {Promise<{ok: boolean, keyProven: boolean, text: string, [k: string]: any}>}
    */
-  async verifyLogEntry(token, id) {
-    const { key } = await this.getLoggerKey(token);
-    const text = await this.getLogEntry(token, id);
-    const result = await verifyLog(key, typeof text === 'string' ? text : JSON.stringify(text));
-    return { ...result, text };
+  async verifyLogFile(token, id) {
+    const nonce = crypto.getRandomValues(new Uint8Array(32));
+    const loggerKey = await this.getLoggerKey(token, { nonce });
+    const keyProven = await verifyLoggerKey(loggerKey, nonce);
+    const text = await this.getLogFile(token, id);
+    const result = await verifyLog(loggerKey.key, typeof text === 'string' ? text : JSON.stringify(text));
+    return { ...result, ok: result.ok && keyProven, keyProven, text };
   }
 
 }

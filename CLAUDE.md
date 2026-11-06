@@ -100,6 +100,17 @@ The table is a map of blast radius, not a freeze. Breaking changes are allowed
 together with the fix in that project, in the same sitting, and the table is
 updated. What the SDK must not do is break a consumer silently.
 
+**Firmware 1.3 (2026-11-06).** The SDK is brought to the 1.3 API in one
+line of work, without compatibility with older firmware (it is retired with
+1.3). The owner's decision for this pass: the Manager is fixed in the same
+sitting, the other consumers in a second pass once the SDK is done; they keep
+their copies / submodule pointers until then. [MIGRATION.md](MIGRATION.md),
+section "Firmware 1.3", lists what each has to change. Rows touched so far:
+`encedo-oidc` (`searchKeys`, `getPubKey`, `createKeyPair`), `encedo-chat`
+(`searchKeys`, `getPubKey`, `createKeyPair`, `updateKey`), `encedo-pgp`
+(`searchKeys`, `getPubKey`, `createKeyPair`, `importPublicKey`, `exdsaVerify`),
+`encedo-meet` (`authorizeRemote` `expSeconds`), `www` (`createKeyPair`).
+
 As it stands nobody reads `hemCheckin()`'s value, nobody catches `AbortError`
 by name, and everybody constructs `new HEM(url, {debug?})`, so the current
 changes reach no consumer: `hemCheckin` returning an object is still truthy,
@@ -145,12 +156,17 @@ byte (cross-checked against jsbip39 + sjcl + tweetnacl), reachable only as
 `authorizeMaster(..., { legacy: true })`, for devices already in the field.
 Never derive a new master key that way.
 
-`usbMode` is not used by the Manager (USB ACM uploads have their own webshell);
-the method stays for other callers.
+`rebootToUsbMode` (was `usbMode`) is not used by the Manager (USB ACM uploads
+have their own webshell); the method stays for other callers.
 
 ## API spec source
 
-Two sources, and they agree:
+The SDK is for firmware 1.3 and later (decided 2026-11-06: older firmware is
+retired with 1.3, so there is no compatibility with it). The firmware's own
+reference is the first source: `encedo_firmware/docs/HEM_API_reference_1.3.x.md`
+(sibling repo, also rendered as `docs/out/HEM_API_reference_1.3.x.html`) -
+every endpoint, field, status code and the order the checks run in, generated
+from the firmware source. Then:
 
 - **<https://docs.encedo.com/hem-api>** — the published reference: every
   endpoint, its request body and its fields. Start here for what a field means
@@ -175,7 +191,9 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
 2. Binary in / binary out: data parameters and return values are `Uint8Array`;
    base64 encoding/decoding happens inside the method (`toB64` / `fromB64`).
    Match `exdsaSignBytes` / `ecdh` as the style reference.
-3. `*Verify` methods resolve to `true` and rely on `#req` to throw on failure.
+3. `*Verify` methods resolve to the device's `verified` (`true` / `false`):
+   the device answers 200 for every well-formed request, a wrong signature
+   included, and puts the verdict in the body. Any other status throws.
 4. Document the **required scope** in the JSDoc.
 5. Multi-step / polling flows (broker interaction): model them on
    `authorizeRemote` / `registerExtAuth` — support `pollInterval`,
@@ -201,14 +219,16 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
 ## Gotchas
 
 - Browser X25519 needs Chrome 113+ / Firefox 130+.
-- `mode` on a create, derive or import is **only for the NIST curves**, where
-  one key does both ECDH and ExDSA and has to be told which. The other 19 types
-  the device supports take no `mode` at all, and the SDK sends one only when a
-  caller passes it — as hem-api-tester test_10 does. It may be given on a
-  single-use key, but it is checked: `ECDH` on an ED25519 key is a 4xx from the
-  device, and `checkMode()` throws `bad_mode` for it before the request. `searchKeys` needs the
-  pattern base64-encoded with a leading `^`; that mismatch silently breaks
-  against a current device.
+- `mode` on a create, derive or import says what a key may do, and only the
+  types that can do more than one thing take one (`KEY_MODES` in the source,
+  from the API's key-type table): the NIST curves ECDH / ExDSA / both and
+  (P-256/384/521) HPKE, ED25519 ECDH on top of signing, X25519 / X448 and
+  ML-KEM HPKE. The SDK sends one only when a caller passes it, and
+  `checkMode()` throws `bad_mode` for a mode that does not fit the type before
+  the device answers a bare 400. Import takes no HPKE.
+- `searchKeys` sends the pattern base64-encoded with the anchor on the base64
+  text: `^` prefix, `$` suffix, none for anywhere. The paging of list and
+  search runs on `listed`, not on the length of `list` (see `listKeys`).
 - Storage lock/unlock has no disk argument: the disk is selected by the token
   scope (`storage:disk<N>:rw`). The Manager v1 called `/unlock/ro` and
   `/unlock/rw`; those sub-paths are legacy (hem-api-tester test_12 uses the

@@ -85,7 +85,7 @@ async function handle(req, res) {
   }
   if (path === '/dev/api/system/config/attestation') return json(res, 200, state.provisioned ? { genuine: 'GEN' } : { genuine: 'GEN', csr: 'CSR', key: 'KEY' });
   if (path === '/dev/api/system/config/provisioning') { state.provisioned = true; return json(res, 200, { installed: true }); }
-  if (path === '/dev/api/auth/token' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-1', genuine: 'GEN' });
+  if (path === '/dev/api/auth/token' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-1' });   // no genuine: only auth/init has one
   if (path === '/dev/api/auth/token' && req.method === 'POST') {
     const { ok, payload } = await verifyEjwt(body.auth);
     if (!ok) return json(res, 401, { error: 'bad signature' });
@@ -99,28 +99,43 @@ async function handle(req, res) {
     state.initIss = payload.iss;
     return json(res, 200, { instanceid: 'INST-1', inited: true });
   }
-  if (path === '/dev/api/auth/ext/request') {
-    // exp is required; a device reading a missing one as zero sees a request
-    // that expired in 1970, so the mock refuses it the way the device would.
-    if (!Number.isFinite(body.exp)) return json(res, 400, { error: 'exp required' });
-    return json(res, 200, { challenge: 'CH', epk: body.epk, scope: body.scope, exp: body.exp });
-  }
+  if (path === '/dev/api/auth/ext/request') return json(res, 200, { authreq: 'AUTHREQ', epk: body.epk });
   if (path === '/dev/api/auth/ext/token') return json(res, 200, { token: fakeJwt({ scope: 'remote', exp: Math.floor(Date.now() / 1000) + 300 }) });
   if (path === '/dev/api/auth/ext/init') return json(res, 200, { eid: state.eid, request: 'REQUEST-JWT' });
   if (path === '/dev/api/auth/ext/validate') return json(res, 200, { confirmed: body.pid });
   if (path === '/dev/api/auth/ext/mac') return json(res, 200, { nonce: 'N', mac: 'M', eid: state.eid });
-  if (path === '/dev/api/system/upgrade/upload_fw') { state.fwChecks = 0; return json(res, 200, { bytes: raw.length, ct: req.headers['content-type'] }); }
+  if (path === '/dev/api/system/upgrade/upload_fw' || path === '/dev/api/system/upgrade/upload_ui') {
+    state.fwChecks = 0;
+    state.upload = { bytes: raw.length, ct: req.headers['content-type'], disposition: req.headers['content-disposition'] };
+    return json(res, 200);
+  }
   // The device verifies in the background: 202 while at it, 200 with the result once done.
   if (path === '/dev/api/system/upgrade/check_fw') return ++state.fwChecks < 3 ? json(res, 202, null) : json(res, 200, { verified: true, fwv: 'v9' });
   if (path === '/dev/api/system/upgrade/install_fw') return json(res, 200, { installing: true });
-  if (path === '/dev/api/keymgmt/create') return json(res, 200, { kid: 'NEW1' });
-  if (path.startsWith('/dev/api/keymgmt/get/')) return json(res, 200, { type: 'ED25519', pubkey: 'PUB', updated: 1738454400 });
-  if (path.startsWith('/dev/api/keymgmt/list/')) {
-    const [offset, limit] = path.split('/').slice(-2).map(Number);
-    const page = state.keys.slice(offset, offset + limit);
-    return json(res, 200, { total: state.keys.length, listed: page.length, list: page });
+  if (path === '/dev/api/keymgmt/create' || path === '/dev/api/keymgmt/derive') {
+    return json(res, 200, { kid: 'NEW1', type: 'ATT,PKEY,ExDSA,' + body.type, label: body.label, created: 1738454400, updated: 1738454400, ...(body.return_pubkey ? { pubkey: b64([1, 2, 3]) } : {}) });
   }
-  if (path === '/dev/api/logger/key') return json(res, 200, { key: state.loggerKeyB64, nonce: state.loggerNonce, nonce_signed: state.loggerNonceSig });
+  if (path === '/dev/api/keymgmt/import') return json(res, 200, { kid: 'IMP1' });
+  if (path.startsWith('/dev/api/keymgmt/get/')) return json(res, 200, { type: 'ATT,PKEY,ExDSA,ED25519', label: 'git-signing', pubkey: b64([9, 9]), created: 1738454400, updated: 1738454400 });
+  if (path.startsWith('/dev/api/keymgmt/list/')) {
+    // /list/<offset>/<limit>[/pubkey]; a CRC-broken record takes a slot but is not listed
+    const [offset, limit] = path.split('/').slice(5, 7).map(Number);
+    const slots = state.keys.slice(offset, offset + limit);
+    const list = slots.filter((k) => !k.broken).map((k) => (path.endsWith('/pubkey') ? { ...k, pubkey: b64([7]) } : k));
+    return json(res, 200, { offset, deleted: 1, invalid: slots.length - list.length, total: state.keys.length, listed: slots.length, list });
+  }
+  if (path === '/dev/api/keymgmt/search') return json(res, 200, { offset: body.offset, deleted: 0, invalid: 0, total: 9, listed: 1, list: [state.keys[0]] });
+  if (path === '/dev/api/crypto/exdsa/verify' || path === '/dev/api/crypto/hmac/verify' || path === '/dev/api/crypto/pqc/mldsa/verify') {
+    return json(res, 200, { verified: Buffer.from(body.msg, 'base64').toString() === 'good' });   // 200 either way, as the device does
+  }
+  if (path === '/dev/api/crypto/cipher/encrypt') return json(res, 200, { ciphertext: b64([1]), iv: b64([2]), tag: b64([3]) });
+  if (path === '/dev/api/crypto/ecdh') return json(res, 200, { ecdh: b64(new Uint8Array(48)) });   // a P-384 raw secret
+  if (path.startsWith('/dev/api/logger/key')) {
+    // /logger/key/<nonce base64url> signs the caller's nonce; without it, a nonce of the device's own
+    const asked = path.split('/')[5];
+    if (asked) return json(res, 200, { key: state.loggerKeyB64, nonce: b64(Buffer.from(asked, 'base64url')), nonce_signed: b64(new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, state.loggerPriv, Buffer.from(asked, 'base64url')))) });
+    return json(res, 200, { key: state.loggerKeyB64, nonce: state.loggerNonce, nonce_signed: state.loggerNonceSig });
+  }
   if (path.startsWith('/dev/api/logger/')) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(state.logText); }
 
   // ---- broker ------------------------------------------------------------------
@@ -273,19 +288,19 @@ test('the token cache can be looked at without handing out the tokens', async ()
   assert.deepEqual(hem.tokens, []);
 });
 
-test('authorizeRemote asks the device for a token with a lifetime, as the device requires', async () => {
+test('authorizeRemote sends the scope and the optional ctx / note; the lifetime is the phone\'s', async () => {
   const hem = mk();
-  const before = Math.floor(Date.now() / 1000);
-  await hem.authorizeRemote('system:config', { pollInterval: 5, expSeconds: 120 });
+  await hem.authorizeRemote('system:config', { pollInterval: 5, ctx: 'session-7', note: 'Sign invoice 12/2026' });
   const sent = state.log.filter((e) => e.path === '/dev/api/auth/ext/request').at(-1).body;
-  assert.ok(sent.exp >= before + 120 && sent.exp <= Math.floor(Date.now() / 1000) + 120,
-    `exp is an epoch second that many seconds out, not a duration: ${sent.exp}`);
   assert.equal(sent.scope, 'system:config');
+  assert.equal(sent.ctx, 'session-7');
+  assert.equal(sent.note, 'Sign invoice 12/2026');
   assert.ok(sent.epk, 'and the broker session key it belongs to');
+  assert.equal('exp' in sent, false, 'ext/request has no exp: the authreply sets the token lifetime');
   hem.clearKeys();
   await hem.authorizeRemote('keymgmt:list', { pollInterval: 5 });
-  const dflt = state.log.filter((e) => e.path === '/dev/api/auth/ext/request').at(-1).body;
-  assert.ok(dflt.exp >= before + 300, 'five minutes by default');
+  const plain = state.log.filter((e) => e.path === '/dev/api/auth/ext/request').at(-1).body;
+  assert.deepEqual(Object.keys(plain).sort(), ['epk', 'scope']);
 });
 
 test('authorizeRemote polls the broker until the phone answers', async () => {
@@ -369,7 +384,8 @@ test('registerDomain asks for a CSR, registers and installs the tls block', asyn
   assert.deepEqual(install.body, { tls });
   assert.ok(install.auth?.startsWith('Bearer '), 'config writes carry the token');
   const again = await hem.registerDomain(token, 'my', { newCertificate: false });
-  assert.deepEqual(again.got, { genuine: 'GEN' }, 're-registration uses the attestation from the auth challenge only');
+  assert.deepEqual(again.got, { genuine: 'GEN' }, 're-registration sends the attestation only');
+  assert.ok(state.log.some((l) => l.path === '/dev/api/system/config/attestation'), 'taken from config/attestation: the auth challenge carries none');
 });
 
 test('a prefix of the owner\'s choosing is confirmed by e-mail before the tls block arrives', async () => {
@@ -406,12 +422,19 @@ test('the firmware check answers null while the device is still at it, and waitF
   assert.deepEqual(await hem.installFirmware(token), { installing: true });
 });
 
-test('uploadFirmware sends raw bytes as octet-stream (Node transport)', async () => {
+test('uploads go under the only names the device takes (Node transport)', async () => {
   const hem = mk();
   const token = await hem.authorizePassword('correct horse', 'system:upgrade');
-  const r = await hem.uploadFirmware(token, new Uint8Array(1000), 'fw.bin');
-  assert.equal(r.bytes, 1000);
-  assert.equal(r.ct, 'application/octet-stream');
+  await hem.uploadFirmware(token, new Uint8Array(1000));
+  assert.equal(state.upload.bytes, 1000);
+  assert.equal(state.upload.ct, 'application/octet-stream');
+  assert.match(state.upload.disposition, /filename="firmware\.bin"/);
+  await hem.uploadFirmware(token, Buffer.from(':10000000FFFF\n'));
+  assert.match(state.upload.disposition, /filename="firmware\.hex"/, 'Intel HEX is told by its first byte');
+  await hem.uploadFirmware(token, new Uint8Array([0x3a, 1]), { format: 'bin' });
+  assert.match(state.upload.disposition, /filename="firmware\.bin"/, 'unless the caller says otherwise');
+  await hem.uploadUi(token, new Uint8Array(10));
+  assert.match(state.upload.disposition, /filename="webroot\.tar"/);
 });
 
 test('getVersion honours timeoutMs as a cancelled request', async () => {
@@ -419,120 +442,219 @@ test('getVersion honours timeoutMs as a cancelled request', async () => {
   await assert.rejects(hem.getVersion({ timeoutMs: 200 }), (e) => e instanceof HemError && (e.code === 'network' || e.code === 'timeout'));
 });
 
-// ---- audit log ---------------------------------------------------------------------
+// ---- audit log (format v2) -----------------------------------------------------------
+// A file as the firmware writes it: a header certifying a per-file Ed25519 key
+// with the device log key, every line signed with the per-file key, a key
+// rotation at a day change (LOGGER_KEY_ROTATE naming the next key, then its header).
+const ed = async (priv, bytes) => new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, priv, bytes));
+const rawPub = async (kp) => new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+
 async function buildLog() {
-  const keys = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
-  state.loggerKeyB64 = b64(new Uint8Array(await crypto.subtle.exportKey('raw', keys.publicKey)));
-  const nonce = crypto.getRandomValues(new Uint8Array(32));
-  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, keys.privateKey, nonce));
-  // What /api/logger/key answers with: the key, a fresh nonce, and its signature.
-  const proof = crypto.getRandomValues(new Uint8Array(32));
+  const dev = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+  state.loggerPriv = dev.privateKey;
+  state.loggerKeyB64 = b64(await rawPub(dev));
+  const proof = crypto.getRandomValues(new Uint8Array(32));   // what /api/logger/key signs without a nonce of ours
   state.loggerNonce = b64(proof);
-  state.loggerNonceSig = b64(new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, keys.privateKey, proof)));
-  const hmacKey = await crypto.subtle.importKey('raw', nonce, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const seal = async (prefix) => {
-    const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, Buffer.from(prefix))).subarray(0, 16);
-    return prefix + b64url(mac);
-  };
-  const lines = ['# encedo audit log'];
-  lines.push(await seal(`${(1).toString(16)}|1700000000|0|0|${b64url(nonce)}|${b64url(sig)}|`));
-  lines.push(await seal(`${(2).toString(16)}|1700000001|3|1|auth ok user|`));
-  lines.push(await seal(`${(2).toString(16)}|1700000002|3|2|auth ok user again|`));   // repeated counter is allowed
-  lines.push(await seal(`${(3).toString(16)}|1700000003|5|0|storage unlock disk0|`));
+  state.loggerNonceSig = b64(await ed(dev.privateKey, proof));
+
+  const file1 = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+  const file2 = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+  const pub1 = await rawPub(file1), pub2 = await rawPub(file2);
+  const header = async (pub) => b64url(Buffer.concat([pub, await ed(dev.privateKey, pub)]));
+  const signed = async (key, text) => text + b64url(await ed(key.privateKey, Buffer.from(text)));
+  const lines = ['# Encedo nGINE FW v1.3.0'];
+  lines.push(await signed(file1, `0|65000000|0|0|v2|${await header(pub1)}|`));
+  lines.push(await signed(file1, `1|65000001|d|0|U|${b64url(Buffer.from('logger:get'))}|`));
+  lines.push(await signed(file1, `2|65000002|33|1||${b64url(Uint8Array.of(5, 0, 0, 0))}|`));        // 5 events lost
+  lines.push(await signed(file1, `3|65015180|32|0||${b64url(pub2)}|`));                            // day change
+  lines.push(await signed(file2, `4|65015180|0|0|v2|${await header(pub2)}|`));
+  lines.push(await signed(file2, `5|65015181|34|0|U|${b64url(Buffer.from('0rw'))}|`));
   state.logText = lines.join('\n') + '\n';
+  return { dev, file1, file2, pub1, pub2, header, signed };
 }
 
-test('verifyLog accepts a well-formed log and names the first bad line', async () => {
-  await buildLog();
-  assert.deepEqual(await verifyLog(state.loggerKeyB64, state.logText), { ok: true, lines: 4 });
+test('verifyLog checks a v2 file line by line and names the first failure', async () => {
+  const { file1, file2, signed } = await buildLog();
+  const good = await verifyLog(state.loggerKeyB64, state.logText);
+  assert.deepEqual(good, { ok: true, lines: 6, headers: 2, rotations: 1, lost: 5, gaps: [] });
+  assert.equal((await verifyLog(fromB64(state.loggerKeyB64), state.logText)).ok, true, 'the key as bytes too');
+  assert.equal((await verifyLog(state.loggerKeyB64, state.logText.replace(/\n/g, '\r\n'))).ok, true, 'CRLF files too');
 
-  const tampered = state.logText.replace('storage unlock disk0', 'storage unlock disk1');
-  assert.deepEqual(await verifyLog(state.loggerKeyB64, tampered), { ok: false, lines: 3, line: 3, reason: 'hmac' });
+  const tampered = state.logText.replace(b64url(Buffer.from('0rw')), b64url(Buffer.from('1rw')));
+  assert.deepEqual(await verifyLog(state.loggerKeyB64, tampered), { ok: false, lines: 5, headers: 2, rotations: 1, lost: 5, gaps: [], line: 7, reason: 'signature' });
 
-  const gap = state.logText.replace(/^3\|/m, '9|');
-  assert.deepEqual(await verifyLog(state.loggerKeyB64, gap), { ok: false, lines: 3, line: 9, reason: 'sequence' });
+  // A deleted line: the rest still verifies, the gap is reported and the file is not ok.
+  const rows = state.logText.split('\n');
+  const deleted = [...rows.slice(0, 3), ...rows.slice(4)].join('\n');
+  const r = await verifyLog(state.loggerKeyB64, deleted);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, undefined, 'every line that is there verifies');
+  assert.deepEqual(r.gaps, [{ after: 1, next: 3 }]);
 
-  const otherKey = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
-  const wrongKey = b64(new Uint8Array(await crypto.subtle.exportKey('raw', otherKey.publicKey)));
-  assert.equal((await verifyLog(wrongKey, state.logText)).reason, 'signature');
+  assert.equal((await verifyLog(state.loggerKeyB64, rows.slice(2).join('\n'))).reason, 'cut_front', 'a file cut at the front');
+  const otherDevice = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+  assert.equal((await verifyLog(b64(await rawPub(otherDevice)), state.logText)).reason, 'header', 'another device key');
+
+  // A second header without the rotation line that announced its key.
+  const noRotate = [...rows.slice(0, 4), await signed(file1, `3|65015180|d|0|U||`), ...rows.slice(5)].join('\n');
+  assert.equal((await verifyLog(state.loggerKeyB64, noRotate)).reason, 'rotate');
+  assert.equal((await verifyLog(state.loggerKeyB64, '# empty\n')).reason, 'no_header');
+  assert.equal((await verifyLog(state.loggerKeyB64, rows[0] + '\n0|1|2|3\n')).reason, 'format');
+  void file2;
 });
 
-test('the logger key is only worth something if the device signed its nonce', async () => {
+test('the logger key is only worth something if the device signed our nonce', async () => {
   await buildLog();
   const hem = mk();
   const token = await hem.authorizePassword('correct horse', 'logger:get');
-  const answer = await hem.getLoggerKey(token);
-  assert.equal(await verifyLoggerKey(answer), true);
-
-  assert.equal(await verifyLoggerKey({ ...answer, nonce: b64(crypto.getRandomValues(new Uint8Array(32))) }), false, 'a nonce it did not sign');
-  assert.equal(await verifyLoggerKey({ ...answer, key: state.spkB64 }), false, 'another key entirely');
+  const nonce = crypto.getRandomValues(new Uint8Array(32));
+  const answer = await hem.getLoggerKey(token, { nonce });
+  assert.equal(state.log.at(-1).path, `/dev/api/logger/key/${b64url(nonce)}`, 'the nonce goes in the path, base64url');
+  assert.equal(await verifyLoggerKey(answer, nonce), true);
+  assert.equal(await verifyLoggerKey(await hem.getLoggerKey(token), nonce), false, 'a nonce of its own choosing proves nothing to us');
+  assert.equal(await verifyLoggerKey(await hem.getLoggerKey(token)), true, 'though it is a valid signature');
+  assert.equal(await verifyLoggerKey({ ...answer, key: state.spkB64 }, nonce), false, 'another key entirely');
   assert.equal(await verifyLoggerKey({ key: answer.key }), false, 'no proof at all');
   assert.equal(await verifyLoggerKey(undefined), false);
+  await assert.rejects(hem.getLoggerKey(token, { nonce: new Uint8Array(16) }), (e) => e.code === 'invalid_arg');
 });
 
-test('verifyLogEntry fetches key and file and verifies them', async () => {
+test('verifyLogFile proves the key, fetches the file and verifies it', async () => {
+  await buildLog();
   const hem = mk();
   const token = await hem.authorizePassword('correct horse', 'logger:get');
-  const r = await hem.verifyLogEntry(token, 7);
+  const r = await hem.verifyLogFile(token, '65000000');
   assert.equal(r.ok, true);
-  assert.equal(r.lines, 4);
+  assert.equal(r.keyProven, true);
+  assert.equal(r.lines, 6);
   assert.equal(r.text, state.logText);
+  const list = await hem.listLogFiles(token, { offset: 2, limit: 50 });
+  void list;
+  assert.equal(state.log.at(-1).path, '/dev/api/logger/list/2/50');
 });
 
 // ---- BIP39 master secret -------------------------------------------------------------
 
 // The official BIP39 English vectors (Trezor test set).
-test('listKeys pages the repository and reports its total', async () => {
+test('listKeys pages by listed, splits the type and skips unreadable records', async () => {
   const hem = mk();
   const token = await hem.authorizePassword('correct horse', 'keymgmt:list');
-  const first = await hem.listKeys(token, 0, 2);
+  const first = await hem.listKeys(token, { limit: 2 });
+  assert.equal(state.log.at(-1).path, '/dev/api/keymgmt/list/0/2');
   assert.equal(first.total, 3);
+  assert.equal(first.listed, 2);
   assert.deepEqual(first.list.map((k) => k.kid), ['K1', 'K2']);
   assert.equal(first.list[0].label, 'git-signing');
+  assert.equal(first.list[0].type, 'ED25519');
+  assert.deepEqual(first.list[0].flags, ['ATT', 'PKEY', 'ExDSA']);
   assert.equal(Buffer.from(first.list[0].description).toString(), 'Commits and tags');
   assert.equal(first.list[0].created, 1738454400);
   assert.equal(first.list[1].updated, 1738454402);
+  assert.equal(first.list[0].pubkey, null, 'no public key unless asked for');
 
-  const second = await hem.listKeys(token, 2, 2);
+  const second = await hem.listKeys(token, { offset: first.offset + first.listed, limit: 2, returnPubkey: true });
+  assert.equal(state.log.at(-1).path, '/dev/api/keymgmt/list/2/2/pubkey');
   assert.deepEqual(second.list.map((k) => k.kid), ['K3']);
+  assert.deepEqual([...second.list[0].pubkey], [7]);
   assert.equal(second.list[0].description, null, 'an empty description is null, not an empty array');
-  assert.equal(second.total, 3);
+
+  state.keys[1].broken = true;
+  const withHole = await hem.listKeys(token, { limit: 15 });
+  assert.equal(withHole.listed, 3, 'the unreadable record takes its slot');
+  assert.equal(withHole.invalid, 1);
+  assert.deepEqual(withHole.list.map((k) => k.kid), ['K1', 'K3']);
+  delete state.keys[1].broken;
 });
 
-test('createKeyPair sends a mode only where the device wants one', async () => {
+test('searchKeys anchors the pattern on the base64 text and passes the filters', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'keymgmt:search');
+  const sent = () => state.log.filter((e) => e.path === '/dev/api/keymgmt/search').at(-1).body;
+  const enc = b64(Buffer.from('EXTAID'));
+  const page = await hem.searchKeys(token, 'EXTAID');
+  assert.deepEqual(sent(), { descr: '^' + enc, offset: 0, limit: 15 });
+  assert.equal(page.list[0].type, 'ED25519');
+  assert.equal(page.listed, 1);
+  await hem.searchKeys(token, Buffer.from('EXTAID'), { match: 'suffix', offset: 15, type: 'ED25519', mode: 'ExDSA', returnPubkey: true });
+  assert.deepEqual(sent(), { descr: enc + '$', offset: 15, limit: 15, type: 'ED25519', mode: 'ExDSA', return_pubkey: true });
+  await hem.searchKeys(null, 'EXTAID', { match: 'contains' });
+  assert.equal(sent().descr, enc);
+});
+
+test('key modes are checked against the type, as the device would', async () => {
   const hem = mk();
   const token = await hem.authorizePassword('correct horse', 'keymgmt:gen');
-  const sent = () => state.log.filter((e) => e.path === '/dev/api/keymgmt/create').at(-1).body;
+  const sent = (p = 'create') => state.log.filter((e) => e.path === `/dev/api/keymgmt/${p}`).at(-1).body;
 
-  // A key that can do one thing carries no mode — which is every type but the
-  // four NIST curves, as hem-api-tester test_10 creates all 23 of them.
-  for (const type of ['ED25519', 'CURVE25519', 'ED448', 'CURVE448', 'MLKEM768', 'MLDSA65', 'AES256', 'SHA2-256']) {
-    await hem.createKeyPair(token, 'k', type, 'ZA==');
-    assert.equal('mode' in sent(), false, `${type} asked for a mode it has no use for`);
-    assert.deepEqual(Object.keys(sent()).sort(), ['descr', 'label', 'type']);
+  for (const type of ['ED25519', 'CURVE25519', 'ED448', 'MLKEM768', 'MLDSA65', 'AES256', 'SHA2-256']) {
+    await hem.createKeyPair(token, 'k', type);
+    assert.deepEqual(Object.keys(sent()).sort(), ['label', 'type'], `${type}: nothing it did not ask for`);
   }
-  // A mode that matches the one thing the key does is allowed, if pointless.
-  await hem.createKeyPair(token, 'signing', 'ED25519', 'ZA==', 'ExDSA');
-  assert.equal(sent().mode, 'ExDSA', 'what the caller asked for is what goes');
-
-  // One that contradicts the type is refused here: the device answers 4xx for
-  // it, and an opaque status is no way to learn which argument was wrong.
-  for (const [type, mode] of [['ED25519', 'ECDH'], ['CURVE25519', 'ExDSA'], ['ED448', 'ECDH'], ['CURVE448', 'ECDH,ExDSA']]) {
-    await assert.rejects(hem.createKeyPair(token, 'k', type, 'ZA==', mode), (e) => e.code === 'bad_mode', `${type} + ${mode}`);
-    await assert.rejects(hem.deriveKey(token, 'k', type, 'ZA==', 'K1', 'cGs=', mode), (e) => e.code === 'bad_mode');
-    await assert.rejects(hem.importPublicKey(token, 'k', type, new Uint8Array(32), 'ZA==', mode), (e) => e.code === 'bad_mode');
+  const ok = [['SECP256R1', 'ECDH,ExDSA'], ['SECP384R1', 'HPKE'], ['SECP256K1', 'ExDSA'], ['ED25519', 'ECDH'],
+    ['CURVE25519', 'HPKE'], ['CURVE448', 'ECDH'], ['MLKEM1024', 'HPKE']];
+  for (const [type, mode] of ok) {
+    await hem.createKeyPair(token, 'k', type, { mode });
+    assert.equal(sent().mode, mode, `${type} + ${mode}`);
   }
-  // Whatever the device makes of a mode on another type is the device's business.
-  await hem.createKeyPair(token, 'sym', 'AES256', 'ZA==', 'something');
-  assert.equal(sent().mode, 'something', 'the SDK does not invent rules it was not told');
+  const bad = [['SECP256K1', 'HPKE'], ['ED25519', 'HPKE'], ['CURVE25519', 'ExDSA'], ['ED448', 'ECDH'], ['MLDSA65', 'HPKE'], ['AES256', 'ECDH']];
+  for (const [type, mode] of bad) {
+    await assert.rejects(hem.createKeyPair(token, 'k', type, { mode }), (e) => e.code === 'bad_mode', `${type} + ${mode}`);
+    await assert.rejects(hem.deriveKey(token, 'k', type, 'K1', { mode }), (e) => e.code === 'bad_mode');
+  }
+  await assert.rejects(hem.importPublicKey(token, 'k', 'CURVE25519', new Uint8Array(32), { mode: 'HPKE' }), (e) => e.code === 'bad_mode',
+    'a public key needs no HPKE flag to be sealed to');
 
-  // The NIST curves do ECDH and ExDSA with the same key, so they are told which.
-  await hem.createKeyPair(token, 'nist', 'SECP384R1', 'ZA==', 'ECDH,ExDSA');
-  assert.equal(sent().mode, 'ECDH,ExDSA', "a curve that can do both takes the caller's word");
-  assert.deepEqual(Object.keys(sent()).sort(), ['descr', 'label', 'mode', 'type']);
+  const created = await hem.createKeyPair(token, 'signing', 'ED25519', { descr: 'git', returnPubkey: true });
+  assert.deepEqual(sent(), { type: 'ED25519', label: 'signing', descr: b64(Buffer.from('git')), return_pubkey: true });
+  assert.equal(created.kid, 'NEW1');
+  assert.equal(created.type, 'ED25519');
+  assert.deepEqual([...created.pubkey], [1, 2, 3]);
 
-  const pub = await hem.getPubKey(token, 'NEW1');
-  assert.equal(pub.pubkey, 'PUB');
+  await hem.deriveKey(token, 'tenant-7', 'AES256', 'K1', { hkdfSalt: 'tenant-7' });
+  assert.deepEqual(sent('derive'), { type: 'AES256', label: 'tenant-7', kid: 'K1', hkdf_salt: b64(Buffer.from('tenant-7')) }, 'an HMAC parent: no peer');
+  await hem.deriveKey(token, 'wg', 'CURVE25519', 'K2', { pubkey: new Uint8Array(32) });
+  assert.equal(sent('derive').pubkey, b64(new Uint8Array(32)));
+
+  await hem.importPublicKey(token, 'bob', 'ED25519', new Uint8Array([5, 6]), { descr: new Uint8Array([1]) });
+  assert.deepEqual(sent('import'), { type: 'ED25519', label: 'bob', pubkey: b64([5, 6]), descr: b64([1]) });
+
+  const info = await hem.getKeyPublicInfo(token, 'K1');
+  assert.equal(info.kid, 'K1');
+  assert.equal(info.type, 'ED25519');
+  assert.deepEqual([...info.pubkey], [9, 9]);
+});
+
+test('verify endpoints answer 200 either way: the SDK reads verified', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'keymgmt:use:00112233445566778899aabbccddeeff');
+  const kid = '00112233445566778899aabbccddeeff';
+  const good = Buffer.from('good'), bad = Buffer.from('bad');
+  assert.equal(await hem.exdsaVerify(token, kid, good, new Uint8Array(64)), true);
+  assert.equal(await hem.exdsaVerify(token, kid, bad, new Uint8Array(64)), false, 'an invalid signature is false, not true');
+  assert.equal(await hem.hmacVerify(token, kid, good, new Uint8Array(32)), true);
+  assert.equal(await hem.hmacVerify(token, kid, bad, new Uint8Array(32)), false);
+  assert.equal(await hem.mldsaVerify(token, kid, good, new Uint8Array(4)), true);
+  assert.equal(await hem.mldsaVerify(token, kid, bad, new Uint8Array(4)), false);
+});
+
+test('the HKDF fields of a peer-key cipher are hkdf_ctx / hkdf_salt, checked before sending', async () => {
+  const hem = mk();
+  const kid = '00112233445566778899aabbccddeeff';
+  const token = await hem.authorizePassword('correct horse', `keymgmt:use:${kid}`);
+  await hem.cipherEncrypt(token, kid, Buffer.from('hi'), 'AES256-GCM', { pubkey: new Uint8Array(32), hkdfCtx: 'files:v1', hkdfSalt: new Uint8Array([1, 2]) });
+  const sent = state.log.filter((e) => e.path === '/dev/api/crypto/cipher/encrypt').at(-1).body;
+  assert.equal(sent.hkdf_ctx, b64(Buffer.from('files:v1')));
+  assert.equal(sent.hkdf_salt, b64([1, 2]));
+  assert.equal('ctx' in sent, false);
+  await assert.rejects(hem.cipherEncrypt(token, kid, Buffer.from('hi'), 'AES256-GCM', { hkdfCtx: 'encedo-wrap:v1:' }), (e) => e.code === 'invalid_arg');
+  await assert.rejects(hem.cipherEncrypt(token, kid, Buffer.from('hi'), 'AES256-GCM', { hkdfSalt: new Uint8Array(129) }), (e) => e.code === 'invalid_arg');
+});
+
+test('a raw ECDH secret is as long as the curve makes it', async () => {
+  const hem = mk();
+  const kid = '00112233445566778899aabbccddeeff';
+  const token = await hem.authorizePassword('correct horse', `keymgmt:use:${kid}`);
+  assert.equal((await hem.ecdhKid(token, kid, 'ffeeddccbbaa99887766554433221100')).length, 48, 'P-384');
 });
 
 const VECTORS = [

@@ -73,15 +73,15 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | **Master secret** | `generateMnemonic`, `entropyToMnemonic`, `mnemonicToEntropy`, `validateMnemonic` — BIP39, where the entropy *is* the master key |
 | **Mobile authenticators** | `registerExtAuth` (pair; hands the QR payload to the caller), `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `getExtAuthMac` |
 | **Provisioning and domains** | `provision` / `installProvisioning` (device certificate), `registerDomain` (`<prefix>.ence.do` + TLS) |
-| **Key management** | `listKeys`, `searchKeys`, `getPubKey`, `createKeyPair`, `deriveKey`, `importPublicKey`, `updateKey`, `deleteKey` |
-| **Cryptography** | `exdsaSign(Bytes)`/`exdsaVerify` (EdDSA/ECDSA), `ecdh`/`ecdhKid`, `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt`, `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum) |
+| **Key management** | `listKeys`, `searchKeys` (prefix / suffix / anywhere, type and mode filters), `getKeyPublicInfo`, `createKeyPair`, `deriveKey` (ECDH or HMAC parent), `importPublicKey`, `updateKey`, `deleteKey` — every key in one shape, `HemKey` |
+| **Cryptography** | `exdsaSign(Bytes)`/`exdsaVerify` (EdDSA/ECDSA), `ecdh`/`ecdhKid`, `hmacHash`/`hmacVerify`, `cipherEncrypt`/`cipherDecrypt` (AES-CBC/GCM, ChaCha20-Poly1305), `cipherWrap`/`cipherUnwrap`, `mlkemEncaps`/`mlkemDecaps`, `mldsaSign`/`mldsaVerify` (post-quantum). The `*Verify` calls resolve to the device's verdict, `true` or `false` |
 | **System** | `getVersion`, `getStatus`, `getConfig`, `setConfig`, `setUserPassword`, `getAttestation`, `reboot`, `shutdown`, `selftest` |
-| **Upgrade** | `usbMode`, `uploadFirmware`/`checkFirmware`/`waitFirmwareCheck`/`installFirmware`, `uploadUi`/`checkUi`/`waitUiCheck`/`installUi` (uploads take `onProgress`; the checks answer null while the device is still verifying, the waits poll) |
+| **Upgrade** | `rebootToUsbMode`, `uploadFirmware`/`checkFirmware`/`waitFirmwareCheck`/`installFirmware`, `uploadUi`/`checkUi`/`waitUiCheck`/`installUi` (uploads take `onProgress`; the checks answer null while the device is still verifying, the waits poll) |
 | **Storage** | `lockStorage`, `unlockStorage` |
-| **Audit log** | `getLoggerKey`, `listLog`, `getLogEntry`, `verifyLogEntry` |
+| **Audit log** | `getLoggerKey` (with a nonce of ours), `listLogFiles`, `getLogFile`, `verifyLogFile` |
 | **Cache** | `clearCache`, `clearKeys` |
 | **Broker** (`hem.broker`) | `checkin`, `session`, `eventNew`/`eventCheck`/`eventDelete`/`waitEvent`, `registerInit`/`registerCheck`/`registerFinalise`/`waitRegistration`, `subscribersList`/`subscribersDelete`, `download`, `domainPredefs`/`domainTaken`/`domainRegister`/`domainStatus`/`waitDomain`, `provisioning`, `shareEmailPubkey` |
-| **Helpers** (exported functions) | `verifyLog` (audit-log integrity, pure Web Crypto), `verifyLoggerKey` (the device signed the nonce it sent with the key), `jwtParse` |
+| **Helpers** (exported functions) | `verifyLog` (audit log, format v2, pure Web Crypto), `verifyLoggerKey` (the device signed the nonce it sent with the key), `jwtParse` |
 
 ### The master secret
 
@@ -106,17 +106,19 @@ Every JWT is issued for a scope that authorizes a class of operations:
 | Scope | Authorizes |
 |-------|------------|
 | `keymgmt:list` | `listKeys` |
-| `keymgmt:search` | `searchKeys` (or `keymgmt:list` + `auth:ext:pair`; no token at all when the device is configured with `allow_keysearch` and the pattern is ≥ 6 bytes) |
-| `keymgmt:gen` | `createKeyPair`, `deriveKey` |
+| `keymgmt:search` | `searchKeys` (or `keymgmt:list`, or `auth:ext:pair`; no token at all for a prefix of ≥ 6 bytes when the device has `allow_keysearch`) |
+| `keymgmt:gen` | `createKeyPair`, `deriveKey` (also `getKeyPublicInfo`) |
+| `keymgmt:derive` | `deriveKey` |
 | `keymgmt:imp` | `importPublicKey` |
 | `keymgmt:upd` | `updateKey` |
 | `keymgmt:del` | `deleteKey` |
-| `keymgmt:get` | `getPubKey` |
-| `keymgmt:use:<KID>` | all `/crypto/*` operations on that key |
-| `system:config` | `getConfig`, `setConfig`, `setUserPassword`, `registerExtAuth`, `listExtAuth`, `deleteExtAuth`, `registerDomain` |
-| `system:upgrade` | all upgrade operations |
+| `keymgmt:get` | `getKeyPublicInfo` |
+| `keymgmt:use:<KID>` | all `/crypto/*` operations on that key, and `getKeyPublicInfo` of it |
+| `system:config` | `getConfig`, `setConfig`, `setUserPassword`, `registerExtAuth`, `listExtAuth`, `deleteExtAuth`, `registerDomain`, `selftest`, `reboot`, `shutdown`, `rebootToUsbMode` and the upgrade checks / installs |
+| `system:upgrade` | all upgrade operations, `reboot` |
+| `system:shutdown` | `reboot`, `shutdown` |
 | `storage:disk<N>:rw` | `lockStorage`, `unlockStorage` for that disk |
-| `logger:get` | `getLoggerKey`, `listLog`, `getLogEntry`, `verifyLogEntry` |
+| `logger:get` | `getLoggerKey`, `listLogFiles`, `getLogFile`, `verifyLogFile`, `getConfig` |
 
 ## Error handling
 

@@ -243,70 +243,78 @@ const tls = await hem.broker.waitDomain(id, { onPending: (status) => console.log
 
 ## 3. Key management
 
+Every key comes back in one shape (`HemKey`):
+`{ kid, label, type, flags, description, created, updated, pubkey, der }`.
+`type` is the key type alone ('ED25519'); the device's flags are split into
+`flags` (['ATT', 'PKEY', 'ExDSA']). `description`, `pubkey` and `der` are bytes
+or null. A description goes in as bytes too (a string is taken as UTF-8).
+
 ```js
 const token = await hem.authorizePassword('my-password', 'keymgmt:list');
 
-// List — one page at a time. `total` is the size of the whole repository,
-// so a caller knows whether to ask for the next page.
-// list: [{ kid, label, type, created, updated, description }]
-const { list, total } = await hem.listKeys(token, 0, 50);
-const all = list.length < total ? list.concat((await hem.listKeys(token, list.length, 50)).list) : list;
+// One page: at most 15 slots. Read on from offset + listed until it reaches
+// total - an unreadable record takes a slot without being in `list`, and a
+// page with public keys ends after 3 PQC keys.
+const keys = [];
+for (let offset = 0, page; ; offset = page.offset + page.listed) {
+  page = await hem.listKeys(token, { offset });
+  keys.push(...page.list);
+  if (!page.listed || page.offset + page.listed >= page.total) break;
+}
+
+// With public keys - only on a device personalised with the pubkey_in_list policy:
+const withKeys = await hem.listKeys(token, { returnPubkey: true });
 ```
 
 ```js
-// Search by description prefix. Pass the plain pattern — the SDK base64-encodes
-// it and prepends the '^' anchor the device expects.
-const found = await hem.searchKeys(token, 'CCTEST:');
+// Search the description bytes. The SDK base64-encodes the pattern and adds
+// the anchor: '^' for a prefix (default), '$' for a suffix, none for anywhere.
+const found = await hem.searchKeys(token, 'CCTEST:');                       // { list, listed, ... }
+const wgPeers = await hem.searchKeys(token, new Uint8Array([0x57, 0x47, 0x3a]), { match: 'contains' });
+const signers = await hem.searchKeys(token, 'git', { type: 'ED25519', mode: 'ExDSA' });
 
-// A binary pattern works too, for descriptions that are not text:
-const wgPeers = await hem.searchKeys(token, new Uint8Array([0x57, 0x47, 0x3a, 0x70, 0x72, 0x3a]));
-
-// Paginate: the device returns at most `limit` entries (its default is 15).
-const page = [];
-for (let offset = 0; ; offset += 50) {
-  const batch = await hem.searchKeys(token, 'CCTEST:', offset, 50);
-  page.push(...batch);
-  if (batch.length < 50) break;
+// Paginate: `total` counts every record, not the matches - read on until a page is empty.
+for (let offset = 0, page; ; offset += page.listed) {
+  page = await hem.searchKeys(token, 'CCTEST:', { offset });
+  if (!page.listed) break;
 }
 
-// No token at all — allowed when the device is configured with allow_keysearch
-// and the pattern is at least 6 bytes.
+// No token at all - allowed when the device has allow_keysearch and the
+// prefix is at least 6 bytes. No public keys then.
 const anon = await hem.searchKeys(null, 'CCTEST:');
 ```
 
 ```js
-// Create a key pair (scope: keymgmt:gen). descr must be base64.
+// Create (scope: keymgmt:gen). The mode is checked against the type before the
+// request: a mode that does not fit throws bad_mode.
 const genToken = await hem.authorizePassword('my-password', 'keymgmt:gen');
-const { kid } = await hem.createKeyPair(genToken, 'My signing key', 'ED25519',
-  btoa('purpose: document signing'));
+const key = await hem.createKeyPair(genToken, 'My signing key', 'ED25519', { descr: 'purpose: document signing' });
 
-// The NIST curves can sign AND agree, so they need to be told which:
-const nistKid = await hem.createKeyPair(genToken, 'Work P-384', 'SECP384R1',
-  btoa('purpose: both'), 'ECDH,ExDSA');
+// The NIST curves can sign AND agree, so they are told which; HPKE makes an HPKE-only key pair.
+const nist = await hem.createKeyPair(genToken, 'Work P-384', 'SECP384R1', { mode: 'ECDH,ExDSA', returnPubkey: true });
+const hpke = await hem.createKeyPair(genToken, 'Inbox', 'CURVE25519', { mode: 'HPKE' });
 
-// Derive a key from an existing ECDH key + a peer public key
-const derived = await hem.deriveKey(genToken, 'Derived key', 'ED25519',
-  btoa('derived'), ecdhKid, peerPubKeyBase64);
+// Derive (scope: keymgmt:derive) from ECDH with a peer key ...
+const derived = await hem.deriveKey(genToken, 'Shared with Bob', 'AES256', ecdhKid, { pubkey: bobX25519 /* Uint8Array */ });
+// ... or, with no peer, from a stored HMAC key: a key hierarchy from one secret.
+const tenant = await hem.deriveKey(genToken, 'tenant-7', 'AES256', hmacKid, { hkdfSalt: 'tenant-7' });
 ```
 
 ```js
-// Import an external public key (scope: keymgmt:imp)
+// Import a public key (scope: keymgmt:imp), exactly the size of its type.
 const impToken = await hem.authorizePassword('my-password', 'keymgmt:imp');
-const imported = await hem.importPublicKey(impToken, 'Peer key', 'ED25519',
-  rawPubKeyBytes /* Uint8Array */, btoa('peer'));
+const imported = await hem.importPublicKey(impToken, 'Peer key', 'ED25519', rawPubKeyBytes, { descr: 'peer' });
 
-// NIST ECC (SECP256R1/384R1/521R1, SECP256K1) additionally REQUIRE a usage mode
-// ('ECDH', 'ExDSA' or 'ECDH,ExDSA') and take a COMPRESSED SEC1 point (0x02/0x03||X):
-const nist = await hem.importPublicKey(impToken, 'Peer P-384', 'SECP384R1',
-  compressedPoint /* Uint8Array, 49 B */, btoa('peer'), 'ECDH');
+// NIST curves take a COMPRESSED SEC1 point (0x02/0x03 || X) and a mode:
+const nistPeer = await hem.importPublicKey(impToken, 'Peer P-384', 'SECP384R1', compressedPoint /* 49 B */, { mode: 'ECDH' });
 
-// Update label/description (scope: keymgmt:upd)
+// Update label/description (scope: keymgmt:upd); no description removes it.
 const updToken = await hem.authorizePassword('my-password', 'keymgmt:upd');
-await hem.updateKey(updToken, kid, 'Renamed key', btoa('new description'));
+await hem.updateKey(updToken, kid, 'Renamed key', 'new description');
 
-// Get public key metadata: { type, pubkey, updated } (scope: keymgmt:get)
+// Metadata and public part of one key - never private material (scope: keymgmt:get)
 const getToken = await hem.authorizePassword('my-password', 'keymgmt:get');
-const pub = await hem.getPubKey(getToken, kid);
+const info = await hem.getKeyPublicInfo(getToken, kid);       // HemKey, with pubkey (or der for a certificate)
 
 // Delete (scope: keymgmt:del)
 const delToken = await hem.authorizePassword('my-password', 'keymgmt:del');
@@ -333,8 +341,9 @@ const sig1 = await hem.exdsaSign(token, kid, 'hello world');
 // Sign raw bytes — use this for OpenPGP / TLS / JWT etc.
 const sig2 = await hem.exdsaSignBytes(token, kid, data);          // Uint8Array
 
-// Verify (against an imported public key). Resolves true or throws.
-await hem.exdsaVerify(token, kid, data, sig2);
+// Verify (with a key pair or an imported public key). The device answers 200
+// either way and the SDK returns its verdict: false is an invalid signature.
+if (!(await hem.exdsaVerify(token, kid, data, sig2))) throw new Error('bad signature');
 
 // Other algorithms — pass a base64 ctx for Ed25519ctx / Ed448
 const sig3 = await hem.exdsaSignBytes(token, kid, data, 'Ed25519ctx', btoa('ctx'));
@@ -343,7 +352,9 @@ const sig3 = await hem.exdsaSignBytes(token, kid, data, 'Ed25519ctx', btoa('ctx'
 ### ECDH
 
 ```js
-// Curve25519 ECDH on the device — returns the raw 32-byte shared secret.
+// ECDH on the device. Without alg the raw secret comes back - as long as the
+// curve (32 B for X25519 / P-256, 48 for P-384, 66 for P-521, 56 for X448) and
+// only on a device personalised with the raw_ecdh_enabled policy (else 403).
 const secret = await hem.ecdh(token, kid, peerPubKeyBase64);       // Uint8Array
 
 // Two-KID variant: the peer public key is already imported in the HSM (extKid);
@@ -372,7 +383,7 @@ configuration without a separate secret.
 
 ```js
 const mac = await hem.hmacHash(token, kid, data, 'SHA2-256');      // Uint8Array
-await hem.hmacVerify(token, kid, data, mac, 'SHA2-256');           // true / throws
+const ok = await hem.hmacVerify(token, kid, data, mac, 'SHA2-256'); // true / false
 
 // MAC key = ECDH(kid, myOwnPubKey) — never leaves the device.
 const mac2 = await hem.hmacHash(token, kid, data, 'SHA2-256', { pubkey: myPubKeyBase64 });
@@ -383,11 +394,14 @@ await hem.hmacVerify(token, kid, data, mac2, 'SHA2-256', { pubkey: myPubKeyBase6
 
 ### Symmetric encryption
 
-`alg` is `<type>-<mode>`, e.g. `AES256-CBC`, `AES256-GCM`, `AES256-ECB`.
-For ECB the plaintext length must be a multiple of 16 bytes.
+`alg` is `AES128-CBC` … `AES256-GCM`, or `CHACHA20-POLY1305` (a 256-bit key:
+an `AES256` key in the HEM). There is no ECB.
 
-The IV is generated by the device, and GCM adds an authentication tag — both
-come back with the ciphertext and both must be handed to `cipherDecrypt`.
+The IV is generated by the device (CBC 16 B, GCM and ChaCha20 12 B), and GCM /
+ChaCha20-Poly1305 add a 16-byte tag — both come back with the ciphertext and
+both must be handed to `cipherDecrypt`. With a peer key the device derives the
+cipher key by HKDF: `hkdfCtx` and `hkdfSalt` (1..128 bytes each) shape it and
+must be repeated on decrypt.
 
 ```js
 const { ciphertext, iv, tag } = await hem.cipherEncrypt(token, kid, data, 'AES256-GCM');
@@ -406,10 +420,10 @@ NIST AES key wrap: deterministic, 32 bytes in → 40 bytes out.
 const wrapped   = await hem.cipherWrap(token, kid, 'AES256', keyMaterialBytes);
 const unwrapped = await hem.cipherUnwrap(token, kid, 'AES256', wrapped);
 
-// Wrapped under a self-ECDH KEK, domain-separated by ctx (max 64 bytes).
-// Every option must be repeated verbatim on unwrap — a different ctx derives a
-// different KEK and the unwrap fails.
-const opts = { pubkey: myPubKeyBase64, ctx: 'ENC-WG-PSK-v1' };
+// Wrapped under a self-ECDH KEK, domain-separated by hkdfCtx (1..128 bytes).
+// Every option must be repeated verbatim on unwrap — a different context derives
+// a different KEK and the unwrap fails.
+const opts = { pubkey: myPubKeyBase64, hkdfCtx: 'ENC-WG-PSK-v1' };
 const psk        = await hem.cipherWrap(token, kid, 'AES256', pskBytes, opts);
 const pskPlain   = await hem.cipherUnwrap(token, kid, 'AES256', psk, opts);
 ```
@@ -423,7 +437,7 @@ const ss2 = await hem.mlkemDecaps(token, kemKid, ct);     // ss2 equals ss
 
 // ML-DSA signatures
 const sig = await hem.mldsaSign(token, dsaKid, data);
-await hem.mldsaVerify(token, dsaKid, data, sig);          // true / throws
+await hem.mldsaVerify(token, dsaKid, data, sig);          // true / false
 ```
 
 ---
@@ -432,7 +446,7 @@ await hem.mldsaVerify(token, dsaKid, data, sig);          // true / throws
 
 ```js
 // No auth required:
-const version = await hem.getVersion();   // { hwv, blv, fwv, fws, conf }
+const version = await hem.getVersion();   // { hwv, fwv, fwk, fws, fwc, blv, blk, bls, blc, uis }
 const status  = await hem.getStatus();
 
 // Auth required (scope: system:config):
@@ -443,10 +457,11 @@ await hem.setConfig(token, { user: 'New Name' });          // { updated: true }
 // Device attestation — any valid token is accepted
 const attestation = await hem.getAttestation(token);       // { genuine, ... }
 
-// Lifecycle — any valid token
+// Lifecycle: system:config does all three (reboot also takes system:upgrade /
+// system:shutdown, shutdown system:shutdown)
+await hem.selftest(token);
 await hem.reboot(token);
 await hem.shutdown(token);
-await hem.selftest(token);
 ```
 
 ---
@@ -476,15 +491,16 @@ const { newfws } = await hem.hemCheckin();
 const fwBytes4 = await hem.broker.download('firmware', newfws);   // Uint8Array
 
 // --- Upgrade flow ---
-await hem.usbMode(token);
-await hem.uploadFirmware(token, fwBytes, 'firmware.bin', {
+// The device takes firmware.bin or firmware.hex only; the SDK picks the name
+// from the content (Intel HEX starts with ':'), or pass { format: 'hex' }.
+await hem.uploadFirmware(token, fwBytes, {
   onProgress: (loaded, total) => bar.value = loaded / total,   // browser only
   // signal: ac.signal,
 });
 await hem.waitFirmwareCheck(token);           // the device verifies in the background; this polls until it is done
 await hem.installFirmware(token);             // device reboots afterwards
 
-// UI bundle — same pattern
+// UI bundle (sent as webroot.tar) — same pattern
 await hem.uploadUi(token, uiBytes);
 await hem.waitUiCheck(token);
 await hem.installUi(token);
@@ -511,21 +527,28 @@ Scope: `logger:get`.
 ```js
 const token = await hem.authorizePassword('my-password', 'logger:get');
 
-const signerKey = await hem.getLoggerKey(token);   // { key }: Ed25519 key that signs log entries
-const page      = await hem.listLog(token, 0);     // entries from offset 0
-const entry     = await hem.getLogEntry(token, entryId);   // the log file, text
+// The device log key, with its signature over a nonce of ours: proof the device holds it now.
+const nonce = crypto.getRandomValues(new Uint8Array(32));
+const loggerKey = await hem.getLoggerKey(token, { nonce });   // { key, nonce, nonce_signed }
+const proven = await verifyLoggerKey(loggerKey, nonce);
+
+// One file per power-up; the one being written is `current`, not listed (and 409 if asked for).
+const { id: ids, total, current } = await hem.listLogFiles(token, { offset: 0 });
+const text = await hem.getLogFile(token, ids[0]);              // the file, text
 ```
 
-Each log file carries its own integrity chain: signed key lines and an HMAC on
-every line. Verify before showing it as evidence:
+Format v2 (firmware 1.3): every line is signed (Ed25519) with a per-file key,
+and each file opens with a header that certifies that key with the device log
+key. Verify before showing a file as evidence:
 
 ```js
-const { ok, lines, line, reason, text } = await hem.verifyLogEntry(token, entryId);
-if (!ok) console.warn(`log ${entryId} fails at entry ${line}: ${reason}`);   // signature | sequence | no_key | hmac
+const r = await hem.verifyLogFile(token, ids[0]);   // proves the key, fetches, verifies
+if (!r.ok) console.warn(r.reason ? `line ${r.line}: ${r.reason}` : `deleted lines: ${JSON.stringify(r.gaps)}`);
+// reason: format | cut_front | no_header | header | rotate | signature; gaps: deleted lines
 
 // Or, with data already in hand (pure Web Crypto, no device call):
-import { verifyLog } from './hem-sdk.js';
-const result = await verifyLog(signerKey.key, text);
+import { verifyLog, verifyLoggerKey } from './hem-sdk.js';
+const result = await verifyLog(loggerKey.key, text);  // { ok, lines, headers, rotations, lost, gaps }
 ```
 
 Share a key's share-code by e-mail through the broker:

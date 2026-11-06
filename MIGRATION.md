@@ -1,3 +1,88 @@
+# Upgrading the SDK
+
+## Firmware 1.3
+
+From 2026-11-06 the SDK follows the firmware 1.3 API
+(`encedo_firmware/docs/HEM_API_reference_1.3.x.md`) and nothing older:
+firmware before 1.3 is retired with it. What changed for a caller, and what
+to do about each. The SDK is shared: fix the project, not the SDK.
+
+### Results that were wrong
+
+- **`exdsaVerify`, `hmacVerify`, `mldsaVerify` resolve to `true` or `false`.**
+  The device answers 200 for a wrong signature too, with `{"verified":false}`;
+  the SDK used to resolve `true` for every 200, so an invalid signature passed.
+  Check the value: `if (!(await hem.exdsaVerify(...))) reject()`. A non-200 still throws.
+- **`verifyLog` reads format v2** (every line signed with Ed25519, per-file key
+  certified by the device log key). The result is
+  `{ ok, lines, headers, rotations, lost, gaps, line?, reason? }`;
+  `reason` is one of `format`, `cut_front`, `no_header`, `header`, `rotate`,
+  `signature` (v1's `hmac`, `sequence`, `no_key` are gone). A deleted line is a
+  `gaps` entry and makes `ok` false while every other line still verifies.
+- **The HKDF context of the cipher calls was never sent.** The option is now
+  `hkdfCtx` (and `hkdfSalt`), 1..128 bytes each; `ctx` is gone. Data
+  encrypted or wrapped with a `ctx` before was made without one: decrypt it
+  without `hkdfCtx`.
+- **`ecdh` / `ecdhKid` without `alg`** return the raw secret at the curve's
+  length (P-384 48, P-521 66, X448 56 bytes) instead of throwing.
+
+### Key management
+
+```js
+// before                                                    // now
+listKeys(token, offset, limit)                               listKeys(token, { offset, limit, returnPubkey })
+searchKeys(token, descr, offset, limit)        -> array      searchKeys(token, pattern, { match, offset, limit, type, mode, returnPubkey }) -> page
+getPubKey(token, kid)                                        getKeyPublicInfo(token, kid)
+createKeyPair(token, label, type, descrB64, mode)            createKeyPair(token, label, type, { descr, mode, returnPubkey })
+importPublicKey(token, label, type, pub, descrB64, mode)     importPublicKey(token, label, type, pub, { descr, mode })
+deriveKey(token, label, type, descrB64, kid, peerB64, mode)  deriveKey(token, label, type, kid, { pubkey, extKid, hkdfSalt, descr, mode, returnPubkey })
+updateKey(token, kid, label, descrB64)                       updateKey(token, kid, label, descr)
+```
+
+- **A description is bytes**, not base64: pass a `Uint8Array`, or a string,
+  which is taken as UTF-8 text. `null` / absent means none.
+- **Every key comes back in one shape** (`HemKey`): `type` is the key type
+  alone ('ED25519') and the device's flags are in `flags` (['ATT', 'PKEY',
+  'ExDSA']); `description`, `pubkey`, `der` are bytes or null. `createKeyPair`
+  and `deriveKey` return it too (with `kid`).
+- **`searchKeys` returns a page** like `listKeys`: `{ list, offset, total,
+  listed, deleted, invalid }`. Take `.list` where an array was used. Page on
+  from `offset + listed` (a page with public keys ends after 3 PQC keys), until
+  a page comes back empty. `match: 'suffix'` and `'contains'` are new.
+- **`listKeys` pages on `listed`**, not on `list.length`: a record that fails
+  its check takes a slot without being listed. The device gives at most 15 a page.
+- **`mode` is checked against the key type** (`bad_mode`): `ED25519` + `ECDH`
+  and `HPKE` (P-256/384/521, X25519, X448, ML-KEM) are allowed now; a mode on a
+  type that takes none (ED448, ML-DSA, AES, HMAC) throws instead of being sent.
+
+### System, upgrade, audit log
+
+| before | now |
+|---|---|
+| `usbMode(token)` | `rebootToUsbMode(token)` — it restarts the device |
+| `uploadFirmware(token, bytes, filename, opts)` | `uploadFirmware(token, bytes, { format, onProgress, signal })` — sent as `firmware.bin` / `firmware.hex` (Intel HEX detected) |
+| `uploadUi(token, bytes, filename, opts)` | `uploadUi(token, bytes, { onProgress, signal })` — sent as `webroot.tar` |
+| `getLoggerKey(token)` | `getLoggerKey(token, { nonce })` — pass a fresh nonce and check it with `verifyLoggerKey(answer, nonce)` |
+| `listLog(token, offset)` | `listLogFiles(token, { offset, limit })` — the open file is not listed, it is `current` |
+| `getLogEntry(token, id)` | `getLogFile(token, id)` — the open file is HTTP 409 (was 406) |
+| `verifyLogEntry(token, id)` | `verifyLogFile(token, id)` — proves the key with a nonce first; `keyProven` |
+| `authorizeRemote(scope, { expSeconds })` | `authorizeRemote(scope, { ctx, note })` — `ext/request` takes no `exp`; the phone's answer sets the token lifetime |
+| `getVersion()` → `{ hwv, blv, fwv, fws, conf }` | `{ hwv, fwv, fwk, fws, fwc?, blv?, blk?, bls?, blc?, uis? }`; `{ token }` adds `sd_csd` / `sd_cid` |
+
+`registerDomain(..., { newCertificate: false })` takes the attestation from
+`GET /api/system/config/attestation` (the auth challenge carries none, so it
+always failed). In Node, requests have no default timeout any more (it was
+15 s, shorter than an ML-DSA signature may take); pass `timeoutMs` where one
+is wanted.
+
+### Who this touches
+
+Fixed with the change: `encedo-manager`. To fix in the second pass:
+`encedo-oidc`, `encedo-chat`, `encedo-pgp`, `encedo-meet`, `www` — see the
+table in [CLAUDE.md](CLAUDE.md#downstream-compatibility-checked-2026-09-03).
+
+---
+
 # Upgrading to the merged SDK
 
 Everything the Manager needed was on `manager-v2` for a week; it is on `main`
