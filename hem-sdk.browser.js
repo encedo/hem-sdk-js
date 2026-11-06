@@ -134,15 +134,17 @@ async function httpRequest(method, url, {
       : (payload ?? '(none)'));
   }
 
-  // In Node.js, undici (built-in fetch) uses chunked transfer encoding by
-  // default, which some embedded devices reject with HTTP 411.
-  // Detect Node.js and use https.request directly to set Content-Length.
+  // In Node.js every request goes through https.request on a connection of
+  // its own. undici (the built-in fetch) sends bodies chunked, which the HEM
+  // answers with 411, and keeps connections in a pool: the HEM closes some
+  // after the answer while still saying keep-alive (a log file, a 409), and
+  // the next request on that socket fails as a network error.
   const isNode = typeof process !== 'undefined' && process.versions?.node;
 
   let status, resHeaders, data;
 
-  if (isNode && payload !== null) {
-    ({ status, headers: resHeaders, data } = await requestNode(method, url, headers, payload, { signal, timeoutMs, debug, tag }));
+  if (isNode) {
+    ({ status, headers: resHeaders, data } = await requestNode(method, url, headers, payload, { signal, timeoutMs, bytes, debug, tag }));
   } else if (onProgress && typeof XMLHttpRequest !== 'undefined') {
     ({ status, headers: resHeaders, data } = await requestXhr(method, url, headers, payload, { signal, timeoutMs, onProgress, bytes }));
   } else {
@@ -246,18 +248,17 @@ function requestXhr(method, url, headers, payload, { signal = null, timeoutMs = 
 }
 
 // Node.js-specific HTTP request using https.request (sets Content-Length explicitly)
-async function requestNode(method, url, headers, body, { signal = null, timeoutMs = 0, debug = false, tag = 'HEM' } = {}) {
+async function requestNode(method, url, headers, body, { signal = null, timeoutMs = 0, bytes = false, debug = false, tag = 'HEM' } = {}) {
   const { default: https } = await import('node:https');
   const { default: http } = await import('node:http');
   const { URL: NodeURL } = await import('node:url');
 
   const parsed = new NodeURL(url);
-  // body is a JSON string or a Uint8Array (binary upload) -- normalise to Buffer
-  const payloadBuf = typeof body === 'string' ? Buffer.from(body, 'utf8') : Buffer.from(body);
-  const reqHeaders = {
-    ...headers,
-    'Content-Length': payloadBuf.length.toString(),
-  };
+  // body is a JSON string, a Uint8Array (binary upload) or null -- normalise to Buffer
+  const payloadBuf = body === null ? null : typeof body === 'string' ? Buffer.from(body, 'utf8') : Buffer.from(body);
+  const reqHeaders = { ...headers };
+  if (payloadBuf) reqHeaders['Content-Length'] = payloadBuf.length.toString();
+  else delete reqHeaders['Content-Type'];
 
   if (debug) {
     console.debug(`[${tag}] reqNode headers sent:`, JSON.stringify(reqHeaders));
@@ -276,18 +277,20 @@ async function requestNode(method, url, headers, body, { signal = null, timeoutM
       // the engine and a firmware upload over a slow link takes longer still.
       ...(timeoutMs ? { timeout: timeoutMs } : {}),
     }, (res) => {
-      let raw = '';
-      res.setEncoding('utf8');
-      res.on('data', chunk => {
-        if (debug) console.debug(`[${tag}] res chunk:`, chunk);
-        raw += chunk;
-      });
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
       res.on('end', () => {
-        if (debug) console.debug(`[${tag}] res status:`, res.statusCode, 'raw:', raw);
+        const buf = Buffer.concat(chunks);
+        const raw = buf.toString('utf8');
+        if (debug) console.debug(`[${tag}] res status:`, res.statusCode, bytes ? `(${buf.length} bytes)` : `raw: ${raw}`);
         const resHeaders = res.headers;
         let data;
         const ct = res.headers['content-type'] ?? '';
-        if (ct.includes('json')) {
+        if (bytes && res.statusCode >= 200 && res.statusCode < 300) {
+          data = new Uint8Array(buf);
+        } else if (!buf.length) {
+          data = null;                                // an empty body, as fetch gives it
+        } else if (ct.includes('json')) {
           try { data = JSON.parse(raw); } catch { data = raw; }
         } else {
           data = raw;
@@ -311,7 +314,7 @@ async function requestNode(method, url, headers, body, { signal = null, timeoutM
       signal.addEventListener('abort', onAbort, { once: true });
       req.on('close', () => signal.removeEventListener('abort', onAbort));
     }
-    req.write(payloadBuf);
+    if (payloadBuf) req.write(payloadBuf);
     req.end();
   });
 }

@@ -138,6 +138,16 @@ node --test test/sdk.test.mjs
 `test/sdk.test.mjs` runs the SDK against an in-process mock of the device and
 the broker; the mock verifies the eJWT the SDK signs. No hardware needed.
 
+```bash
+node test/device.mjs [https://my.ence.do] [user password]
+```
+
+`test/device.mjs` runs every group against a real, personalised HEM (PPA,
+firmware 1.3): key types and modes, paging, all crypto calls checked against
+Node's own crypto, attestation with each PoP checked here and the device
+certificate chained to pki.encedo.com, the audit log. It makes its own keys
+(`SDK-TEST-*`) and deletes them; no reboot, wipe, upgrade or disk unlock.
+
 ## Security notes
 
 - Passwords are zeroed in memory immediately after key derivation.

@@ -65,9 +65,12 @@ here**, never in a downstream copy.
     data }`, so a poll can tell 202 "pending" from 200 "done".
   - Cancellation is uniform: an aborted request, an aborted poll and an aborted
     wait all reject with `HemError` code `aborted` (not a DOMException).
-  - In Node.js, requests with a body go through `#reqNode` (`https.request`
-    with an explicit `Content-Length`) — embedded devices reject `undici`'s
-    chunked encoding with HTTP 411. `#reqNode` accepts a string or `Uint8Array`.
+  - In Node.js every request goes through `requestNode` (`https.request`, a
+    connection of its own, an explicit `Content-Length`). `undici` (the
+    built-in fetch) sends bodies chunked, which the device answers with 411,
+    and pools connections: the device closes some after the answer while
+    saying keep-alive (a log file, a 409), and the next request on that
+    socket failed as `network` - seen on a PPA, 2026-11-06.
   - Non-2xx responses throw `HemError`.
 - Auth crypto helpers (module-level): `x25519*`, `toB64`/`toB64url`/`fromB64`,
   `strToBytes`, `jwtParse`. eJWT building is `#buildEjwt`; password→X25519 key
