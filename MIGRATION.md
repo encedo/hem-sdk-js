@@ -100,7 +100,8 @@ mldsaVerify(token, kid, data, sig)                       mldsaVerify(token, kid,
 - `cipherEncrypt`'s `iv` is never null.
 - New calls, no change for anyone: `xwingEncaps` / `xwingDecaps`, `hpkeSeal` /
   `hpkeOpen`, `kdf`, `otp` / `otpVerify`, `random`, `defragCheck` /
-  `defragStart`, `bootstrap`.
+  `defragStart`, `bootstrap`; attestation: `hem.attest` and the `Attest`
+  class (EXAMPLES.md, Attestation).
 
 ### Authentication and system
 

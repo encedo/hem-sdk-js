@@ -11,6 +11,8 @@
  *              pairing sessions, paired-authenticator lists, downloads, *.ence.do
  *              domains and TLS, provisioning, key sharing. One method per
  *              endpoint; HEM composes them with device calls.
+ *   Attest  -- attestation: the token and its proof of possession (pure Web
+ *              Crypto), the device certificate chain, attest.encedo.com.
  *   verifyLog, jwtParse -- pure helpers.
  *
  * Requires: Chrome 113+ / Firefox 130+ (X25519 in Web Crypto API), Node.js 18+
@@ -1473,6 +1475,45 @@ class HEM {
     }
     const path = nonce ? `/api/system/config/attestation/${toB64url(nonce)}` : '/api/system/config/attestation';
     return this.#req('GET', `${this.#baseUrl}${path}`, null, token);
+  }
+
+  /**
+   * An attestation JWT: the device signs (ES256, its device key - the
+   * secure element on a PPA, the attestation key on an EPA) who it is and,
+   * with `kid`, one of its keys, with a proof that it holds that key's
+   * private half. Attest.prepare() makes the request, Attest.verify() checks
+   * the answer.
+   *
+   * Any valid token (none before personalisation, then without kid); with
+   * kid: 'keymgmt:use:<kid>' and TLS.
+   *
+   * @param {string|null} token
+   * @param {object} request  As Attest.prepare() returns it:
+   * @param {Uint8Array} request.nonce  32..64 bytes, copied into the token
+   * @param {string} request.aud        The verifier, 1..64 printable ASCII
+   * @param {string} [request.kid]
+   * @param {boolean} [request.includeMetadata]  The key's label and description too
+   * @param {object} [request.popArgs]  {} = signature; { verifierEphPub } = ECDH-MAC;
+   *   { ciphertext } = ML-KEM MAC; { enc } = HPKE export (all bytes)
+   * @returns {Promise<string>}  The JWT
+   */
+  async attest(token, { nonce, aud, kid = null, includeMetadata = false, popArgs = null } = {}) {
+    if (!(nonce instanceof Uint8Array) || nonce.length < 32 || nonce.length > 64) {
+      throw new HemError('attest: nonce is 32..64 bytes', { code: 'invalid_arg' });
+    }
+    const body = { nonce: toB64(nonce), aud };
+    if (kid) body.kid = kid;
+    if (includeMetadata) body.include_metadata = true;
+    if (popArgs) {
+      const pop = {};
+      if (popArgs.verifierEphPub) pop.verifier_eph_pub = toB64(popArgs.verifierEphPub);
+      if (popArgs.ciphertext) pop.ciphertext = toB64(popArgs.ciphertext);
+      if (popArgs.enc) pop.enc = toB64(popArgs.enc);
+      body.pop_args = pop;
+    }
+    const ret = await this.#req('POST', `${this.#baseUrl}/api/system/config/attestation`, body, token);
+    if (typeof ret?.attestation !== 'string') throw new HemError('No attestation in the answer', { code: 'attest_error' });
+    return ret.attestation;
   }
 
   // -- Authorization: Remote (mobile push via broker) --------------------------
@@ -3122,5 +3163,466 @@ class HEM {
 
 }
 
-export { Broker, HEM, HemError, entropyToMnemonic, generateMnemonic, jwtParse, mnemonicToEntropy, validateMnemonic, verifyLog, verifyLoggerKey };
+// --- Attestation (attest.encedo.com) ---------------------------------------
+//
+// A HEM attests itself, and optionally one of its keys, with a JWT signed by
+// its device key (POST /api/system/config/attestation, HEM.attest()). Checking
+// it has three levels, from what needs nothing to what needs Encedo:
+//
+//   1      Attest.verify(): the token itself - ES256 by the key in its header,
+//          the header kid = hash of that key, the claims, and the key's proof
+//          of possession against a challenge from Attest.prepare(). Pure Web
+//          Crypto, no network.
+//   1_ext  attest.verifyDevice(): the device certificate (`crt` of
+//          HEM.getAttestation()) carries the same key and chains to the Encedo
+//          Root CA, pinned here by its SHA-256. The CA certificates come from
+//          attest.encedo.com/v1/pki (or are passed in); offline once fetched.
+//   2      attest.validate(): attest.encedo.com checks token and device
+//          against the issued-certificate registry and the revocation lists.
+//
+// Device certificates are not limited by their dates: a HEM cannot renew its
+// own. Revocation lists are checked by level 2 only. An EPA has no device
+// certificate yet; for it level 1 and level 2 are what there is.
+
+const ATTEST_ISS = 'https://attest.encedo.com';
+const ATTEST_TYP = 'encedo-attest+jwt';
+/** SHA-256 of the DER of the Encedo Root CA (pki.encedo.com). */
+const ENCEDO_ROOT_SHA256 = 'b28f4ee4cf26028260cf4f0db18bd2fb7234d172925797dca7f81e53a2816e9c';
+const POP_SIG = 'encedo-attest-pop:v1:sig';
+const POP_ECDH = 'encedo-attest-pop:v1:ecdh';
+
+// The NIST curves the PoP and the certificates use: WebCrypto names, sizes,
+// and the curve equation y^2 = x^3 - 3x + b (mod p) to decompress a point -
+// the device hands out compressed points, WebCrypto takes uncompressed ones.
+const NIST_CURVES = {
+  SECP256R1: {
+    name: 'P-256', size: 32, hash: 'SHA-256', oid: '1.2.840.10045.3.1.7',
+    p: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn,
+    b: 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn,
+  },
+  SECP384R1: {
+    name: 'P-384', size: 48, hash: 'SHA-384', oid: '1.3.132.0.34',
+    p: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffffn,
+    b: 0xb3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aefn,
+  },
+  SECP521R1: {
+    name: 'P-521', size: 66, hash: 'SHA-512', oid: '1.3.132.0.35',
+    p: (1n << 521n) - 1n,
+    b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b503f00n,
+  },
+};
+const CURVE_BY_OID = Object.fromEntries(Object.values(NIST_CURVES).map(c => [c.oid, c]));
+
+const toHex = (b) => Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+const bigOf = (b) => b.reduce((n, x) => (n << 8n) | BigInt(x), 0n);
+function bytesOf(n, size) {
+  const out = new Uint8Array(size);
+  for (let i = size - 1; i >= 0; i--) { out[i] = Number(n & 0xffn); n >>= 8n; }
+  return out;
+}
+function modPow(b, e, m) {
+  let r = 1n; b %= m;
+  for (; e > 0n; e >>= 1n) { if (e & 1n) r = (r * b) % m; b = (b * b) % m; }
+  return r;
+}
+const concat = (...parts) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+};
+
+/** A NIST point as 04 || x || y; a compressed one (02/03 || x) is decompressed. All three curves have p = 3 mod 4. */
+function uncompressPoint(curve, point) {
+  if (point[0] === 0x04) return point;
+  const { p, b, size } = curve;
+  const x = bigOf(point.subarray(1));
+  let y = modPow(((x * x * x - 3n * x + b) % p + p) % p, (p + 1n) / 4n, p);
+  if (Number(y & 1n) !== (point[0] & 1)) y = p - y;
+  return concat([0x04], bytesOf(x, size), bytesOf(y, size));
+}
+const compressPoint = (u) => concat([0x02 | (u[u.length - 1] & 1)], u.subarray(1, 1 + (u.length - 1) / 2));
+
+/** One field of the PoP canonical input: uint16 big-endian length, then the bytes. */
+const canonField = (bytes) => concat([bytes.length >> 8, bytes.length & 0xff], bytes);
+
+// -- a little DER: enough to read a certificate and check who signed it -------
+
+function derRead(buf, pos) {
+  let len = buf[pos + 1];
+  let hdr = 2;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + buf[pos + 2 + i];
+    hdr += n;
+  }
+  const start = pos + hdr;
+  if (start + len > buf.length) throw new HemError('DER: truncated', { code: 'bad_certificate' });
+  return { tag: buf[pos], content: buf.subarray(start, start + len), all: buf.subarray(pos, start + len), end: start + len };
+}
+function derItems(bytes) {
+  const out = [];
+  for (let p = 0; p < bytes.length;) { const e = derRead(bytes, p); out.push(e); p = e.end; }
+  return out;
+}
+function oidString(b) {
+  const out = [Math.floor(b[0] / 40), b[0] % 40];
+  for (let i = 1, v = 0; i < b.length; i++) {
+    v = v * 128 + (b[i] & 0x7f);
+    if (!(b[i] & 0x80)) { out.push(v); v = 0; }
+  }
+  return out.join('.');
+}
+/** The common name of a DER Name, for showing a chain. */
+function nameCN(name) {
+  for (const rdn of derItems(derRead(name, 0).content)) {
+    for (const atv of derItems(rdn.content)) {
+      const [oid, value] = derItems(atv.content);
+      if (oidString(oid.content) === '2.5.4.3') return new TextDecoder().decode(value.content);
+    }
+  }
+  return '';
+}
+
+function parseCertificate(der) {
+  const [tbs, sigAlg, sigValue] = derItems(derRead(der, 0).content);
+  const t = derItems(tbs.content);
+  const i = t[0].tag === 0xa0 ? 1 : 0;              // [0] version
+  const [algSeq, keyBits] = derItems(t[i + 5].content);
+  const alg = derItems(algSeq.content);
+  return {
+    der,
+    tbs: tbs.all,
+    sigAlg: oidString(derItems(sigAlg.content)[0].content),
+    sig: sigValue.content.subarray(1),              // BIT STRING: skip the unused-bits byte
+    issuer: t[i + 2].all,
+    subject: t[i + 4].all,
+    spki: t[i + 5].all,
+    keyAlg: oidString(alg[0].content),
+    keyParam: alg[1]?.tag === 0x06 ? oidString(alg[1].content) : null,
+    key: keyBits.content.subarray(1),
+  };
+}
+
+/** ECDSA signature: DER SEQUENCE { r, s } -> raw r || s, each `size` bytes. */
+function ecdsaDerToRaw(sig, size) {
+  const [r, s] = derItems(derRead(sig, 0).content).map(e => {
+    let v = e.content;
+    while (v.length > size && v[0] === 0) v = v.subarray(1);
+    return concat(new Uint8Array(size - v.length), v);
+  });
+  return concat(r, s);
+}
+
+const CERT_SIG = {
+  '1.2.840.10045.4.3.2': { kind: 'ECDSA', hash: 'SHA-256' },
+  '1.2.840.10045.4.3.3': { kind: 'ECDSA', hash: 'SHA-384' },
+  '1.2.840.10045.4.3.4': { kind: 'ECDSA', hash: 'SHA-512' },
+  '1.2.840.113549.1.1.11': { kind: 'RSA', hash: 'SHA-256' },
+  '1.2.840.113549.1.1.12': { kind: 'RSA', hash: 'SHA-384' },
+  '1.2.840.113549.1.1.13': { kind: 'RSA', hash: 'SHA-512' },
+};
+
+/** Did `parent`'s key sign `cert`? ECDSA (P-256/384/521) or RSA PKCS#1 v1.5. */
+async function certSignedBy(cert, parent) {
+  const alg = CERT_SIG[cert.sigAlg];
+  if (!alg) return false;
+  try {
+    if (alg.kind === 'ECDSA') {
+      const curve = CURVE_BY_OID[parent.keyParam];
+      if (!curve) return false;
+      const key = await crypto.subtle.importKey('spki', parent.spki, { name: 'ECDSA', namedCurve: curve.name }, false, ['verify']);
+      return await crypto.subtle.verify({ name: 'ECDSA', hash: alg.hash }, key, ecdsaDerToRaw(cert.sig, curve.size), cert.tbs);
+    }
+    const key = await crypto.subtle.importKey('spki', parent.spki, { name: 'RSASSA-PKCS1-v1_5', hash: alg.hash }, false, ['verify']);
+    return await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, cert.sig, cert.tbs);
+  } catch {
+    return false;
+  }
+}
+
+/** A certificate given as DER bytes, base64 DER or PEM. */
+function certBytes(c) {
+  if (c instanceof Uint8Array) return c;
+  const s = String(c);
+  const pem = /-----BEGIN CERTIFICATE-----([\s\S]+?)-----END CERTIFICATE-----/.exec(s);
+  return fromB64((pem ? pem[1] : s).replace(/\s+/g, ''));
+}
+
+/** The attestation JWT as text: the bare token, or the device's {"attestation": "..."} reply. */
+function attestationText(jwt) {
+  if (jwt && typeof jwt === 'object') return String(jwt.attestation ?? '');
+  const s = String(jwt ?? '').trim();
+  if (s.startsWith('{')) { try { return String(JSON.parse(s).attestation ?? ''); } catch { return ''; } }
+  return s;
+}
+
+const UUID4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+class Attest {
+  #url;
+  #debug;
+  #cas = null;
+
+  /**
+   * @param {string} [url='https://attest.encedo.com']
+   * @param {object} [opts]
+   * @param {boolean} [opts.debug=false]
+   */
+  constructor(url = ATTEST_ISS, { debug = false } = {}) {
+    this.#url = url.replace(/\/+$/, '');
+    this.#debug = debug;
+  }
+
+  get url() { return this.#url; }
+
+  #req(method, path, body = null) {
+    return httpRequest(method, `${this.#url}${path}`, { body, debug: this.#debug, tag: 'Attest' });
+  }
+
+  /**
+   * A fresh challenge for HEM.attest(): a 32-byte nonce, and for a PoP what
+   * the verifier side needs. Pass `request` to hem.attest() and keep `state`
+   * for verify() - it holds the verifier's ephemeral private key (as a
+   * non-extractable CryptoKey) for an ECDH PoP.
+   *
+   * PoP methods: 'sig' (keys that sign: NIST with ExDSA, Ed25519/Ed448,
+   * ML-DSA) and 'ecdh' (keys that agree: NIST with ECDH, X25519; give `curve`
+   * = the key's type). KEM and HPKE PoPs: TBD.
+   *
+   * @param {object} args
+   * @param {string} args.aud  Who is asking, 1..64 printable ASCII
+   * @param {string} [args.kid]  A key to attest along with the device
+   * @param {boolean} [args.includeMetadata=false]  Its label and description too
+   * @param {'sig'|'ecdh'|null} [args.pop]
+   * @param {'SECP256R1'|'SECP384R1'|'SECP521R1'|'CURVE25519'} [args.curve]  For 'ecdh'
+   * @returns {Promise<{request: object, state: object}>}
+   */
+  static async prepare({ aud, kid = null, includeMetadata = false, pop = null, curve = null } = {}) {
+    if (!aud) throw new HemError('prepare: aud is required', { code: 'invalid_arg' });
+    if (pop && !kid) throw new HemError('prepare: a proof of possession needs a kid', { code: 'invalid_arg' });
+    const nonce = crypto.getRandomValues(new Uint8Array(32));
+    const request = { nonce, aud };
+    const state = { aud, nonce, kid: kid?.toLowerCase() ?? null, pop };
+    if (kid) request.kid = kid;
+    if (includeMetadata) request.includeMetadata = true;
+    if (pop === 'sig') {
+      request.popArgs = {};
+    } else if (pop === 'ecdh') {
+      let eph, pub;
+      if (curve === 'CURVE25519') {
+        eph = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+        pub = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey));
+      } else if (NIST_CURVES[curve]) {
+        eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: NIST_CURVES[curve].name }, true, ['deriveBits']);
+        pub = compressPoint(new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey)));
+      } else {
+        throw new HemError(`prepare: an ECDH PoP needs curve SECP256R1, SECP384R1, SECP521R1 or CURVE25519 (others TBD), got ${curve}`, { code: 'invalid_arg' });
+      }
+      Object.assign(state, { curve, ephPriv: eph.privateKey, ephPub: pub });
+      request.popArgs = { verifierEphPub: pub };
+    } else if (pop) {
+      throw new HemError(`prepare: pop is 'sig' or 'ecdh' (KEM / HPKE: TBD), got ${pop}`, { code: 'invalid_arg' });
+    }
+    return { request, state };
+  }
+
+  /**
+   * Level 1: check an attestation token on its own - no network. Without
+   * `state` the token is checked for itself (signature, kid, issuer, shape);
+   * with the state from prepare() also that it answers that challenge (aud,
+   * nonce, the key, and its proof of possession).
+   *
+   * `ok` is false when any check failed (`failed` names them) - also when a
+   * requested PoP could not be checked here ('pop_unsupported': Ed448,
+   * secp256k1, ML-DSA, X448, ML-KEM, HPKE are TBD; level 2 or the CLI verifier
+   * does them). `expired` (past `exp` + leeway) is reported, not failed: the
+   * nonce already binds a token to its request. `point` is the device key
+   * (04 || x || y) for verifyDevice(); `skid` is what the manufacturer's
+   * registry is keyed by.
+   *
+   * @param {string|{attestation: string}} jwt  The token, or the device's reply
+   * @param {object|null} [state]  From prepare()
+   * @param {object} [opts]
+   * @param {number} [opts.now]  Unix seconds; default the local clock
+   * @param {number} [opts.leeway=300]
+   * @returns {Promise<{ok: boolean, failed: string[], expired: boolean, skid: string|null,
+   *          skid256: string|null, point: Uint8Array|null, header: object|null, claims: object|null,
+   *          pop: {method: string|null, result: 'ok'|'fail'|'unsupported'|'none'}}>}
+   */
+  static async verify(jwt, state = null, { now = Math.floor(Date.now() / 1000), leeway = 300 } = {}) {
+    const r = { ok: false, failed: [], expired: false, skid: null, skid256: null, point: null, header: null, claims: null, pop: { method: null, result: 'none' } };
+    const check = (name, pass) => { if (!pass) r.failed.push(name); return pass; };
+    const parts = attestationText(jwt).split('.');
+    if (!check('format', parts.length === 3)) return r;
+    try {
+      r.header = JSON.parse(new TextDecoder().decode(fromB64(parts[0])));
+      r.claims = JSON.parse(new TextDecoder().decode(fromB64(parts[1])));
+    } catch { check('format', false); return r; }
+    const h = r.header, c = r.claims;
+
+    // The device key: header jwk, kid = its hash, ES256 over header.body.
+    check('alg', h.alg === 'ES256');
+    check('typ', h.typ === ATTEST_TYP);
+    const x = h.jwk?.x ? fromB64(h.jwk.x) : null, y = h.jwk?.y ? fromB64(h.jwk.y) : null;
+    if (!check('jwk', h.jwk?.kty === 'EC' && h.jwk?.crv === 'P-256' && x?.length === 32 && y?.length === 32)) return r;
+    r.point = concat([0x04], x, y);
+    r.skid = toHex(new Uint8Array(await crypto.subtle.digest('SHA-1', r.point)));
+    r.skid256 = toHex(await sha256(r.point));
+    check('kid', [r.skid, r.skid256].includes(String(h.kid ?? '').toLowerCase()));
+    const devKey = await crypto.subtle.importKey('raw', r.point, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    const sig = fromB64(parts[2]);
+    check('signature', sig.length === 64 && await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, devKey, sig, strToBytes(`${parts[0]}.${parts[1]}`)));
+
+    // The claims.
+    check('iss', c.iss === ATTEST_ISS);
+    check('times', Number.isInteger(c.iat) && Number.isInteger(c.exp) && c.iat < c.exp);
+    r.expired = Number.isInteger(c.exp) && now > c.exp + leeway;
+    check('jti', UUID4.test(String(c.jti ?? '')));
+    check('device', typeof c.device?.hwv === 'string' && typeof c.device?.fwv === 'string');
+    if (state) {
+      check('aud', c.aud === state.aud);
+      check('nonce', typeof c.nonce === 'string' && bytesEqual(fromB64(c.nonce), state.nonce));
+    }
+    if (state?.kid) {
+      check('key', c.key?.kid?.toLowerCase() === state.kid);
+      if (state.pop) await Attest.#checkPop(r, c, state, check);
+    }
+    r.ok = r.failed.length === 0;
+    return r;
+  }
+
+  static async #checkPop(r, c, state, check) {
+    const type = c.key?.type;
+    const pub = b64OrNull(c.key?.pubkey?.primary);
+    const aud = strToBytes(state.aud);
+    if (state.pop === 'sig') {
+      r.pop.method = 'signature';
+      const sig = b64OrNull(c.pop?.signature);
+      if (!check('pop', sig && pub)) { r.pop.result = 'fail'; return; }
+      const msg = concat(canonField(strToBytes(POP_SIG)), canonField(aud), canonField(pub), canonField(state.nonce));
+      let key, alg;
+      if (NIST_CURVES[type]) {
+        const curve = NIST_CURVES[type];
+        key = await crypto.subtle.importKey('raw', uncompressPoint(curve, pub), { name: 'ECDSA', namedCurve: curve.name }, false, ['verify']);
+        alg = { name: 'ECDSA', hash: curve.hash };
+      } else if (type === 'ED25519') {
+        key = await crypto.subtle.importKey('raw', pub, { name: 'Ed25519' }, false, ['verify']);
+        alg = { name: 'Ed25519' };
+      } else {
+        r.pop.result = 'unsupported';
+        check('pop_unsupported', false);
+        return;
+      }
+      r.pop.result = await crypto.subtle.verify(alg, key, sig, msg) ? 'ok' : 'fail';
+      check('pop', r.pop.result === 'ok');
+      return;
+    }
+    // ECDH-MAC: our ephemeral key and the attested key agree a secret; the MAC
+    // under a key derived from it proves the HEM holds the private half.
+    r.pop.method = 'mac';
+    const mac = b64OrNull(c.pop?.mac);
+    if (!check('pop', mac?.length === 32 && pub)) { r.pop.result = 'fail'; return; }
+    let ss;
+    try {
+      if (state.curve === 'CURVE25519') {
+        ss = await x25519(state.ephPriv, pub);
+      } else {
+        const curve = NIST_CURVES[state.curve];
+        const peer = await crypto.subtle.importKey('raw', uncompressPoint(curve, pub), { name: 'ECDH', namedCurve: curve.name }, false, []);
+        ss = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: peer }, state.ephPriv, curve.size * 8));
+      }
+    } catch {
+      r.pop.result = 'fail'; check('pop', false); return;
+    }
+    const info = concat(canonField(strToBytes(POP_ECDH)), canonField(aud), canonField(pub));
+    const ikm = await crypto.subtle.importKey('raw', ss, 'HKDF', false, ['deriveBits']);
+    const macKey = new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: state.nonce, info }, ikm, 256));
+    const hk = await crypto.subtle.importKey('raw', macKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const want = new Uint8Array(await crypto.subtle.sign('HMAC', hk, concat(info, canonField(state.nonce), canonField(state.ephPub))));
+    r.pop.result = bytesEqual(want, mac) ? 'ok' : 'fail';
+    check('pop', r.pop.result === 'ok');
+  }
+
+  /**
+   * Level 1_ext: the device certificate carries the attested key and chains to
+   * the Encedo Root CA (its SHA-256 pinned). `point` is verify()'s `point`.
+   * The CA certificates come from pki() unless passed in `cas` (PEM, base64
+   * DER or bytes) - so after one fetch this runs offline. Certificate dates
+   * and revocation are not checked here (see the note above the class).
+   *
+   * @param {Uint8Array} point  The device key, 04 || x || y
+   * @param {string|Uint8Array} crt  `crt` of HEM.getAttestation() (base64 DER), PEM or bytes
+   * @param {object} [opts]
+   * @param {Array<string|Uint8Array>} [opts.cas]
+   * @param {string} [opts.rootSha256=ENCEDO_ROOT_SHA256]
+   * @returns {Promise<{ok: boolean, chain: string[], reason?: 'certificate'|'key'|'issuer'|'signature'|'root'}>}
+   *          `chain`: the common names from the device up to the root
+   */
+  async verifyDevice(point, crt, { cas = null, rootSha256 = ENCEDO_ROOT_SHA256 } = {}) {
+    let cert;
+    try { cert = parseCertificate(certBytes(crt)); } catch { return { ok: false, chain: [], reason: 'certificate' }; }
+    const chain = [nameCN(cert.subject)];
+    const key = cert.keyAlg === '1.2.840.10045.2.1' && cert.keyParam === NIST_CURVES.SECP256R1.oid ? uncompressPoint(NIST_CURVES.SECP256R1, cert.key) : null;
+    if (!key || !point || !bytesEqual(key, point)) return { ok: false, chain, reason: 'key' };
+
+    const pool = (cas ?? (await this.pki()).map(e => e.pem)).map(c => parseCertificate(certBytes(c)));
+    for (let depth = 0; depth < 6; depth++) {
+      const parent = pool.find(p => bytesEqual(p.subject, cert.issuer));
+      if (!parent) return { ok: false, chain, reason: 'issuer' };
+      if (!await certSignedBy(cert, parent)) return { ok: false, chain, reason: 'signature' };
+      if (parent === cert) {
+        // Self-signed: the end of the chain, and it must be the pinned root.
+        const fp = toHex(await sha256(parent.der));
+        return fp === rootSha256 ? { ok: true, chain } : { ok: false, chain, reason: 'root' };
+      }
+      chain.push(nameCN(parent.subject));
+      cert = parent;
+    }
+    return { ok: false, chain, reason: 'issuer' };
+  }
+
+  /**
+   * Level 2: attest.encedo.com checks the token and the device - with `crt`
+   * the certificate (chain, revocation lists, its key = the token's), without
+   * it its registry of issued certificates. It says only the verdict.
+   *
+   * @param {string|{attestation: string}} jwt
+   * @param {object} [opts]
+   * @param {string|Uint8Array} [opts.crt]  The device certificate
+   * @returns {Promise<{status: 'valid'|'valid_unverified'|'invalid', expired?: boolean}>}
+   */
+  async validate(jwt, { crt = null } = {}) {
+    const body = { jwt: attestationText(jwt) };
+    if (crt) body.crt = crt instanceof Uint8Array ? toB64(crt) : crt;
+    return this.#req('POST', '/v1/validate', body);
+  }
+
+  /**
+   * Does Encedo know this device key (an issued, not revoked certificate)?
+   * Only the SKID leaves the caller.
+   *
+   * @param {string} skid  verify()'s `skid` (SHA-1, 40 hex) or `skid256` (64 hex)
+   * @returns {Promise<boolean>}
+   */
+  async skidKnown(skid) {
+    if (!/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(skid)) throw new HemError('skidKnown: 40 or 64 hex characters', { code: 'invalid_arg' });
+    return (await this.#req('GET', `/v1/skid/${skid.toLowerCase()}`))?.known === true;
+  }
+
+  /**
+   * The Encedo CA certificates (root, attestation, custody), fetched once and
+   * kept. Trust comes from the pinned root fingerprint, not from where they
+   * were fetched.
+   *
+   * @returns {Promise<Array<{subject: string, issuer: string, not_after: number, sha256: string, pem: string}>>}
+   */
+  async pki() {
+    if (!this.#cas) this.#cas = (await this.#req('GET', '/v1/pki'))?.certificates ?? [];
+    return this.#cas;
+  }
+}
+
+export { Attest, Broker, ENCEDO_ROOT_SHA256, HEM, HemError, entropyToMnemonic, generateMnemonic, jwtParse, mnemonicToEntropy, validateMnemonic, verifyLog, verifyLoggerKey };
 //# sourceMappingURL=hem-sdk.browser.js.map

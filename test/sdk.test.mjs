@@ -8,7 +8,9 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { HEM, Broker, HemError, jwtParse, verifyLog, verifyLoggerKey, generateMnemonic, entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '../hem-sdk.js';
+import nodeCrypto from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { HEM, Broker, Attest, HemError, jwtParse, verifyLog, verifyLoggerKey, generateMnemonic, entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '../hem-sdk.js';
 
 const b64 = (bytes) => Buffer.from(bytes).toString('base64');
 const b64url = (bytes) => Buffer.from(bytes).toString('base64url');
@@ -84,6 +86,7 @@ async function handle(req, res) {
     if (!req.headers.authorization) return json(res, 200, body.att ? { att: { csr: b64([0x30, 0x82]) } } : undefined);   // bootstrap
     return json(res, 200, { updated: true, received: body });
   }
+  if (path === '/dev/api/system/config/attestation' && req.method === 'POST') return json(res, 200, { attestation: 'eyJ.x.y' });
   if (path.startsWith('/dev/api/system/config/attestation')) return json(res, 200, state.provisioned ? { genuine: 'GEN' } : { genuine: 'GEN', csr: 'CSR', key: 'KEY' });
   if (path === '/dev/api/system/config/provisioning') { state.provisioned = true; return json(res, 200, { installed: true }); }
   if (path === '/dev/api/auth/token' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-1' });   // no genuine: only auth/init has one
@@ -158,6 +161,14 @@ async function handle(req, res) {
     return json(res, 200, { key: state.loggerKeyB64, nonce: state.loggerNonce, nonce_signed: state.loggerNonceSig });
   }
   if (path.startsWith('/dev/api/logger/')) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(state.logText); }
+
+  // ---- attest.encedo.com -------------------------------------------------------
+  if (path === '/att/v1/validate') return json(res, 200, { status: 'valid', expired: false });
+  if (path.startsWith('/att/v1/skid/')) return json(res, 200, { known: true });
+  if (path === '/att/v1/pki') {
+    const PKIs = JSON.parse(readFileSync(new URL('./attest-test-pki.json', import.meta.url), 'utf8'));
+    return json(res, 200, { certificates: [PKIs.root, PKIs.attestation, PKIs.custody].map((pem) => ({ subject: 'CN', issuer: 'CN', not_after: 0, sha256: '', pem })) });
+  }
 
   // ---- broker ------------------------------------------------------------------
   if (path === '/brk/checkin') { assert.equal(body.check, 'c1'); return json(res, 200, { checked: 'ok' }); }
@@ -825,6 +836,152 @@ test('bootstrap of a device out of the box: tls, and the EPA attestation key', a
   assert.deepEqual(await hem.bootstrap({ tls: { pkey: 'K', crt: 'C' } }), { csr: null });
   await assert.rejects(hem.bootstrap({ att: { seed: new Uint8Array(16), epoch: 0 } }), (e) => e.code === 'invalid_arg');
   await assert.rejects(hem.bootstrap({}), (e) => e.code === 'invalid_arg');
+});
+
+// ---- attestation -------------------------------------------------------------------
+// Tokens built the way the firmware builds them (api_system.c attestation_jwt_sign,
+// hem_pop_*), signed with the device key of a TEST PKI (test/attest-test-pki.json).
+const mockLog = () => state.log;   // the tests below name their own `state` (the verifier's)
+const PKI = JSON.parse(readFileSync(new URL('./attest-test-pki.json', import.meta.url), 'utf8'));
+const u16 = (b) => Buffer.concat([Buffer.from([b.length >> 8, b.length & 0xff]), Buffer.from(b)]);
+const uuid4 = () => { const h = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex'); return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`; };
+
+async function deviceToken({ state, key = null, pop = null, tamper = null, iat = Math.floor(Date.now() / 1000) }) {
+  const priv = await crypto.subtle.importKey('pkcs8', Buffer.from(PKI.devicePkcs8, 'base64'), { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+  const jwk = await crypto.subtle.exportKey('jwk', priv);
+  const point = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]);
+  const header = { alg: 'ES256', typ: 'encedo-attest+jwt', kid: nodeCrypto.createHash('sha1').update(point).digest('hex'), jwk: { kty: 'EC', crv: 'P-256', x: jwk.x, y: jwk.y } };
+  const body = { iss: 'https://attest.encedo.com', aud: state.aud, iat, exp: iat + 300, nonce: b64(state.nonce), jti: uuid4(),
+    device: { hwv: 'PPA rev 2.2', fwv: 'Encedo nGINE FW v1.3.0', blv: 'bl', assurance: 'hard', cc_mode: 0, policy: [] } };
+  if (key) body.key = key;
+  if (pop) body.pop = pop;
+  if (tamper) tamper(body);
+  const input = `${b64url(Buffer.from(JSON.stringify(header)))}.${b64url(Buffer.from(JSON.stringify(body)))}`;
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, priv, Buffer.from(input)));
+  return { jwt: `${input}.${b64url(sig)}`, point: new Uint8Array(point) };
+}
+
+test('Attest.prepare / hem.attest / Attest.verify: the token and a signature PoP', async () => {
+  const { request, state } = await Attest.prepare({ aud: 'bank-7', kid: '00112233445566778899AABBCCDDEEFF', includeMetadata: true, pop: 'sig' });
+  assert.equal(request.nonce.length, 32);
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'keymgmt:use:00112233445566778899AABBCCDDEEFF');
+  await hem.attest(token, request);
+  assert.deepEqual(mockLog().at(-1).body, { nonce: b64(request.nonce), aud: 'bank-7', kid: '00112233445566778899AABBCCDDEEFF', include_metadata: true, pop_args: {} });
+
+  // Ed25519 key, pure EdDSA over prefix | aud | pubkey | nonce
+  const ed = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+  const edPub = new Uint8Array(await crypto.subtle.exportKey('raw', ed.publicKey));
+  const canon = Buffer.concat([u16(Buffer.from('encedo-attest-pop:v1:sig')), u16(Buffer.from('bank-7')), u16(edPub), u16(state.nonce)]);
+  const edSig = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, ed.privateKey, canon));
+  const key = { kid: '00112233445566778899aabbccddeeff', type: 'ED25519', modes: ['ExDSA'], pubkey: { primary: b64(edPub) } };
+  const { jwt, point } = await deviceToken({ state, key, pop: { signature: b64(edSig) } });
+
+  const r = await Attest.verify(jwt, state);
+  assert.deepEqual(r.failed, []);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.pop, { method: 'signature', result: 'ok' });
+  assert.equal(r.expired, false);
+  assert.deepEqual(r.point, point);
+  assert.equal(r.skid, nodeCrypto.createHash('sha1').update(point).digest('hex'));
+  assert.equal((await Attest.verify({ attestation: jwt }, state)).ok, true, 'the device reply works as well');
+  assert.equal((await Attest.verify(jwt)).ok, true, 'without a state: the token for itself');
+
+  const other = await Attest.prepare({ aud: 'bank-7', kid: key.kid, pop: 'sig' });
+  assert.deepEqual((await Attest.verify(jwt, other.state)).failed, ['nonce', 'pop'], 'another challenge: wrong nonce, and the PoP covers the nonce');
+  const forged = await deviceToken({ state, key, pop: { signature: b64(edSig) }, tamper: (b) => { b.aud = 'bank-8'; } });
+  assert.deepEqual((await Attest.verify(forged.jwt, state)).failed, ['aud'], 'the PoP is over our aud, which the device signed');
+  const parts = jwt.split('.');
+  const resigned = `${parts[0]}.${b64url(Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(parts[1], 'base64url')), aud: 'x' })))}.${parts[2]}`;
+  assert.ok((await Attest.verify(resigned)).failed.includes('signature'), 'a changed body breaks the device signature');
+  const old = await deviceToken({ state, key, pop: { signature: b64(edSig) }, iat: Math.floor(Date.now() / 1000) - 3600 });
+  const late = await Attest.verify(old.jwt, state);
+  assert.equal(late.ok, true);
+  assert.equal(late.expired, true, 'expired is reported, not failed');
+});
+
+test('Attest.verify: ECDSA signature PoP on P-384 / P-521 (compressed keys), the rest TBD', async () => {
+  for (const [type, curve, hash, size] of [['SECP384R1', 'P-384', 'SHA-384', 48], ['SECP521R1', 'P-521', 'SHA-512', 66], ['SECP256R1', 'P-256', 'SHA-256', 32]]) {
+    const { state } = await Attest.prepare({ aud: 'a', kid: '00112233445566778899aabbccddeeff', pop: 'sig' });
+    const k = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: curve }, true, ['sign', 'verify']);
+    const raw = new Uint8Array(await crypto.subtle.exportKey('raw', k.publicKey));
+    const compressed = Buffer.concat([Buffer.from([2 | (raw[raw.length - 1] & 1)]), raw.subarray(1, 1 + size)]);
+    const canon = Buffer.concat([u16(Buffer.from('encedo-attest-pop:v1:sig')), u16(Buffer.from('a')), u16(compressed), u16(state.nonce)]);
+    const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash }, k.privateKey, canon));
+    const key = { kid: state.kid, type, modes: ['ExDSA'], pubkey: { primary: b64(compressed) } };
+    const r = await Attest.verify((await deviceToken({ state, key, pop: { signature: b64(sig) } })).jwt, state);
+    assert.deepEqual(r.pop, { method: 'signature', result: 'ok' }, type);
+  }
+  const { state } = await Attest.prepare({ aud: 'a', kid: '00112233445566778899aabbccddeeff', pop: 'sig' });
+  const key = { kid: state.kid, type: 'MLDSA65', modes: ['MLDSA'], pubkey: { primary: b64(new Uint8Array(1952)) } };
+  const r = await Attest.verify((await deviceToken({ state, key, pop: { signature: b64(new Uint8Array(3309)) } })).jwt, state);
+  assert.deepEqual(r.pop, { method: 'signature', result: 'unsupported' });
+  assert.deepEqual(r.failed, ['pop_unsupported'], 'not checked is not ok');
+});
+
+test('Attest.verify: ECDH-MAC PoP on X25519 and P-256', async () => {
+  for (const curve of ['CURVE25519', 'SECP256R1']) {
+    const { request, state } = await Attest.prepare({ aud: 'vpn', kid: '00112233445566778899aabbccddeeff', pop: 'ecdh', curve });
+    assert.deepEqual(request.popArgs.verifierEphPub, state.ephPub);
+    // The device side, by node:crypto: its key pair, the shared secret with our ephemeral key, the MAC.
+    let devPub, ss;
+    if (curve === 'CURVE25519') {
+      const kp = nodeCrypto.generateKeyPairSync('x25519');
+      devPub = kp.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+      const eph = nodeCrypto.createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), state.ephPub]), format: 'der', type: 'spki' });
+      ss = nodeCrypto.diffieHellman({ privateKey: kp.privateKey, publicKey: eph });
+    } else {
+      const ecdh = nodeCrypto.createECDH('prime256v1');
+      ecdh.generateKeys();
+      devPub = ecdh.getPublicKey(null, 'compressed');
+      ss = ecdh.computeSecret(Buffer.from(state.ephPub));       // our key comes compressed, as the API wants it
+    }
+    const info = Buffer.concat([u16(Buffer.from('encedo-attest-pop:v1:ecdh')), u16(Buffer.from('vpn')), u16(devPub)]);
+    const macKey = Buffer.from(nodeCrypto.hkdfSync('sha256', ss, state.nonce, info, 32));
+    const mac = nodeCrypto.createHmac('sha256', macKey).update(Buffer.concat([info, u16(state.nonce), u16(state.ephPub)])).digest();
+    const key = { kid: state.kid, type: curve, modes: ['ECDH'], pubkey: { primary: b64(devPub) } };
+    const r = await Attest.verify((await deviceToken({ state, key, pop: { mac: b64(mac) } })).jwt, state);
+    assert.deepEqual(r.pop, { method: 'mac', result: 'ok' }, curve);
+    assert.equal(r.ok, true);
+    mac[0] ^= 1;
+    assert.deepEqual((await Attest.verify((await deviceToken({ state, key, pop: { mac: b64(mac) } })).jwt, state)).pop, { method: 'mac', result: 'fail' });
+  }
+  await assert.rejects(Attest.prepare({ aud: 'a', kid: '00112233445566778899aabbccddeeff', pop: 'ecdh', curve: 'CURVE448' }), (e) => e.code === 'invalid_arg');
+  await assert.rejects(Attest.prepare({ aud: 'a', pop: 'sig' }), (e) => e.code === 'invalid_arg', 'a PoP needs a key');
+});
+
+test('Attest.verifyDevice: the certificate holds the token key and chains to the pinned root', async () => {
+  const { state } = await Attest.prepare({ aud: 'x' });
+  const { jwt, point } = await deviceToken({ state });
+  const r = await Attest.verify(jwt, state);
+  const attest = new Attest(`${base}/att`);
+  const cas = [PKI.root, PKI.attestation, PKI.custody];
+  const ok = await attest.verifyDevice(r.point, PKI.device, { cas, rootSha256: PKI.rootSha256 });
+  assert.deepEqual(ok, { ok: true, chain: ['#0123TESTDEVICE', 'Encedo TEST Custody CA', 'Encedo TEST Attestation CA', 'Encedo TEST Root CA'] });
+  assert.equal((await attest.verifyDevice(point, Buffer.from(PKI.device, 'base64'), { cas, rootSha256: PKI.rootSha256 })).ok, true, 'DER bytes too');
+
+  assert.equal((await attest.verifyDevice(r.point, PKI.device, { cas })).reason, 'root', 'the real Encedo root is pinned by default');
+  assert.equal((await attest.verifyDevice(r.point, PKI.device, { cas: [PKI.root, PKI.custody], rootSha256: PKI.rootSha256 })).reason, 'issuer');
+  const wrongKey = new Uint8Array(point); wrongKey[5] ^= 1;
+  assert.equal((await attest.verifyDevice(wrongKey, PKI.device, { cas, rootSha256: PKI.rootSha256 })).reason, 'key', 'a certificate for another key');
+  const tampered = Buffer.from(PKI.device, 'base64'); tampered[tampered.length - 80] ^= 1;   // inside the signature
+  assert.equal((await attest.verifyDevice(r.point, tampered, { cas, rootSha256: PKI.rootSha256 })).reason, 'signature');
+  assert.equal((await attest.verifyDevice(r.point, 'not a certificate', { cas })).reason, 'certificate');
+
+  // Without cas the CA certificates come from attest.encedo.com /v1/pki, once.
+  const before = mockLog().length;
+  assert.equal((await attest.verifyDevice(r.point, PKI.device, { rootSha256: PKI.rootSha256 })).ok, true);
+  await attest.verifyDevice(r.point, PKI.device, { rootSha256: PKI.rootSha256 });
+  assert.equal(mockLog().slice(before).filter((l) => l.path === '/att/v1/pki').length, 1);
+});
+
+test('Attest level 2: validate and skidKnown at attest.encedo.com', async () => {
+  const attest = new Attest(`${base}/att`);
+  assert.deepEqual(await attest.validate({ attestation: 'J.W.T' }, { crt: new Uint8Array([1, 2]) }), { status: 'valid', expired: false });
+  assert.deepEqual(mockLog().at(-1).body, { jwt: 'J.W.T', crt: b64([1, 2]) });
+  assert.equal(await attest.skidKnown('ABCDEF0123456789abcdef0123456789abcdef01'), true);
+  assert.equal(mockLog().at(-1).path, '/att/v1/skid/abcdef0123456789abcdef0123456789abcdef01');
+  await assert.rejects(attest.skidKnown('xyz'), (e) => e.code === 'invalid_arg');
 });
 
 const VECTORS = [

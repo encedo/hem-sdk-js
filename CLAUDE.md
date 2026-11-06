@@ -27,9 +27,11 @@ here**, never in a downstream copy.
 
 ## Architecture
 
-- Two classes, `HEM` (the device) and `Broker` (the backend at
-  api.encedo.com), plus `HemError`, plus the exported helpers `verifyLog` and
-  `jwtParse`. **Every call to api.encedo.com lives in `Broker`, one method per
+- Three classes, `HEM` (the device), `Broker` (the backend at
+  api.encedo.com) and `Attest` (attestation: the token checked here, the
+  device certificate chain, and attest.encedo.com - a separate service from
+  the broker, so every call to it lives in `Attest`), plus `HemError`, plus
+  the exported helpers `verifyLog` and `jwtParse`. **Every call to api.encedo.com lives in `Broker`, one method per
   endpoint.** `HEM` holds one (`hem.broker`, built from `opts.broker`, a URL or
   an instance) and composes broker calls with device calls in the multi-step
   flows (`hemCheckin`, `authorizeRemote`, `registerExtAuth`, `listExtAuth`,

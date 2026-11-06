@@ -81,6 +81,7 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | **Audit log** | `getLoggerKey` (with a nonce of ours), `listLogFiles`, `getLogFile`, `verifyLogFile` |
 | **Cache** | `clearCache`, `clearKeys` |
 | **Broker** (`hem.broker`) | `checkin`, `session`, `eventNew`/`eventCheck`/`eventDelete`/`waitEvent`, `registerInit`/`registerCheck`/`registerFinalise`/`waitRegistration`, `subscribersList`/`subscribersDelete`, `download`, `domainPredefs`/`domainTaken`/`domainRegister`/`domainStatus`/`waitDomain`, `provisioning`, `shareEmailPubkey` |
+| **Attestation** (`Attest`, `hem.attest`) | `Attest.prepare` (challenge), `hem.attest` (the device signs), `Attest.verify` (token + PoP, no network), `attest.verifyDevice` (certificate chain to the pinned Encedo root), `attest.validate` / `skidKnown` / `pki` (attest.encedo.com) |
 | **Helpers** (exported functions) | `verifyLog` (audit log, format v2, pure Web Crypto), `verifyLoggerKey` (the device signed the nonce it sent with the key), `jwtParse` |
 
 ### The master secret

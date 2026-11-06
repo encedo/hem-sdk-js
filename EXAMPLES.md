@@ -610,6 +610,43 @@ await hem.broker.shareEmailPubkey('bob@example.com', shareCode);   // shareCode:
 
 ---
 
+## Attestation
+
+A HEM signs who it is, and one of its keys with a proof that it holds the
+private half, in a JWT. Checking it has three levels:
+
+```js
+import { HEM, Attest } from './hem-sdk.js';
+
+// The verifier makes a challenge; the HEM answers it.
+const { request, state } = await Attest.prepare({ aud: 'bank.example', kid, pop: 'sig' });
+const jwt = await hem.attest(await hem.authorizePassword(pw, `keymgmt:use:${kid}`), request);
+
+// 1. The token itself: device signature, kid, claims, our nonce, the key's PoP. No network.
+const r = await Attest.verify(jwt, state);   // { ok, failed, expired, skid, point, claims, pop }
+if (!r.ok) throw new Error(`attestation: ${r.failed.join(', ')}`);
+
+// 1_ext. The device certificate carries that key and chains to the Encedo Root CA
+//        (pinned by its SHA-256); the CA certificates are fetched once.
+const attest = new Attest();                  // https://attest.encedo.com
+const { crt } = await hem.getAttestation(token);
+const dev = await attest.verifyDevice(r.point, crt);   // { ok, chain }
+
+// 2. attest.encedo.com: the registry of issued certificates and the revocation lists.
+const { status } = await attest.validate(jwt, { crt });   // valid | valid_unverified | invalid
+const known = await attest.skidKnown(r.skid);              // only the SKID leaves the client
+```
+
+An ECDH PoP (keys that agree, not sign) needs the key's curve:
+`Attest.prepare({ aud, kid, pop: 'ecdh', curve: 'CURVE25519' })`. Checked
+here: signatures of P-256/384/521 and Ed25519, ECDH-MAC of P-256/384/521 and
+X25519. Ed448, secp256k1, ML-DSA, X448, ML-KEM and HPKE PoPs are TBD; a token
+asking for one is not `ok` here (`pop_unsupported`) — level 2 or the
+`attest_verify` CLI check them. An EPA has no device certificate yet: level 1
+and level 2 only.
+
+---
+
 ## Error handling
 
 ```js

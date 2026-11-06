@@ -239,6 +239,8 @@ export declare class HEM {
     onEvent?: (eventid: string) => void;
   }): Promise<string>;
 
+  /** An attestation JWT for the device (and a key with its PoP); Attest.prepare() makes `request`. Any valid token; with kid keymgmt:use:<kid>. */
+  attest(token: string | null, request: AttestRequest): Promise<string>;
   /** Device certificate and attestation token; with `nonce` (32..64 B) the token is bound to this request. Any valid token. */
   getAttestation(token: string | null, opts?: { nonce?: Uint8Array | null }): Promise<{ genuine: string; crt?: string; csr?: string; key?: string }>;
 
@@ -427,4 +429,69 @@ export declare class HEM {
   readonly tokens: Array<{ scope: HemScope; exp: number }>;
   /** Discard cached derived keys and all JWT tokens (call on logout). */
   clearKeys(): void;
+}
+
+/** SHA-256 of the DER of the Encedo Root CA, pinned by Attest.verifyDevice(). */
+export declare const ENCEDO_ROOT_SHA256: string;
+
+export interface AttestRequest {
+  nonce: Uint8Array;
+  aud: string;
+  kid?: string;
+  includeMetadata?: boolean;
+  /** {} = signature PoP; verifierEphPub = ECDH-MAC; ciphertext = ML-KEM MAC; enc = HPKE export. */
+  popArgs?: { verifierEphPub?: Uint8Array; ciphertext?: Uint8Array; enc?: Uint8Array };
+}
+
+/** What Attest.prepare() keeps for Attest.verify(); holds the verifier's ephemeral private key for an ECDH PoP. */
+export interface AttestState {
+  aud: string;
+  nonce: Uint8Array;
+  kid: string | null;
+  pop: 'sig' | 'ecdh' | null;
+  curve?: string;
+  ephPriv?: CryptoKey;
+  ephPub?: Uint8Array;
+}
+
+export interface AttestVerification {
+  /** Every check passed - a PoP that could not be checked here ('pop_unsupported') is not ok. */
+  ok: boolean;
+  /** Names of the failed checks: format, alg, typ, jwk, kid, signature, iss, times, jti, device, aud, nonce, key, pop, pop_unsupported. */
+  failed: string[];
+  /** Past exp + leeway; reported, not failed. */
+  expired: boolean;
+  /** SHA-1 / SHA-256 of the device key, hex: what the manufacturer registry is keyed by. */
+  skid: string | null;
+  skid256: string | null;
+  /** The device key, 04 || x || y, for verifyDevice(). */
+  point: Uint8Array | null;
+  header: Record<string, any> | null;
+  claims: Record<string, any> | null;
+  pop: { method: 'signature' | 'mac' | null; result: 'ok' | 'fail' | 'unsupported' | 'none' };
+}
+
+/**
+ * Attestation, in three levels: verify() (the token and its PoP, no network),
+ * verifyDevice() (the device certificate chains to the pinned Encedo root),
+ * validate() (attest.encedo.com: registry and revocation).
+ */
+export declare class Attest {
+  constructor(url?: string, opts?: { debug?: boolean });
+  readonly url: string;
+  /** A challenge: `request` for hem.attest(), `state` for verify(). PoP 'sig' or 'ecdh' (curve: SECP256R1/384R1/521R1, CURVE25519); KEM / HPKE TBD. */
+  static prepare(args: { aud: string; kid?: string | null; includeMetadata?: boolean; pop?: 'sig' | 'ecdh' | null;
+    curve?: 'SECP256R1' | 'SECP384R1' | 'SECP521R1' | 'CURVE25519' | null }): Promise<{ request: AttestRequest; state: AttestState }>;
+  /** Level 1. PoP checked here: signatures of P-256/384/521 and Ed25519, ECDH-MAC of P-256/384/521 and X25519. */
+  static verify(jwt: string | { attestation: string }, state?: AttestState | null, opts?: { now?: number; leeway?: number }): Promise<AttestVerification>;
+  /** Level 1_ext. CA certificates from pki() unless `cas` is given; dates and revocation are not checked here. */
+  verifyDevice(point: Uint8Array, crt: string | Uint8Array, opts?: { cas?: Array<string | Uint8Array> | null; rootSha256?: string }): Promise<{
+    ok: boolean; chain: string[]; reason?: 'certificate' | 'key' | 'issuer' | 'signature' | 'root';
+  }>;
+  /** Level 2: attest.encedo.com's verdict. */
+  validate(jwt: string | { attestation: string }, opts?: { crt?: string | Uint8Array | null }): Promise<{ status: 'valid' | 'valid_unverified' | 'invalid'; expired?: boolean }>;
+  /** Whether Encedo knows the device key (SKID, 40 or 64 hex). */
+  skidKnown(skid: string): Promise<boolean>;
+  /** The Encedo CA certificates, fetched once. */
+  pki(): Promise<Array<{ subject: string; issuer: string; not_after: number; sha256: string; pem: string }>>;
 }
