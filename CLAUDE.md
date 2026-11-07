@@ -22,6 +22,7 @@ here**, never in a downstream copy.
 | `hem-sdk.browser.js` + `.js.map` | Rollup output | ❌ generated — never edit |
 | `hem-sdk.browser.d.ts` | TypeScript declarations | ✅ keep in sync by hand |
 | `rollup.browser.config.js` | Browser build config | rarely |
+| `rollup.mini.config.js` | A project's stripped build: only the HEM methods it lists (+ what they call) | rarely |
 | `README.md` | High-level overview | keep current |
 | `EXAMPLES.md` | Commented usage per operation | keep current |
 
@@ -235,6 +236,24 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
 4. Update `README.md` (group table) and `EXAMPLES.md` if the public API changed.
 5. Commit `hem-sdk.js`, the rebuilt bundle, `.js.map`, `.d.ts` and the docs
    together — the bundle must never lag the source.
+
+## A stripped build per project (`rollup.mini.config.js`)
+
+A project that uses a dozen of the ~80 HEM methods can ship only those:
+`KEEP=keep.json OUT=hem-sdk.mini.js npx --yes rollup@4.63.2 -c
+rollup.mini.config.js`. The plugin parses `hem-sdk.js`, keeps the listed
+methods and every method they reach through `this.x` / `this.#x` (to a fixed
+point), removes the rest of class `HEM`, and rollup's tree-shaking drops what
+nothing kept reaches (Attest, the mnemonic helpers, the log verifier...). The
+exports are `HEM` and `HemError` unless the keep file names others. Same input,
+same bytes (checked across rollup 4.63.1 / 4.63.2), no path of the building
+machine in the output. A method that was not kept is `undefined` on the
+instance, so a project that starts calling one fails at once.
+
+Why not split `hem-sdk.js` into modules instead: the `#private` fields are
+reachable only inside the class body, so a split needs an internal accessor
+for every one of them, and buys nothing the stripped build does not.
+`test/mini.test.mjs` covers it when `ROLLUP` points at a rollup binary.
 
 ## Gotchas
 
