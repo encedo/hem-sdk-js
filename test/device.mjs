@@ -249,7 +249,8 @@ await step('otp / otpVerify TOTP and HOTP', async () => {
 });
 
 // --- attestation ----------------------------------------------------------------------
-const cas = await Promise.all(['root-ca.pem', 'attestation-ca.pem', 'custody-ca.pem']
+// both custody CAs: a PPA's certificate comes from the Custody CA, an EPA's from the EPA Custody CA
+const cas = await Promise.all(['root-ca.pem', 'attestation-ca.pem', 'custody-ca.pem', 'epa-custody-ca.pem']
   .map(async (f) => (await fetch(`https://pki.encedo.com/${f}`)).text()));
 let attCrt = null;
 await step('getAttestation with our nonce', async () => {
