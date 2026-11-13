@@ -646,6 +646,30 @@ const { status } = await attest.validate(jwt, { crt });   // valid | valid_unver
 const known = await attest.skidKnown(r.skid);              // only the SKID leaves the client
 ```
 
+### The login context (FW 1.3, DEV-511)
+
+The device also signs how the token behind the request was obtained: the
+`auth` block. A login page asks for it with the token it just got; the server
+checks it against the nonce it handed out, and against its own Origin:
+
+```js
+// Browser: the server's challenge, the token of this login.
+const jwt = await hem.attest(useToken, { nonce, aud: 'https://op.example' });
+
+// Server: no network.
+const r = await Attest.verify(jwt, { aud: 'https://op.example', nonce, kid: null },
+  { requireAuth: true, org: 'https://op.example', maxAge: 300 });
+// r.failed: 'auth' (no / malformed block), 'org' (the login came from another site), 'age'
+// r.auth: { method: 'pwd'|'ext', age, authTime, org, actx, akid, trustedTime }
+```
+
+Through the phone, `require` tells the app what to ask of its user; what it
+did comes back in `r.auth.actx`, signed by the app:
+
+```js
+const token = await hem.authorizeRemote(scope, { require: { uv: 'bio' } });   // ctx 'uv=bio'
+```
+
 An ECDH PoP (keys that agree, not sign) needs the key's curve:
 `Attest.prepare({ aud, kid, pop: 'ecdh', curve: 'CURVE25519' })`. Checked
 here: signatures of P-256/384/521 and Ed25519, ECDH-MAC of P-256/384/521 and

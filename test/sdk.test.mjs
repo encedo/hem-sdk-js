@@ -344,6 +344,22 @@ test('authorizeRemote sends the scope and the optional ctx / note; the lifetime 
   assert.deepEqual(Object.keys(plain).sort(), ['epk', 'scope']);
 });
 
+test('authorizeRemote require: what the app must ask of its user goes in ctx', async () => {
+  const hem = mk();
+  const sentCtx = () => state.log.filter((e) => e.path === '/dev/api/auth/ext/request').at(-1).body.ctx;
+  await hem.authorizeRemote('keymgmt:use:00112233445566778899aabbccddeeff', { pollInterval: 5, require: { uv: 'bio' } });
+  assert.equal(sentCtx(), 'uv=bio');
+  hem.clearKeys();
+  await hem.authorizeRemote('keymgmt:list', { pollInterval: 5, ctx: 'oidc', require: { uv: 'pin' } });
+  assert.equal(sentCtx(), 'oidc;uv=pin', 'joined to the caller\'s ctx');
+  hem.clearKeys();
+  await hem.authorizeRemote('keymgmt:list', { pollInterval: 5, require: {} });
+  assert.equal(sentCtx(), undefined, 'nothing required: no ctx');
+  await assert.rejects(hem.authorizeRemote('keymgmt:list', { require: { uv: 'face' } }), (e) => e.code === 'invalid_arg');
+  await assert.rejects(hem.authorizeRemote('keymgmt:list', { require: { level: 3 } }), (e) => e.code === 'invalid_arg');
+  await assert.rejects(hem.authorizeRemote('keymgmt:list', { ctx: 'x'.repeat(60), require: { uv: 'bio' } }), (e) => e.code === 'invalid_arg');
+});
+
 test('authorizeRemote polls the broker until the phone answers', async () => {
   state.eventPolls = 0; state.eventReadyAfter = 3; state.deleted = [];
   let pending = 0, seenEvent = null;
@@ -986,6 +1002,53 @@ test('Attest.prepare / hem.attest / Attest.verify: the token and a signature PoP
   const late = await Attest.verify(old.jwt, state);
   assert.equal(late.ok, true);
   assert.equal(late.expired, true, 'expired is reported, not failed');
+});
+
+test('Attest.verify: the login context (auth block, DEV-511)', async () => {
+  const { state } = await Attest.prepare({ aud: 'oidc' });
+  const now = Math.floor(Date.now() / 1000);
+  const withAuth = (auth) => deviceToken({ state, iat: now, tamper: (b) => { b.auth = auth; } }).then((t) => t.jwt);
+
+  const pwd = await Attest.verify(await withAuth({ v: 1, iat: now - 4, age: 4, mth: 'pwd', org: 'https://op.example', tts: true }), state);
+  assert.deepEqual(pwd.failed, []);
+  assert.deepEqual(pwd.auth, { method: 'pwd', iat: now - 4, age: 4, authTime: now - 4, org: 'https://op.example', actx: null, akid: null, trustedTime: true });
+
+  const actx = { v: 1, lock: 'bio+pin', uva: 12, aos: 'android', app: '2.0.34', hw: true, uvm: 'bio' };
+  const ext = await Attest.verify(await withAuth({ v: 1, iat: now - 30, age: 25, mth: 'ext', akid: '00112233445566778899AABBCCDDEEFF', actx, org: 'https://op.example', tts: false }), state,
+    { requireAuth: true, org: 'https://op.example', maxAge: 60 });
+  assert.deepEqual(ext.failed, []);
+  assert.equal(ext.auth.akid, '00112233445566778899aabbccddeeff');
+  assert.deepEqual(ext.auth.actx, actx, 'the app context as the device copied it');
+  assert.equal(ext.auth.authTime, now - 25, 'from age, not from the token iat');
+
+  const phish = await Attest.verify(await withAuth({ v: 1, iat: now, age: 0, mth: 'pwd', org: 'https://evil.example', tts: true }), state, { org: 'https://op.example' });
+  assert.deepEqual(phish.failed, ['org']);
+  const noOrg = await Attest.verify(await withAuth({ v: 1, iat: now, age: 0, mth: 'pwd', tts: true }), state, { org: 'https://op.example' });
+  assert.deepEqual(noOrg.failed, ['org'], 'no Origin at the login: not ours either');
+  const old = await Attest.verify(await withAuth({ v: 1, iat: now - 900, age: 900, mth: 'pwd', tts: true }), state, { maxAge: 300 });
+  assert.deepEqual(old.failed, ['age']);
+
+  const none = await deviceToken({ state });
+  assert.deepEqual((await Attest.verify(none.jwt, state)).failed, [], 'no block, nothing asked: fine');
+  assert.equal((await Attest.verify(none.jwt, state)).auth, null);
+  assert.deepEqual((await Attest.verify(none.jwt, state, { requireAuth: true })).failed, ['auth']);
+  assert.deepEqual((await Attest.verify(none.jwt, state, { maxAge: 60 })).failed, ['age']);
+
+  for (const bad of [
+    { v: 2, iat: now, age: 0, mth: 'pwd', tts: true },
+    { v: 1, iat: now, age: -1, mth: 'pwd', tts: true },
+    { v: 1, iat: now, age: 0, mth: 'bio', tts: true },
+    { v: 1, iat: now, age: 0, mth: 'pwd' },
+    { v: 1, iat: now, age: 0, mth: 'ext', tts: true },
+    { v: 1, iat: now, age: 0, mth: 'ext', akid: 'zz', tts: true },
+    { v: 1, iat: now, age: 0, mth: 'pwd', akid: '00112233445566778899aabbccddeeff', tts: true },
+    { v: 1, iat: now, age: 0, mth: 'ext', akid: '00112233445566778899aabbccddeeff', actx: 'bio', tts: true },
+    'auth',
+  ]) {
+    const r = await Attest.verify(await withAuth(bad), state);
+    assert.deepEqual(r.failed, ['auth'], JSON.stringify(bad));
+    assert.equal(r.auth, null);
+  }
 });
 
 test('Attest.verify: ECDSA signature PoP on P-384 / P-521 (compressed keys), the rest TBD', async () => {

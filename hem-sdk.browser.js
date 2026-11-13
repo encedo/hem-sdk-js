@@ -1584,7 +1584,15 @@ class HEM {
    *
    * @param {string|string[]} scope  As authorizePassword
    * @param {object} [opts]
-   * @param {string} [opts.ctx]        1..64 chars, copied into the token
+   * The phone is told what the approval needs through `ctx` (the device has no
+   * field of its own for it): `require: { uv: 'bio' }` appends `uv=bio` -
+   * a fingerprint / face at this approval - and `{ uv: 'pin' }` `uv=pin` - the
+   * app's PIN or biometrics - joined to a caller's `ctx` with ';'. This is a
+   * request to the app, not a guarantee: what the app did is in the token's
+   * `actx`, signed by the app, and that is what a verifier checks.
+   *
+   * @param {string} [opts.ctx]        1..64 chars (with `require` added), copied into the token
+   * @param {{uv?: 'bio'|'pin'}} [opts.require]  What the app must ask of its user
    * @param {string} [opts.note]       1..128 chars shown with the request on the phone
    * @param {number} [opts.pollInterval=2000]  Poll interval in ms
    * @param {number} [opts.pollTimeout=60000]  Max wait time in ms
@@ -1595,6 +1603,7 @@ class HEM {
    */
   async authorizeRemote(scope, {
     ctx = null,
+    require: need = null,
     note = null,
     pollInterval = 2_000,
     pollTimeout = 60_000,
@@ -1603,6 +1612,7 @@ class HEM {
     signal = null,
   } = {}) {
     checkScope(scope);
+    ctx = remoteCtx(ctx, need);
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
 
@@ -3477,6 +3487,42 @@ function certBytes(c) {
   return fromB64((pem ? pem[1] : s).replace(/\s+/g, ''));
 }
 
+/**
+ * The `ctx` of an ext/request: the caller's, plus what the app must ask of
+ * its user (`uv=bio` / `uv=pin`), joined with ';'. 1..64 chars (API reference,
+ * POST /api/auth/ext/request).
+ */
+function remoteCtx(ctx, need) {
+  const parts = ctx ? [String(ctx)] : [];
+  if (need != null) {
+    const unknown = Object.keys(need).filter((k) => k !== 'uv');
+    if (unknown.length || (need.uv != null && need.uv !== 'bio' && need.uv !== 'pin')) {
+      throw new HemError(`authorizeRemote: require takes { uv: 'bio' | 'pin' }`, { code: 'invalid_arg' });
+    }
+    if (need.uv) parts.push(`uv=${need.uv}`);
+  }
+  const out = parts.join(';');
+  if (out.length > 64) throw new HemError('authorizeRemote: ctx is at most 64 chars', { code: 'invalid_arg' });
+  return out || null;
+}
+
+/**
+ * The `auth` block of an attestation (DEV-511, API reference
+ * POST /api/system/config/attestation): v 1, iat, age (s since the login
+ * started), mth 'pwd' | 'ext', akid (ext only: the authenticator's KID, hex),
+ * actx (ext only, an object), org (the login's Origin), tts (bool).
+ */
+function authBlockValid(a) {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return false;
+  if (a.v !== 1 || !Number.isInteger(a.iat) || !Number.isInteger(a.age) || a.age < 0) return false;
+  if (a.mth !== 'pwd' && a.mth !== 'ext') return false;
+  if (typeof a.tts !== 'boolean') return false;
+  if (a.org !== undefined && typeof a.org !== 'string') return false;
+  if (a.actx !== undefined && (!a.actx || typeof a.actx !== 'object' || Array.isArray(a.actx))) return false;
+  if (a.mth === 'ext') return typeof a.akid === 'string' && /^([0-9a-f]{32}|[0-9a-f]{40})$/i.test(a.akid);
+  return a.akid === undefined && a.actx === undefined;
+}
+
 /** The attestation JWT as text: the bare token, or the device's {"attestation": "..."} reply. */
 function attestationText(jwt) {
   if (jwt && typeof jwt === 'object') return String(jwt.attestation ?? '');
@@ -3571,15 +3617,29 @@ class Attest {
    *
    * @param {string|{attestation: string}} jwt  The token, or the device's reply
    * @param {object|null} [state]  From prepare()
+   * The login context (FW 1.3, DEV-511): a token sent with the request makes
+   * the device add an `auth` block - how the token behind the request was
+   * obtained, signed by the device like the rest. `auth` in the result is that
+   * block read out (null without one); a malformed block fails 'auth'.
+   * `requireAuth`, `org` (the Origin the login must have come from, compared
+   * exactly) and `maxAge` (seconds since the login started) turn it into
+   * checks: 'auth', 'org', 'age'. `actx` is what the authenticator app
+   * declared - signed by the app, copied by the device, not interpreted by it.
+   *
    * @param {object} [opts]
    * @param {number} [opts.now]  Unix seconds; default the local clock
    * @param {number} [opts.leeway=300]
+   * @param {boolean} [opts.requireAuth=false]  Fail 'auth' when the block is absent
+   * @param {string} [opts.org]  Fail 'org' unless the login came from this Origin
+   * @param {number} [opts.maxAge]  Fail 'age' when the login started longer ago (s)
    * @returns {Promise<{ok: boolean, failed: string[], expired: boolean, skid: string|null,
    *          skid256: string|null, point: Uint8Array|null, header: object|null, claims: object|null,
-   *          pop: {method: string|null, result: 'ok'|'fail'|'unsupported'|'none'}}>}
+   *          pop: {method: string|null, result: 'ok'|'fail'|'unsupported'|'none'},
+   *          auth: {method: 'pwd'|'ext', iat: number, age: number, authTime: number, org: string|null,
+   *          actx: object|null, akid: string|null, trustedTime: boolean}|null}>}
    */
-  static async verify(jwt, state = null, { now = Math.floor(Date.now() / 1000), leeway = 300 } = {}) {
-    const r = { ok: false, failed: [], expired: false, skid: null, skid256: null, point: null, header: null, claims: null, pop: { method: null, result: 'none' } };
+  static async verify(jwt, state = null, { now = Math.floor(Date.now() / 1000), leeway = 300, requireAuth = false, org = null, maxAge = null } = {}) {
+    const r = { ok: false, failed: [], expired: false, skid: null, skid256: null, point: null, header: null, claims: null, pop: { method: null, result: 'none' }, auth: null };
     const check = (name, pass) => { if (!pass) r.failed.push(name); return pass; };
     const parts = attestationText(jwt).split('.');
     if (!check('format', parts.length === 3)) return r;
@@ -3616,6 +3676,15 @@ class Attest {
       check('key', c.key?.kid?.toLowerCase() === state.kid);
       if (state.pop) await Attest.#checkPop(r, c, state, check);
     }
+    if (c.auth !== undefined) {
+      if (check('auth', authBlockValid(c.auth))) {
+        const a = c.auth;
+        r.auth = { method: a.mth, iat: a.iat, age: a.age, authTime: c.iat - a.age, org: a.org ?? null,
+          actx: a.actx ?? null, akid: a.akid ? a.akid.toLowerCase() : null, trustedTime: a.tts };
+      }
+    } else if (requireAuth) check('auth', false);
+    if (org != null) check('org', r.auth?.org === org);
+    if (maxAge != null) check('age', r.auth != null && r.auth.age <= maxAge);
     r.ok = r.failed.length === 0;
     return r;
   }

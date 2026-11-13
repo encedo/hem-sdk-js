@@ -243,8 +243,10 @@ export declare class HEM {
    * the event from the broker; rejects with code `aborted`, `timeout` or `denied`.
    */
   authorizeRemote(scope: HemScope, opts?: PollOpts & {
-    /** 1..64 chars, copied into the token. The token lifetime is the phone's answer. */
+    /** 1..64 chars (with `require` added), copied into the token. The token lifetime is the phone's answer. */
     ctx?: string | null;
+    /** What the app must ask of its user, sent as `uv=bio` / `uv=pin` in ctx. A request; the token's actx says what it did. */
+    require?: { uv?: 'bio' | 'pin' } | null;
     /** 1..128 chars shown with the request on the phone. */
     note?: string | null;
     /** Called once with the broker event id. */
@@ -478,7 +480,7 @@ export interface AttestState {
 export interface AttestVerification {
   /** Every check passed - a PoP that could not be checked here ('pop_unsupported') is not ok. */
   ok: boolean;
-  /** Names of the failed checks: format, alg, typ, jwk, kid, signature, iss, times, jti, device, aud, nonce, key, pop, pop_unsupported. */
+  /** Names of the failed checks: format, alg, typ, jwk, kid, signature, iss, times, jti, device, aud, nonce, key, pop, pop_unsupported, auth, org, age. */
   failed: string[];
   /** Past exp + leeway; reported, not failed. */
   expired: boolean;
@@ -490,6 +492,47 @@ export interface AttestVerification {
   header: Record<string, any> | null;
   claims: Record<string, any> | null;
   pop: { method: 'signature' | 'mac' | null; result: 'ok' | 'fail' | 'unsupported' | 'none' };
+  /** The login context of the token behind the request (FW 1.3, DEV-511); null without one. */
+  auth: AttestAuth | null;
+}
+
+/** The `auth` block of an attestation, read out: how the token was obtained, signed by the device. */
+export interface AttestAuth {
+  /** 'pwd' passphrase, 'ext' paired authenticator app. */
+  method: 'pwd' | 'ext';
+  /** The token's iat. */
+  iat: number;
+  /** Seconds since the login started, from the device uptime (ext: since the request to the app). */
+  age: number;
+  /** Attestation iat - age, on the device clock (trusted only when trustedTime). */
+  authTime: number;
+  /** The Origin of the login request; null when there was none. */
+  org: string | null;
+  /** What the app declared (ext only): v, lock, uva, aos, app, hw, ... - signed by the app, not interpreted by the device. */
+  actx: Record<string, any> | null;
+  /** ext only: the authenticator's KID, hex lowercase. */
+  akid: string | null;
+  /** trusted_ts on and the RTC set: iat / authTime come from a trusted clock. */
+  trustedTime: boolean;
+}
+
+/** Claims of a device access token (jwtParse()); org / upt / v / actx since FW 1.3 (DEV-511). */
+export interface HemTokenClaims {
+  scope: string | string[];
+  /** 'U' / 'M', or base64 of the app KID for a token from an authenticator. */
+  sub: string;
+  iat: number;
+  exp: number;
+  jti: string;
+  ctx?: string;
+  /** The Origin header of the login request. */
+  org?: string;
+  /** Device uptime (s) when the login started. */
+  upt?: number;
+  /** Version of the login context: 1. */
+  v?: number;
+  /** authorizeRemote only: the context the app declared. */
+  actx?: Record<string, any>;
 }
 
 /**
@@ -504,7 +547,10 @@ export declare class Attest {
   static prepare(args: { aud: string; kid?: string | null; includeMetadata?: boolean; pop?: 'sig' | 'ecdh' | null;
     curve?: 'SECP256R1' | 'SECP384R1' | 'SECP521R1' | 'CURVE25519' | null }): Promise<{ request: AttestRequest; state: AttestState }>;
   /** Level 1. PoP checked here: signatures of P-256/384/521 and Ed25519, ECDH-MAC of P-256/384/521 and X25519. */
-  static verify(jwt: string | { attestation: string }, state?: AttestState | null, opts?: { now?: number; leeway?: number }): Promise<AttestVerification>;
+  static verify(jwt: string | { attestation: string }, state?: AttestState | null, opts?: { now?: number; leeway?: number;
+    /** Fail 'auth' without a login context. */ requireAuth?: boolean;
+    /** Fail 'org' unless the login came from this Origin (exact). */ org?: string | null;
+    /** Fail 'age' when the login started longer ago (s). */ maxAge?: number | null }): Promise<AttestVerification>;
   /** Level 1_ext. CA certificates from pki() unless `cas` is given; dates and revocation are not checked here. */
   verifyDevice(point: Uint8Array, crt: string | Uint8Array, opts?: { cas?: Array<string | Uint8Array> | null; rootSha256?: string }): Promise<{
     ok: boolean; chain: string[]; reason?: 'certificate' | 'key' | 'issuer' | 'signature' | 'root';

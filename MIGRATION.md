@@ -308,6 +308,14 @@ Additive, so a project takes it when it wants it:
 - **External authenticators** — `listExtAuth`, `deleteExtAuth`, `hasExtAuth`,
   and `registerExtAuth` with the pairing QR payload fixed.
 - **Uploads take `onProgress`**, and every request takes a `signal`.
+- **Login context (FW 1.3, DEV-511)** — `Attest.verify` reads the device-signed
+  `auth` block into `r.auth` (`method`, `age`, `authTime`, `org`, `actx`,
+  `akid`, `trustedTime`) and checks it on request: `requireAuth`, `org`,
+  `maxAge` (failed `auth` / `org` / `age`). A block that is malformed fails
+  `auth` even unasked - a verifier that took every attestation so far keeps
+  doing so, since the device builds the block correctly.
+  `authorizeRemote({ require: { uv: 'bio' | 'pin' } })` adds `uv=…` to the
+  `ctx` sent to the app (joined to a caller's with ';', 64 chars in all).
 - **`authorizePassword(..., { remember: false })`** uses the derived key for
   that one call instead of keeping it, so the next scope needs the password
   typed again. Tokens are cached either way. It is what a "save password for

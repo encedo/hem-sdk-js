@@ -69,7 +69,7 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | Group | Operations |
 |-------|------------|
 | **Checkin** | `hemCheckin` — connection test + clock sync (call once, first); returns `newfws` / `newuis` when an update is available |
-| **Authentication** (a scope is a string or an array of 1..8; a cached token serves each scope it holds) | `authorizePassword`, `authorizeRemote` (mobile push; cancelling withdraws the event), `authorizeMaster` (the 24 words), `initialize` (device initialisation) |
+| **Authentication** (a scope is a string or an array of 1..8; a cached token serves each scope it holds) | `authorizePassword`, `authorizeRemote` (mobile push; cancelling withdraws the event; `require: { uv }` asks the app for a fingerprint / PIN), `authorizeMaster` (the 24 words), `initialize` (device initialisation) |
 | **Master secret** | `generateMnemonic`, `entropyToMnemonic`, `mnemonicToEntropy`, `validateMnemonic` — BIP39, where the entropy *is* the master key |
 | **Mobile authenticators** | `registerExtAuth` (pair; hands the QR payload to the caller), `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `getExtAuthMac` |
 | **Provisioning and domains** | `provision` / `installProvisioning` (device certificate), `registerDomain` (`<prefix>.ence.do` + TLS) |
@@ -82,7 +82,7 @@ The SDK wraps the HEM device REST API. Operations are grouped as:
 | **Audit log** | `getLoggerKey` (with a nonce of ours), `listLogFiles`, `getLogFile`, `verifyLogFile` |
 | **Cache** | `clearCache`, `clearKeys` |
 | **Broker** (`hem.broker`) | `checkin`, `session`, `eventNew`/`eventCheck`/`eventDelete`/`waitEvent`, `registerInit`/`registerCheck`/`registerFinalise`/`waitRegistration`, `subscribersList`/`subscribersDelete`, `download`, `domainPredefs`/`domainTaken`/`domainRegister`/`domainStatus`/`waitDomain`, `provisioning`, `shareEmailPubkey` |
-| **Attestation** (`Attest`, `hem.attest`) | `Attest.prepare` (challenge), `hem.attest` (the device signs), `Attest.verify` (token + PoP, no network), `attest.verifyDevice` (certificate chain to the pinned Encedo root), `attest.validate` / `skidKnown` / `pki` (attest.encedo.com) |
+| **Attestation** (`Attest`, `hem.attest`) | `Attest.prepare` (challenge), `hem.attest` (the device signs), `Attest.verify` (token + PoP, and the login context - `auth`, `org`, `age` - no network), `attest.verifyDevice` (certificate chain to the pinned Encedo root), `attest.validate` / `skidKnown` / `pki` (attest.encedo.com) |
 | **Helpers** (exported functions) | `verifyLog` (audit log, format v2, pure Web Crypto), `verifyLoggerKey` (the device signed the nonce it sent with the key), `jwtParse` |
 
 ### The master secret
