@@ -183,8 +183,8 @@ export interface HemWrapOpts extends HemHkdfOpts {
 export interface HemCipherOpts extends HemHkdfOpts {
   /** CBC 16 B, GCM 12 B, ChaCha20 12 B - decrypt only. */
   iv?: Uint8Array | null;
-  /** Additional authenticated data, 1..256 bytes; GCM and ChaCha20-Poly1305. */
-  aad?: Uint8Array | null;
+  /** Additional authenticated data, 1..256 bytes (a string as UTF-8); GCM and ChaCha20-Poly1305. */
+  aad?: Uint8Array | string | null;
   /** Authentication tag (GCM, ChaCha20-Poly1305) — decrypt only. */
   tag?: Uint8Array | null;
 }
@@ -197,8 +197,8 @@ export interface HemHpkeOpts {
   aead?: 'AES128-GCM' | 'AES256-GCM' | 'CHACHA20-POLY1305' | null;
   /** 1..128 bytes. */
   info?: Uint8Array | string | null;
-  /** 1..256 bytes. */
-  aad?: Uint8Array | null;
+  /** 1..256 bytes (a string as UTF-8). */
+  aad?: Uint8Array | string | null;
 }
 
 export interface HemOtpOpts {
@@ -255,7 +255,9 @@ export declare class HEM {
 
   /** An attestation JWT for the device (and a key with its PoP); Attest.prepare() makes `request`. Any valid token; with kid keymgmt:use:<kid>. */
   attest(token: string | null, request: AttestRequest): Promise<string>;
-  /** Device certificate and attestation token; with `nonce` (32..64 B) the token is bound to this request. Any valid token. */
+  /** Device certificate and attestation token; with `nonce` (32..64 B) the token is bound to this request. Any valid token.
+   *  PPA: `crt` when provisioned, else `csr` + `key`; EPA: `crt` when the bootstrap `att.crt` matched, else `csr`.
+   *  DIAG builds also return `csr` (PPA: and `key`) next to `crt`. */
   getAttestation(token: string | null, opts?: { nonce?: Uint8Array | null }): Promise<{ genuine: string; crt?: string; csr?: string; key?: string }>;
 
   /**
@@ -391,7 +393,8 @@ export declare class HEM {
   /** Start the reclaim at the next boot; `started`: the device restarts in ~2 s. 409 (report in err.data): unreadable records. */
   defragStart(token: string): Promise<{ started: boolean; report: Record<string, unknown> | null }>;
   /** Before personalisation, no token: start HTTPS (`tls`) and, on an EPA, derive the attestation key (`att`). Once per power-up each. */
-  bootstrap(parts: { tls?: Record<string, unknown> | null; att?: { seed: Uint8Array; epoch: number } | null }): Promise<{ csr: Uint8Array | null }>;
+  /** `att.crt`: the HEM attestation certificate (DER, ≤2048 B); the device answers `match`. In the field the host system sends this (OpenWrt inject). */
+  bootstrap(parts: { tls?: Record<string, unknown> | null; att?: { seed: Uint8Array; epoch: number; crt?: Uint8Array | null } | null }): Promise<{ csr: Uint8Array | null; match: boolean | null }>;
 
   /** Scope: system:config, system:upgrade or system:shutdown (none before personalisation). */
   reboot(token: string | null): Promise<unknown>;
@@ -409,18 +412,21 @@ export declare class HEM {
     onProgress?: (loaded: number, total: number) => void;
     signal?: AbortSignal;
   }): Promise<void>;
-  /** null while the device is still checking (it answers 201/202); the result once it is done. */
-  checkFirmware(token: string, opts?: { signal?: AbortSignal }): Promise<Record<string, unknown> | null>;
+  /** null while the device is still checking (it answers 201/202); true once it passed (200, no body); 406 thrown when it failed. Scope: system:upgrade or system:config. */
+  checkFirmware(token: string, opts?: { signal?: AbortSignal }): Promise<true | null>;
   /** Poll checkFirmware() until done. Rejects with `timeout`, `aborted`, or the device's 4xx. */
-  waitFirmwareCheck(token: string, opts?: PollOpts): Promise<Record<string, unknown>>;
+  waitFirmwareCheck(token: string, opts?: PollOpts): Promise<true>;
+  /** Scope: system:upgrade or system:config. */
   installFirmware(token: string): Promise<unknown>;
   /** Sent as webroot.tar, the only name the device takes. */
   uploadUi(token: string | null, bytes: Uint8Array, opts?: {
     onProgress?: (loaded: number, total: number) => void;
     signal?: AbortSignal;
   }): Promise<void>;
-  checkUi(token: string, opts?: { signal?: AbortSignal }): Promise<Record<string, unknown> | null>;
-  waitUiCheck(token: string, opts?: PollOpts): Promise<Record<string, unknown>>;
+  /** As checkFirmware(); the device reports the result once, the next call starts a new check. */
+  checkUi(token: string, opts?: { signal?: AbortSignal }): Promise<true | null>;
+  waitUiCheck(token: string, opts?: PollOpts): Promise<true>;
+  /** Scope: system:upgrade or system:config. */
   installUi(token: string): Promise<unknown>;
 
   /** Scope: storage:disk<N> - the disk is the one in the scope. */
@@ -437,9 +443,9 @@ export declare class HEM {
   /** One log file as text; the one being written is HTTP 409. Scope: logger:get. */
   getLogFile(token: string, id: string): Promise<string>;
 
-  /** Install the certificate Broker.provisioning() issued. 403 on a provisioned device. */
+  /** Install the certificate Broker.provisioning() issued (PPA). 406: a certificate is already stored (or not for this chip); 409: initialised. */
   installProvisioning(cert: Record<string, unknown>, token?: string | null): Promise<unknown>;
-  /** Provision if the attestation still carries a CSR; resolves null when already provisioned. */
+  /** Provision a PPA whose attestation has no `crt` but a `csr` and `key`; null otherwise (provisioned, or an EPA). */
   provision(token?: string | null): Promise<Record<string, unknown> | null>;
   /** Register `<prefix>.ence.do` and install the TLS block. Scope: system:config. */
   registerDomain(token: string, prefix: string, opts?: { ip?: string | null; newCertificate?: boolean; pollInterval?: number; pollTimeout?: number; onPending?: (status: string) => void; signal?: AbortSignal }): Promise<Record<string, unknown>>;

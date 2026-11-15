@@ -520,15 +520,19 @@ const report = await hem.defragCheck(token);              // { reclaimable, recl
 if (report.reclaimable) await hem.defragStart(token);     // { started: true }: the device restarts
 
 // A device out of the box, no token: HTTPS, and on an EPA its attestation key.
+// In the field the host system sends this (OpenWrt inject); shown for completeness.
 const { csr } = await hem.bootstrap({ att: { seed: moduleSeed /* 32 B */, epoch: 0 } });
+// With the HEM attestation certificate of that key the device checks it and keeps it:
+const { match } = await hem.bootstrap({ att: { seed: moduleSeed, epoch: 0, crt: attCertDer } });
 ```
 
 ---
 
 ## 6. Firmware / UI upgrade
 
-Scope: `system:upgrade`. The SDK takes a raw `Uint8Array` — obtaining it is up
-to the caller.
+Scope: `system:upgrade` (the checks and installs also take `system:config`;
+the uploads only `system:upgrade`). The SDK takes a raw `Uint8Array` — obtaining
+it is up to the caller.
 
 ```js
 const token = await hem.authorizePassword('my-password', 'system:upgrade');
@@ -556,7 +560,7 @@ await hem.uploadFirmware(token, fwBytes, {
   onProgress: (loaded, total) => bar.value = loaded / total,   // browser only
   // signal: ac.signal,
 });
-await hem.waitFirmwareCheck(token);           // the device verifies in the background; this polls until it is done
+await hem.waitFirmwareCheck(token);           // the device verifies in the background; polls until true (passed) or throws 406
 await hem.installFirmware(token);             // device reboots afterwards
 
 // UI bundle (sent as webroot.tar) — same pattern

@@ -887,7 +887,7 @@ const LOG_EVENTS_LOST = '33';     // LOGGER_EVENTS_LOST: data = u32 LE count of 
  * reported. Lines missing at the very end cannot be detected - the device
  * stops by power-off and there is no end marker.
  *
- * Pure Web Crypto, no device call: pass what getLoggerKey() and getLogEntry()
+ * Pure Web Crypto, no device call: pass what getLoggerKey() and getLogFile()
  * returned. Requires Ed25519 in Web Crypto (Chrome 137+ / Firefox 130+ / Node 18+).
  *
  * @param {string|Uint8Array} deviceKey  `key` from HEM.getLoggerKey() (base64), or its 32 bytes
@@ -987,6 +987,12 @@ const LIMITS = Object.freeze({
   hkdfItems: 8,                   // POST /api/crypto/ecdh: hkdf_args, 1..8 items
   hkdfReserved: 'encedo-',        // POST /api/crypto/ecdh: an hkdf_ctx starting with it -> 400
   pageSize: 15,                   // POST /api/keymgmt/search, GET list: at most 15 a page
+  cryptoCt: 2064,                 // cipher/decrypt, cipher/unwrap, hpke/open: msg / ct decoded at most 2064 B
+  aad: 256,                       // cipher/encrypt, cipher/decrypt, hpke/seal, hpke/open: aad 1..256 B
+  sigCtx: 255,                    // exdsa/sign, exdsa/verify, pqc/mldsa/sign, pqc/mldsa/verify: ctx 1..255 B
+  tokenCtx: 64,                   // auth/token (auth claim), auth/ext/request: ctx 1..64 chars
+  remoteNote: 128,                // auth/ext/request: note 1..128 chars
+  certDer: 2048,                  // POST /api/system/config (bootstrap): att.crt, at most 2048 B decoded
 });
 const HKDF_RESERVED = strToBytes(LIMITS.hkdfReserved);
 
@@ -1145,7 +1151,7 @@ function applyHpkeSuite(body, { kdf, aead, info, aad }) {
   if (kdf) body.kdf = kdf;
   if (aead) body.aead = aead;
   if (info !== null && info !== undefined) body.info = toB64(asBytes(info));
-  if (aad) body.aad = toB64(aad);
+  if (aad) body.aad = toB64(checkLen('hpke', 'aad', asBytes(aad), LIMITS.aad));
 }
 
 /** The request body of hmac/otp: TOTP takes period / time, HOTP a counter. */
@@ -1170,6 +1176,35 @@ function checkMsgSize(op, data) {
   if (data.length > LIMITS.cryptoMsg) {
     throw new HemError(`${op}: message is ${data.length} bytes, max ${LIMITS.cryptoMsg}`,
       { code: 'invalid_arg' });
+  }
+}
+
+/**
+ * A byte field of `min..max` bytes, as bytes: the device answers a field out
+ * of range with a bare 400 (an empty one too), so say which field it was.
+ */
+function checkLen(op, name, bytes, max, min = 1) {
+  if (bytes.length < min || bytes.length > max) {
+    throw new HemError(`${op}: ${name} is ${bytes.length} bytes, must be ${min}..${max}`, { code: 'invalid_arg' });
+  }
+  return bytes;
+}
+
+/**
+ * The `ctx` of a token request, 1..64 characters. The device copies it into
+ * the token, and a longer one it drops without a word - while the SDK would
+ * cache the token under the value the caller passed.
+ */
+function checkTokenCtx(op, ctx) {
+  if (ctx !== null && ctx !== undefined && (String(ctx).length < 1 || String(ctx).length > LIMITS.tokenCtx)) {
+    throw new HemError(`${op}: ctx is 1..${LIMITS.tokenCtx} characters`, { code: 'invalid_arg' });
+  }
+}
+
+/** A KID in a path segment: 32 hex characters, or the device answers 400 / 404. */
+function checkKid(op, kid) {
+  if (!(typeof kid === 'string' && KID_RE.test(kid))) {
+    throw new HemError(`${op}: kid is 32 hex characters`, { code: 'invalid_arg' });
   }
 }
 
@@ -1378,6 +1413,7 @@ class HEM {
   async authorizePassword(password, scope, opts) {
     const { expSeconds = 300, remember = true, ctx = null } = optsArg('authorizePassword', arguments, 2);
     checkScope(scope);
+    checkTokenCtx('authorizePassword', ctx);
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
 
@@ -1429,6 +1465,7 @@ class HEM {
   async authorizeMaster(mnemonic, scope, opts) {
     const { expSeconds = 300, legacy = false, ctx = null } = optsArg('authorizeMaster', arguments, 2);
     checkScope(scope);
+    checkTokenCtx('authorizeMaster', ctx);
     // No cache read here, deliberately. A cached token for this scope may have
     // come from the password, and a caller asking to authorise with the master
     // secret is asking for that key in particular — handing back a token the
@@ -1504,8 +1541,11 @@ class HEM {
 
   /**
    * The device certificate and a fresh attestation token (`genuine`). PPA:
-   * `crt` once the chip is provisioned, `csr` and `key` before; EPA: `csr` of
-   * the attestation key. `genuine` is `<SKID>.<TS>.<SIG>`, or with a nonce of
+   * `crt` once the chip is provisioned, `csr` and `key` before. EPA: `crt` (the
+   * HEM attestation certificate) when the bootstrap `att.crt` matched, `csr` of
+   * the attestation key without one; never `key`. DIAG (R&D) builds return
+   * `csr` always - and on a PPA `key` - next to `crt`, so tell a provisioned
+   * device by `crt`, not by the absence of `csr`. `genuine` is `<SKID>.<TS>.<SIG>`, or with a nonce of
    * ours `<nonce>.<SKID>.<TS>.<SIG>` - bound to this request, so it cannot be
    * replayed; verify it with the public key of `crt`.
    *
@@ -1613,6 +1653,9 @@ class HEM {
   } = {}) {
     checkScope(scope);
     ctx = remoteCtx(ctx, need);
+    if (note !== null && (String(note).length < 1 || String(note).length > LIMITS.remoteNote)) {
+      throw new HemError(`authorizeRemote: note is 1..${LIMITS.remoteNote} characters`, { code: 'invalid_arg' });
+    }
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
 
@@ -2014,6 +2057,7 @@ class HEM {
    * @returns {Promise<KeyEntry>}  With `der` (Uint8Array) for a certificate record
    */
   async getKeyPublicInfo(token, kid) {
+    checkKid('getKeyPublicInfo', kid);
     const data = await this.#req('GET', `${this.#baseUrl}/api/keymgmt/get/${kid}`, null, token);
     return keyEntry({ ...data, kid });
   }
@@ -2137,6 +2181,7 @@ class HEM {
    * @returns {Promise<void>}
    */
   async deleteKey(token, kid) {
+    checkKid('deleteKey', kid);
     await this.#req('DELETE', `${this.#baseUrl}/api/keymgmt/delete/${kid}`, null, token);
   }
 
@@ -2167,8 +2212,10 @@ class HEM {
    */
   async exdsaSign(token, kid, data, opts) {
     const { alg = 'Ed25519', ctx = null, det = false } = optsArg('exdsaSign', arguments, 3);
-    const body = { kid, alg, msg: toB64(asBytes(data)) };
-    if (ctx !== null) body.ctx = toB64(asBytes(ctx));
+    const msg = asBytes(data);
+    checkMsgSize('exdsaSign', msg);
+    const body = { kid, alg, msg: toB64(msg) };
+    if (ctx !== null) body.ctx = toB64(checkLen('exdsaSign', 'ctx', asBytes(ctx), LIMITS.sigCtx));
     if (det) body.det = true;
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/sign`, body, token);
     if (!ret.sign) throw new HemError('No sign in exdsa/sign response', { code: 'sign_error' });
@@ -2194,8 +2241,10 @@ class HEM {
    */
   async exdsaVerify(token, kid, data, sig, opts) {
     const { alg = 'Ed25519', ctx = null } = optsArg('exdsaVerify', arguments, 4);
-    const body = { kid, alg, msg: toB64(asBytes(data)), sign: toB64(sig) };
-    if (ctx !== null) body.ctx = toB64(asBytes(ctx));
+    const msg = asBytes(data);
+    checkMsgSize('exdsaVerify', msg);
+    const body = { kid, alg, msg: toB64(msg), sign: toB64(sig) };
+    if (ctx !== null) body.ctx = toB64(checkLen('exdsaVerify', 'ctx', asBytes(ctx), LIMITS.sigCtx));
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/exdsa/verify`, body, token);
     return ret?.verified === true;
   }
@@ -2363,7 +2412,7 @@ class HEM {
    * @param {Uint8Array} [opts.pubkey]  Raw peer public key; not with extKid
    * @param {Uint8Array|string} [opts.hkdfCtx]   HKDF context (info), 1..128 bytes; peer modes only
    * @param {Uint8Array|string} [opts.hkdfSalt]  HKDF salt, 1..128 bytes; peer modes only
-   * @param {Uint8Array} [opts.aad]  1..256 bytes; GCM and ChaCha20-Poly1305
+   * @param {Uint8Array|string} [opts.aad]  1..256 bytes (a string as UTF-8); GCM and ChaCha20-Poly1305
    * @returns {Promise<{ciphertext: Uint8Array, iv: Uint8Array, tag: Uint8Array|null}>}
    */
   async cipherEncrypt(token, kid, data, alg, opts = {}) {
@@ -2372,7 +2421,7 @@ class HEM {
     const body = { kid, msg: toB64(bytes), alg };
     applyPeerKey(body, opts, 'cipherEncrypt');
     applyHkdf(body, opts, 'cipherEncrypt');
-    if (opts.aad) body.aad = toB64(opts.aad);
+    if (opts.aad) body.aad = toB64(checkLen('cipherEncrypt', 'aad', asBytes(opts.aad), LIMITS.aad));
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/encrypt`, body, token);
     if (!ret.ciphertext) throw new HemError('No ciphertext in encrypt response', { code: 'cipher_error' });
     return {
@@ -2399,12 +2448,12 @@ class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async cipherDecrypt(token, kid, ciphertext, alg, opts = {}) {
-    const body = { kid, msg: toB64(ciphertext), alg };
+    const body = { kid, msg: toB64(checkLen('cipherDecrypt', 'ciphertext', ciphertext, LIMITS.cryptoCt)), alg };
     applyPeerKey(body, opts, 'cipherDecrypt');
     applyHkdf(body, opts, 'cipherDecrypt');
     if (opts.iv) body.iv = toB64(opts.iv);
     if (opts.tag) body.tag = toB64(opts.tag);
-    if (opts.aad) body.aad = toB64(opts.aad);
+    if (opts.aad) body.aad = toB64(checkLen('cipherDecrypt', 'aad', asBytes(opts.aad), LIMITS.aad));
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/cipher/decrypt`, body, token);
     if (typeof ret.plaintext !== 'string') throw new HemError('No plaintext in decrypt response', { code: 'cipher_error' });
     return fromB64(ret.plaintext);
@@ -2454,7 +2503,7 @@ class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async cipherUnwrap(token, kid, wrapped, opts = {}) {
-    const body = { kid, msg: toB64(wrapped) };
+    const body = { kid, msg: toB64(checkLen('cipherUnwrap', 'wrapped', wrapped, LIMITS.cryptoCt)) };
     if (opts.alg) body.alg = opts.alg;
     applyPeerKey(body, opts, 'cipherUnwrap');
     applyHkdf(body, opts, 'cipherUnwrap');
@@ -2520,8 +2569,8 @@ class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async mldsaSign(token, kid, data, { ctx = null, mode = null } = {}) {
-    const body = { kid, msg: toB64(asBytes(data)) };
-    if (ctx !== null) body.ctx = toB64(asBytes(ctx));
+    const body = { kid, msg: toB64(checkLen('mldsaSign', 'data', asBytes(data), LIMITS.cryptoMsg)) };
+    if (ctx !== null) body.ctx = toB64(checkLen('mldsaSign', 'ctx', asBytes(ctx), LIMITS.sigCtx));
     if (mode) body.mode = mode;
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/sign`, body, token);
     if (!ret.sign) throw new HemError('No sign in mldsa/sign response', { code: 'pqc_error' });
@@ -2545,8 +2594,8 @@ class HEM {
    * @returns {Promise<boolean>}  true: the signature is valid
    */
   async mldsaVerify(token, kid, data, sign, { ctx = null, mode = null } = {}) {
-    const body = { kid, msg: toB64(asBytes(data)), sign: toB64(sign) };
-    if (ctx !== null) body.ctx = toB64(asBytes(ctx));
+    const body = { kid, msg: toB64(checkLen('mldsaVerify', 'data', asBytes(data), LIMITS.cryptoMsg)), sign: toB64(sign) };
+    if (ctx !== null) body.ctx = toB64(checkLen('mldsaVerify', 'ctx', asBytes(ctx), LIMITS.sigCtx));
     if (mode) body.mode = mode;
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mldsa/verify`, body, token);
     return ret?.verified === true;
@@ -2632,7 +2681,7 @@ class HEM {
       throw new HemError('hpkeSeal: the recipient is { kid[, extKid] } or { pubkey: Uint8Array, kem }', { code: 'invalid_arg' });
     }
     applyHpkeSuite(body, { kdf, aead, info, aad });
-    body.msg = toB64(asBytes(data));
+    body.msg = toB64(checkLen('hpkeSeal', 'data', asBytes(data), LIMITS.cryptoMsg));
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hpke/seal`, body, token);
     if (!ret.enc || !ret.ct) throw new HemError('Missing enc/ct in hpke/seal response', { code: 'hpke_error' });
     return { enc: fromB64(ret.enc), ct: fromB64(ret.ct), suite: ret.suite, kem: ret.kem, kdf: ret.kdf, aead: ret.aead };
@@ -2663,7 +2712,7 @@ class HEM {
     if (extKid) body.ext_kid = extKid;
     applyHpkeSuite(body, { kdf, aead, info, aad });
     body.enc = toB64(enc);
-    body.ct = toB64(ct);
+    body.ct = toB64(checkLen('hpkeOpen', 'ct', ct, LIMITS.cryptoCt, 17));
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hpke/open`, body, token);
     if (typeof ret.plaintext !== 'string') throw new HemError('No plaintext in hpke/open response', { code: 'hpke_error' });
     return fromB64(ret.plaintext);
@@ -2846,7 +2895,8 @@ class HEM {
    * Required scope: 'system:config'
    *
    * @param {string} token  Bearer JWT
-   * @param {object} cfg    Partial config, e.g. { user }, { email }, { hostname }
+   * @param {object} cfg    Partial config, e.g. { user }, { email }, { origin } (hostname
+   *   and ip are not settable)
    * @returns {Promise<{updated: boolean}>}
    */
   async setConfig(token, cfg) {
@@ -2940,13 +2990,21 @@ class HEM {
    * - `att` (EPA): the 32-byte module seed and an epoch 0..65535. The same
    *   seed, chip, slot and epoch always give the same P-256 key; the answer
    *   carries its CSR (subject key id = the SKID of the attestation tokens).
-   *   The key is stored at personalisation; a reset before that needs another
-   *   bootstrap.
+   *   With `crt` (the HEM attestation certificate of that key, DER) the device
+   *   compares its public key with the derived one and answers `match`; a
+   *   matching certificate is stored next to the key at personalisation and
+   *   from then on returned by getAttestation() as `crt`. The key is stored at
+   *   personalisation; a reset before that needs another bootstrap.
+   *
+   * In the field the bootstrap is sent by the host system the module sits in
+   * (the OpenWrt inject procedure); the method is here so the SDK covers the
+   * API one to one.
    *
    * @param {object} parts
    * @param {object} [parts.tls]
-   * @param {{seed: Uint8Array, epoch: number}} [parts.att]
-   * @returns {Promise<{csr: Uint8Array|null}>}  The attestation key's CSR (DER), with `att`
+   * @param {{seed: Uint8Array, epoch: number, crt?: Uint8Array}} [parts.att]
+   * @returns {Promise<{csr: Uint8Array|null, match: boolean|null}>}  The attestation
+   *   key's CSR (DER) with `att`; `match` with `att.crt`, null without
    */
   async bootstrap({ tls = null, att = null } = {}) {
     const body = {};
@@ -2959,10 +3017,15 @@ class HEM {
         throw new HemError('bootstrap: att.epoch is an integer 0..65535', { code: 'invalid_arg' });
       }
       body.att = { seed: toB64(att.seed), epoch: att.epoch };
+      if (att.crt != null) {
+        if (!(att.crt instanceof Uint8Array)) throw new HemError('bootstrap: att.crt is DER bytes', { code: 'invalid_arg' });
+        body.att.crt = toB64(checkLen('bootstrap', 'att.crt', att.crt, LIMITS.certDer));
+      }
     }
     if (!body.tls && !body.att) throw new HemError('bootstrap: give tls, att or both', { code: 'invalid_arg' });
     const ret = await this.#req('POST', `${this.#baseUrl}/api/system/config`, body);
-    return { csr: b64OrNull(ret?.att?.csr) };
+    const match = ret?.att?.match ?? ret?.match;
+    return { csr: b64OrNull(ret?.att?.csr), match: typeof match === 'boolean' ? match : null };
   }
 
   // -- Firmware / UI Upgrade ---------------------------------------------------
@@ -3023,17 +3086,18 @@ class HEM {
   /**
    * Verify the firmware image previously uploaded with uploadFirmware(). The
    * device checks the signature in the background: it answers 201 or 202 while
-   * it is still at it, and this resolves null then — 200 with the result once
-   * it is done. waitFirmwareCheck() does the polling.
+   * it is still at it, and this resolves null then; 200 (no body) means the
+   * image passed and resolves true. A failed check is 406 and throws.
+   * waitFirmwareCheck() does the polling.
    *
-   * Required scope: 'system:upgrade'
+   * Required scope: 'system:upgrade' or 'system:config'
    *
    * @param {string} token  Bearer JWT
-   * @returns {Promise<object|null>}  null while the device is still checking
+   * @returns {Promise<true|null>}  null while the device is still checking
    */
   async checkFirmware(token, { signal = null } = {}) {
     const r = await this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_fw`, null, token, { signal, withStatus: true });
-    return r.status === 200 ? r.data : null;
+    return r.status === 200 ? true : null;
   }
 
   /**
@@ -3043,7 +3107,7 @@ class HEM {
    *
    * @param {string} token
    * @param {object} [opts]  pollInterval (4 s), pollTimeout (3 min), onPending, signal
-   * @returns {Promise<object>}  The device's answer to the check
+   * @returns {Promise<true>}  The image passed
    */
   waitFirmwareCheck(token, { pollInterval = 4_000, pollTimeout = 180_000, onPending = null, signal = null } = {}) {
     return pollUntil(() => this.checkFirmware(token, { signal }), 'The firmware check did not finish in time', { pollInterval, pollTimeout, onPending, signal });
@@ -3052,7 +3116,7 @@ class HEM {
   /**
    * Install the verified firmware image. The device reboots afterwards.
    *
-   * Required scope: 'system:upgrade'
+   * Required scope: 'system:upgrade' or 'system:config'
    *
    * @param {string} token  Bearer JWT
    * @returns {Promise<object>}
@@ -3080,17 +3144,18 @@ class HEM {
 
   /**
    * Verify the UI bundle previously uploaded with uploadUi(). As with
-   * checkFirmware(): null while the device is still checking, the result once
-   * it is done; waitUiCheck() polls.
+   * checkFirmware(): null while the device is still checking, true once it
+   * passed, 406 thrown when it failed. The device reports the final result
+   * once; the next call starts a new check. waitUiCheck() polls.
    *
-   * Required scope: 'system:upgrade'
+   * Required scope: 'system:upgrade' or 'system:config'
    *
    * @param {string} token  Bearer JWT
-   * @returns {Promise<object|null>}
+   * @returns {Promise<true|null>}
    */
   async checkUi(token, { signal = null } = {}) {
     const r = await this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_ui`, null, token, { signal, withStatus: true });
-    return r.status === 200 ? r.data : null;
+    return r.status === 200 ? true : null;
   }
 
   /** Poll checkUi() until the device has verified the bundle; see waitFirmwareCheck(). */
@@ -3101,7 +3166,7 @@ class HEM {
   /**
    * Install the verified UI bundle.
    *
-   * Required scope: 'system:upgrade'
+   * Required scope: 'system:upgrade' or 'system:config'
    *
    * @param {string} token  Bearer JWT
    * @returns {Promise<object>}
@@ -3203,8 +3268,10 @@ class HEM {
   // -- Provisioning (PPA: certificate for the device) ---------------------------
 
   /**
-   * Install the certificate the broker issued for this device.
-   * Fails with HTTP 403 on a device that is already provisioned.
+   * Install the certificate the broker issued for this device (PPA, before
+   * personalisation). Fails with HTTP 406 on a device that already has a
+   * certificate (or when it is not for this chip) and 409 on an initialised
+   * one; an EPA has no such endpoint (404).
    *
    * @param {object} cert   Result of Broker.provisioning()
    * @param {string|null} [token]
@@ -3215,18 +3282,20 @@ class HEM {
   }
 
   /**
-   * Provision the device if it still needs it: read the attestation, and when it
-   * carries a CSR, have the broker sign it and install the certificate.
+   * Provision the device if it still needs it (PPA): read the attestation, and
+   * when it carries no certificate but a CSR and the chip's attestation key,
+   * have the broker sign it and install the certificate.
    *
-   * Resolves with the installed certificate, or null when the device was
-   * already provisioned (no CSR in the attestation).
+   * Resolves with the installed certificate, or null when there is nothing to
+   * do: `crt` present (provisioned - a DIAG build also returns `csr` then), or
+   * no `key` (an EPA, whose certificate comes with the bootstrap).
    *
    * @param {string|null} [token]  Any valid JWT; the attestation endpoint accepts any
    * @returns {Promise<object|null>}
    */
   async provision(token = null) {
     const att = await this.#req('GET', `${this.#baseUrl}/api/system/config/attestation`, null, token);
-    if (!att.csr) return null;
+    if (att.crt || !att.csr || !att.key) return null;
     const cert = await this.#broker.provisioning({ csr: att.csr, key: att.key, genuine: att.genuine });
     await this.installProvisioning(cert, token);
     return cert;
@@ -3502,7 +3571,7 @@ function remoteCtx(ctx, need) {
     if (need.uv) parts.push(`uv=${need.uv}`);
   }
   const out = parts.join(';');
-  if (out.length > 64) throw new HemError('authorizeRemote: ctx is at most 64 chars', { code: 'invalid_arg' });
+  if (out.length > LIMITS.tokenCtx) throw new HemError(`authorizeRemote: ctx is at most ${LIMITS.tokenCtx} chars`, { code: 'invalid_arg' });
   return out || null;
 }
 

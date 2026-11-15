@@ -35,6 +35,9 @@ const state = {
   regReadyAfter: 1,
   deleted: [],
   provisioned: false,
+  diagBuild: false,       // a DIAG (R&D) build returns csr / key next to crt
+  uiChecks: 0,
+  uiFails: false,
   fwChecks: 0,
   domainTaken: { my: true },
   paired: true,
@@ -83,11 +86,19 @@ async function handle(req, res) {
   }
   if (path === '/dev/api/system/config' && req.method === 'POST') {
     if (body.gen_csr) return json(res, 200, { genuine: 'GEN', csr: 'CSR' });
-    if (!req.headers.authorization) return json(res, 200, body.att ? { att: { csr: b64([0x30, 0x82]) } } : undefined);   // bootstrap
+    if (!req.headers.authorization) {   // bootstrap
+      if (!body.att) return json(res, 200);
+      const att = { csr: b64([0x30, 0x82]) };
+      if (body.att.crt) att.match = body.att.crt === b64([0x30, 0x01]);
+      return json(res, 200, { att });
+    }
     return json(res, 200, { updated: true, received: body });
   }
   if (path === '/dev/api/system/config/attestation' && req.method === 'POST') return json(res, 200, { attestation: 'eyJ.x.y' });
-  if (path.startsWith('/dev/api/system/config/attestation')) return json(res, 200, state.provisioned ? { genuine: 'GEN' } : { genuine: 'GEN', csr: 'CSR', key: 'KEY' });
+  if (path.startsWith('/dev/api/system/config/attestation')) {
+    if (!state.provisioned) return json(res, 200, { genuine: 'GEN', csr: 'CSR', key: 'KEY' });
+    return json(res, 200, state.diagBuild ? { genuine: 'GEN', crt: 'CERT', csr: 'CSR', key: 'KEY' } : { genuine: 'GEN', crt: 'CERT' });
+  }
   if (path === '/dev/api/system/config/provisioning') { state.provisioned = true; return json(res, 200, { installed: true }); }
   if (path === '/dev/api/auth/token' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-1' });   // no genuine: only auth/init has one
   if (path === '/dev/api/auth/token' && req.method === 'POST') {
@@ -114,7 +125,9 @@ async function handle(req, res) {
     return json(res, 200);
   }
   // The device verifies in the background: 202 while at it, 200 with the result once done.
-  if (path === '/dev/api/system/upgrade/check_fw') return ++state.fwChecks < 3 ? json(res, 202, null) : json(res, 200, { verified: true, fwv: 'v9' });
+  // The device answers the check with a status and no body (API 1.3, upgrade/check_fw, check_ui).
+  if (path === '/dev/api/system/upgrade/check_fw') return ++state.fwChecks < 3 ? json(res, 202) : json(res, 200);
+  if (path === '/dev/api/system/upgrade/check_ui') return ++state.uiChecks === 1 ? json(res, 201) : json(res, state.uiFails ? 406 : 200);
   if (path === '/dev/api/system/upgrade/install_fw') return json(res, 200, { installing: true });
   if (path === '/dev/api/keymgmt/create' || path === '/dev/api/keymgmt/derive') {
     return json(res, 200, { kid: 'NEW1', type: 'ATT,PKEY,ExDSA,' + body.type, label: body.label, created: 1738454400, updated: 1738454400, ...(body.return_pubkey ? { pubkey: b64([1, 2, 3]) } : {}) });
@@ -152,7 +165,7 @@ async function handle(req, res) {
   if (path.startsWith('/dev/api/storage/unlock')) return json(res, 200);
   if (path === '/dev/api/crypto/pqc/xwing/encaps') return json(res, 200, { alg: 'X-Wing', ss: b64(new Uint8Array(32)), ct: b64(new Uint8Array(1120)) });
   if (path === '/dev/api/crypto/pqc/xwing/decaps') return json(res, 200, { alg: 'X-Wing', ss: b64(new Uint8Array(32)) });
-  if (path === '/dev/api/crypto/hpke/seal') return json(res, 200, { mode: 'base', suite: '647a-0001-0003', kem: 'X-Wing', kdf: 'HKDF-SHA256', aead: 'CHACHA20-POLY1305', enc: b64([1, 2]), ct: b64([3, 4]) });
+  if (path === '/dev/api/crypto/hpke/seal') return json(res, 200, { mode: 'base', suite: '647a-0001-0003', kem: 'X-Wing', kdf: 'HKDF-SHA256', aead: 'CHACHA20-POLY1305', enc: b64([1, 2]), ct: b64(new Uint8Array(22).fill(3)) });   // 'secret' + 16 B tag
   if (path === '/dev/api/crypto/hpke/open') return json(res, 200, { mode: 'base', suite: '647a-0001-0003', plaintext: b64(Buffer.from('opened')) });
   if (path === '/dev/api/crypto/kdf') return json(res, 200, { okm: b64(new Uint8Array(body.len)) });
   if (path === '/dev/api/crypto/hmac/otp') {
@@ -465,6 +478,11 @@ test('provision installs a certificate once and is a no-op afterwards', async ()
   assert.deepEqual(cert, { crt: 'CERT', genuine: 'GEN' });
   assert.equal(state.provisioned, true);
   assert.equal(await hem.provision(), null);
+  state.diagBuild = true;
+  const installs = state.log.filter((l) => l.path === '/dev/api/system/config/provisioning').length;
+  assert.equal(await hem.provision(), null, 'a DIAG build returns csr next to crt: still provisioned');
+  assert.equal(state.log.filter((l) => l.path === '/dev/api/system/config/provisioning').length, installs, 'no second install');
+  state.diagBuild = false;
 });
 
 test('the firmware check answers null while the device is still at it, and waitFirmwareCheck polls through', async () => {
@@ -474,7 +492,7 @@ test('the firmware check answers null while the device is still at it, and waitF
   assert.equal(await hem.checkFirmware(token), null, '202: not done');
   let pending = 0;
   const result = await hem.waitFirmwareCheck(token, { pollInterval: 5, onPending: () => pending++ });
-  assert.deepEqual(result, { verified: true, fwv: 'v9' });
+  assert.equal(result, true, '200 has no body: a pass is true, not null');
   assert.equal(pending, 1, 'one more 202 before the 200');
   assert.deepEqual(await hem.installFirmware(token), { installing: true });
 });
@@ -707,8 +725,8 @@ test('key modes are checked against the type, as the device would', async () => 
   await hem.importPublicKey(token, 'bob', 'ED25519', new Uint8Array([5, 6]), { descr: new Uint8Array([1]) });
   assert.deepEqual(sent('import'), { type: 'ED25519', label: 'bob', pubkey: b64([5, 6]), descr: b64([1]) });
 
-  const info = await hem.getKeyPublicInfo(token, 'K1');
-  assert.equal(info.kid, 'K1');
+  const info = await hem.getKeyPublicInfo(token, 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1');
+  assert.equal(info.kid, 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1');
   assert.equal(info.type, 'ED25519');
   assert.deepEqual([...info.pubkey], [9, 9]);
 });
@@ -937,7 +955,13 @@ test('bootstrap of a device out of the box: tls, and the EPA attestation key', a
   const sent = state.log.at(-1);
   assert.equal(sent.auth, null, 'no token before personalisation');
   assert.deepEqual(sent.body, { att: { seed: b64(new Uint8Array(32).fill(7)), epoch: 0 } });
-  assert.deepEqual(await hem.bootstrap({ tls: { pkey: 'K', crt: 'C' } }), { csr: null });
+  assert.deepEqual(await hem.bootstrap({ tls: { pkey: 'K', crt: 'C' } }), { csr: null, match: null });
+  const withCrt = await hem.bootstrap({ att: { seed: new Uint8Array(32).fill(7), epoch: 1, crt: new Uint8Array([0x30, 0x01]) } });
+  assert.equal(withCrt.match, true);
+  assert.equal(state.log.at(-1).body.att.crt, b64([0x30, 0x01]));
+  assert.equal((await hem.bootstrap({ att: { seed: new Uint8Array(32).fill(7), epoch: 1, crt: new Uint8Array([0x30, 0x02]) } })).match, false);
+  assert.equal((await hem.bootstrap({ att: { seed: new Uint8Array(32).fill(7), epoch: 1 } })).match, null, 'no crt, no match');
+  await assert.rejects(hem.bootstrap({ att: { seed: new Uint8Array(32), epoch: 0, crt: new Uint8Array(2049) } }), (e) => e.code === 'invalid_arg');
   await assert.rejects(hem.bootstrap({ att: { seed: new Uint8Array(16), epoch: 0 } }), (e) => e.code === 'invalid_arg');
   await assert.rejects(hem.bootstrap({}), (e) => e.code === 'invalid_arg');
 });
@@ -1237,4 +1261,35 @@ test('the v1 derivation is available for an existing device and differs from the
   // Regression vector for the all-zero 24-word mnemonic, taken from the v1
   // libraries themselves (jsbip39 + sjcl + tweetnacl, run against this value).
   assert.equal(legacyIss, 'npHoBqiizdNniy/kAK2QJnlTAdGVxgA7dza2FKIaqhY=');
+});
+
+test('the UI check: 201 / 200 with no body is a pass, 406 a failure', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'system:upgrade');
+  state.uiChecks = 0; state.uiFails = false;
+  assert.equal(await hem.waitUiCheck(token, { pollInterval: 5 }), true);
+  state.uiChecks = 0; state.uiFails = true;
+  await assert.rejects(hem.waitUiCheck(token, { pollInterval: 5 }), (e) => e.code === 'http_406');
+  state.uiFails = false;
+});
+
+test('device limits are checked before a request goes out', async () => {
+  const hem = mk();
+  const token = await hem.authorizePassword('correct horse', 'keymgmt:list');
+  const kid = '00112233445566778899aabbccddeeff';
+  const before = state.log.length;
+  const bad = (e) => e instanceof HemError && e.code === 'invalid_arg';
+  await assert.rejects(hem.authorizePassword('correct horse', 'keymgmt:get', { ctx: 'x'.repeat(65) }), bad, 'token ctx 1..64');
+  await assert.rejects(hem.authorizePassword('correct horse', 'keymgmt:get', { ctx: '' }), bad, 'an empty ctx too');
+  await assert.rejects(hem.authorizeRemote('keymgmt:get', { note: 'n'.repeat(129) }), bad, 'note 1..128');
+  await assert.rejects(hem.exdsaSign(token, kid, new Uint8Array(2049)), bad, 'msg 1..2048');
+  await assert.rejects(hem.exdsaSign(token, kid, 'm', { alg: 'Ed25519ctx', ctx: new Uint8Array(256) }), bad, 'ctx 1..255');
+  await assert.rejects(hem.mldsaVerify(token, kid, new Uint8Array(2049), new Uint8Array(1)), bad);
+  await assert.rejects(hem.cipherEncrypt(token, kid, 'm', 'AES256-GCM', { aad: new Uint8Array(257) }), bad, 'aad 1..256');
+  await assert.rejects(hem.cipherDecrypt(token, kid, new Uint8Array(2065), 'AES256-GCM', { iv: new Uint8Array(12) }), bad, 'ct up to 2064');
+  await assert.rejects(hem.hpkeOpen(token, kid, new Uint8Array(32), new Uint8Array(16)), bad, 'ct 17..2064');
+  await assert.rejects(hem.hpkeSeal(token, { kid }, new Uint8Array(2049)), bad);
+  await assert.rejects(hem.getKeyPublicInfo(token, '../system/reboot'), bad, 'a KID in the path is 32 hex');
+  await assert.rejects(hem.deleteKey(token, 'zz'), bad);
+  assert.equal(state.log.length, before, 'none of them reached the device');
 });

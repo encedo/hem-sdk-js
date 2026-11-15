@@ -1,5 +1,38 @@
 # Upgrading the SDK
 
+## Checked against the API reference 1.3.x (2026-11-15)
+
+The SDK was read against the firmware API reference as of 2026-11-13 (DEV-511
+included). Every release endpoint has a method; these are the fixes.
+
+- **`checkFirmware()` / `checkUi()` resolve `true` when the check passed.**
+  The device answers 200 with no body, which the SDK read as `null` - the
+  value that means "still checking" - so `waitFirmwareCheck()` and
+  `waitUiCheck()` polled until their timeout against a real device. The mock
+  in the tests answered with a body and hid it. A failed check is still 406,
+  thrown. Who this touches: a caller that read fields of the old result (none
+  known; the Manager passes it on as is).
+- **`provision()` tells a provisioned device by `crt`.** A DIAG build returns
+  `csr` (and `key`) next to `crt`, so the old test (`csr` present) asked the
+  broker for a second certificate. An EPA (no `key`; its certificate comes with
+  the bootstrap) is left alone: `config/provisioning` is PPA only.
+- **`bootstrap()` takes `att.crt` and resolves `{ csr, match }`** (DEV-505
+  (8)). `match` is null without `crt`. In the field the host system sends the
+  bootstrap (OpenWrt inject); the method keeps the SDK one to one with the API.
+- **Device limits checked before the request** (`HemError` `invalid_arg`
+  instead of the device's bare 400): token `ctx` 1..64 characters
+  (`authorizePassword`, `authorizeMaster` - the device dropped a longer one
+  silently while the SDK cached the token under it), `authorizeRemote` `note`
+  1..128, message 1..2048 B in `exdsaSign` / `exdsaVerify` / `mldsaSign` /
+  `mldsaVerify` / `hpkeSeal`, ciphertext up to 2064 B in `cipherDecrypt` /
+  `cipherUnwrap` / `hpkeOpen` (17..2064), signature `ctx` 1..255 B, `aad`
+  1..256 B, a KID in the path of `getKeyPublicInfo` / `deleteKey` 32 hex.
+- **`aad` given as a string is UTF-8**, as everywhere else in the SDK (it was
+  encoded as zero bytes).
+- Comments and types: scope `system:upgrade` **or** `system:config` for the
+  upgrade checks and installs; `installProvisioning` fails with 406 / 409, not
+  403; `setConfig` cannot set `hostname` / `ip`; `getAttestation` per build.
+
 ## Firmware 1.3
 
 From 2026-11-06 the SDK follows the firmware 1.3 API
