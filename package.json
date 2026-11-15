@@ -1,0 +1,52 @@
+{
+  "name": "@encedo/hem-sdk",
+  "version": "1.3.0",
+  "private": true,
+  "description": "Dependency-free JavaScript client for the Encedo HEM hardware security module (firmware 1.3+), browser and Node.js",
+  "type": "module",
+  "main": "./hem-sdk.js",
+  "module": "./hem-sdk.js",
+  "browser": "./hem-sdk.browser.js",
+  "types": "./hem-sdk.browser.d.ts",
+  "exports": {
+    ".": {
+      "types": "./hem-sdk.browser.d.ts",
+      "browser": "./hem-sdk.browser.js",
+      "default": "./hem-sdk.js"
+    },
+    "./browser": {
+      "types": "./hem-sdk.browser.d.ts",
+      "default": "./hem-sdk.browser.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "hem-sdk.js",
+    "hem-sdk.browser.js",
+    "hem-sdk.browser.js.map",
+    "hem-sdk.browser.d.ts",
+    "README.md",
+    "MIGRATION.md",
+    "EXAMPLES.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "test": "node --test test/sdk.test.mjs",
+    "build": "npx --yes rollup@4.63.2 -c rollup.browser.config.js",
+    "prepublishOnly": "node --check hem-sdk.js && node --test test/sdk.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/encedo/hem-sdk-js.git"
+  },
+  "homepage": "https://github.com/encedo/hem-sdk-js#readme",
+  "bugs": {
+    "url": "https://github.com/encedo/hem-sdk-js/issues"
+  },
+  "keywords": ["encedo", "hem", "hsm", "hardware-security-module", "webcrypto", "x25519", "ed25519", "jwt", "attestation"],
+  "license": "MIT"
+}

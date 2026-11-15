@@ -193,6 +193,11 @@ practice: `mode`, for instance, is documented as "Key operation mode (for NIST
 ECC only)" and test_10 sends it for the four SECP* curves and for none of the
 other 19 types.
 
+The newest rendering of the reference is the claude.ai artifact "HEM REST
+API 1.3.x" (updated 2026-11-13, DEV-511); the `.md` on the firmware branch
+checked out may be older. The SDK was read against it end to end on
+2026-11-15 (MIGRATION.md, first section).
+
 `/api/diag/*` endpoints (memory dump, fault injection) are **intentionally not
 implemented** — they are hardware-destructive Common Criteria test hooks.
 
@@ -254,6 +259,20 @@ Why not split `hem-sdk.js` into modules instead: the `#private` fields are
 reachable only inside the class body, so a split needs an internal accessor
 for every one of them, and buys nothing the stripped build does not.
 `test/mini.test.mjs` covers it when `ROLLUP` points at a rollup binary.
+
+## npm package (2026-11-15)
+
+`package.json` makes the repo an npm package, `@encedo/hem-sdk`, still
+`"private": true` - where and under what name it is published is not decided
+yet (the owner holds the Encedo name; a teammate's `@kajtomato/encedo-hem-sdk`
+exists on npm, the aim is one official package, made from this repo).
+`"type": "module"` is load-bearing: without it Node before 22 reads
+`hem-sdk.js` as CommonJS and the import fails. `exports`: Node gets
+`hem-sdk.js`, bundlers with the `browser` condition `hem-sdk.browser.js`,
+types `hem-sdk.browser.d.ts`. `engines` node >=22: Node 18 has no global
+`crypto` (every test fails), Node 20 is out of support and lacks
+`Array.fromAsync` the tests use. Checked: `npm pack`, install in a clean
+Node 22 / 24 project, `import`, `require()` and `tsc --strict` (nodenext).
 
 ## Gotchas
 

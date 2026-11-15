@@ -10,7 +10,22 @@ shared secrets.
 ## Requirements
 
 - **Browser**: Chrome 113+ / Firefox 130+ (X25519 in the Web Crypto API).
-- **Node.js**: 18+ (built-in `fetch` and Web Crypto).
+- **Node.js**: 22+ (global Web Crypto with X25519 / Ed25519; older lines are
+  out of support). In Node every request goes through `node:https`, not `fetch`.
+
+## Install
+
+```bash
+npm install @encedo/hem-sdk        # once published; until then: npm install github:encedo/hem-sdk-js
+```
+
+```js
+import { HEM, HemError } from '@encedo/hem-sdk';   // Node: hem-sdk.js; bundlers for the browser: hem-sdk.browser.js
+```
+
+`require('@encedo/hem-sdk')` works too in Node 22 (it loads the ES module).
+Types come with the package (`hem-sdk.browser.d.ts`). A page without a bundler
+loads `hem-sdk.browser.js` as a module, as before.
 - No runtime dependencies.
 
 ## Files
@@ -21,6 +36,7 @@ shared secrets.
 | `hem-sdk.browser.js` | Pre-built browser bundle (ES module). |
 | `hem-sdk.browser.js.map` | Source map for the browser bundle. |
 | `hem-sdk.browser.d.ts` | TypeScript type declarations. |
+| `package.json` | npm package: `type: module`, `exports` (Node / browser / types), `engines`. |
 | `rollup.browser.config.js` | Rollup config for the browser bundle. |
 | `test/sdk.test.mjs` | End-to-end test against a mock device and broker (`node --test test/sdk.test.mjs`). |
 
