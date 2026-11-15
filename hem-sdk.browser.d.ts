@@ -393,7 +393,8 @@ export declare class HEM {
   /** Start the reclaim at the next boot; `started`: the device restarts in ~2 s. 409 (report in err.data): unreadable records. */
   defragStart(token: string): Promise<{ started: boolean; report: Record<string, unknown> | null }>;
   /** Before personalisation, no token: start HTTPS (`tls`) and, on an EPA, derive the attestation key (`att`). Once per power-up each. */
-  /** `att.crt`: the HEM attestation certificate (DER, ≤2048 B); the device answers `match`. In the field the host system sends this (OpenWrt inject). */
+  /** `att.crt`: the HEM attestation certificate (DER, ≤2048 B); the device answers `match`.
+   *  In practice: sent by the host system (OpenWrt inject) while its firewall keeps the external interface closed; no application reaches a module in that state. */
   bootstrap(parts: { tls?: Record<string, unknown> | null; att?: { seed: Uint8Array; epoch: number; crt?: Uint8Array | null } | null }): Promise<{ csr: Uint8Array | null; match: boolean | null }>;
 
   /** Scope: system:config, system:upgrade or system:shutdown (none before personalisation). */
@@ -403,7 +404,7 @@ export declare class HEM {
   /** Scope: system:config (none before personalisation). 409 while a run is in progress. */
   selftest(token: string | null): Promise<unknown>;
 
-  /** Restarts the device into the bootloader's USB mode. Scope: system:upgrade or system:config. */
+  /** Restarts the device into the bootloader's USB mode. Scope: system:upgrade or system:config. In practice: service and recovery. */
   rebootToUsbMode(token: string | null): Promise<void>;
   /** Sent as firmware.bin or firmware.hex (Intel HEX told by its first byte, or `format`). */
   uploadFirmware(token: string | null, bytes: Uint8Array, opts?: {
@@ -443,9 +444,11 @@ export declare class HEM {
   /** One log file as text; the one being written is HTTP 409. Scope: logger:get. */
   getLogFile(token: string, id: string): Promise<string>;
 
-  /** Install the certificate Broker.provisioning() issued (PPA). 406: a certificate is already stored (or not for this chip); 409: initialised. */
+  /** Install the certificate Broker.provisioning() issued (PPA). 406: a certificate is already stored (or not for this chip); 409: initialised.
+   *  In practice: a factory step (PPA production); a module in the field already has its certificate. */
   installProvisioning(cert: Record<string, unknown>, token?: string | null): Promise<unknown>;
-  /** Provision a PPA whose attestation has no `crt` but a `csr` and `key`; null otherwise (provisioned, or an EPA). */
+  /** Provision a PPA whose attestation has no `crt` but a `csr` and `key`; null otherwise (provisioned, or an EPA).
+   *  In practice: the factory flow in one call (attestation, broker, install). */
   provision(token?: string | null): Promise<Record<string, unknown> | null>;
   /** Register `<prefix>.ence.do` and install the TLS block. Scope: system:config. */
   registerDomain(token: string, prefix: string, opts?: { ip?: string | null; newCertificate?: boolean; pollInterval?: number; pollTimeout?: number; onPending?: (status: string) => void; signal?: AbortSignal }): Promise<Record<string, unknown>>;

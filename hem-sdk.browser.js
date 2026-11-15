@@ -828,6 +828,8 @@ class Broker {
    * Turn a device's CSR into its certificate. Takes the { csr, key, genuine }
    * fields of HEM.getAttestation() on an unprovisioned device; the result is
    * installed with HEM.installProvisioning().
+   *
+   * In practice: a factory step (PPA production), see HEM.installProvisioning().
    */
   provisioning({ csr, key, genuine }) {
     return this.#req('POST', '/provisioning', { csr, key, genuine });
@@ -2996,9 +2998,11 @@ class HEM {
    *   from then on returned by getAttestation() as `crt`. The key is stored at
    *   personalisation; a reset before that needs another bootstrap.
    *
-   * In the field the bootstrap is sent by the host system the module sits in
-   * (the OpenWrt inject procedure); the method is here so the SDK covers the
-   * API one to one.
+   * In practice: sent by the host system the module sits in (the OpenWrt
+   * inject procedure), whose firewall keeps the external interface closed
+   * until the TLS certificate and the attestation material are in. No
+   * application reaches a module in that state; the method is here so the
+   * SDK covers the API one to one.
    *
    * @param {object} parts
    * @param {object} [parts.tls]
@@ -3034,6 +3038,9 @@ class HEM {
    * Restart the device into the bootloader's low-level USB mode (~2 s after
    * the answer). It leaves the running firmware: the module is gone until the
    * bootloader is done with it.
+   *
+   * In practice: service and recovery; the Manager does not use it (uploads
+   * over USB ACM have their own tool).
    *
    * Required scope: 'system:upgrade' or 'system:config'
    *
@@ -3271,7 +3278,13 @@ class HEM {
    * Install the certificate the broker issued for this device (PPA, before
    * personalisation). Fails with HTTP 406 on a device that already has a
    * certificate (or when it is not for this chip) and 409 on an initialised
-   * one; an EPA has no such endpoint (404).
+   * one; an EPA has no such endpoint (404). POST /api/system/config/provisioning
+   * one to one: no token needed (the device is not initialised yet).
+   *
+   * In practice: a factory step. A PPA is provisioned once, in production,
+   * before personalisation, by the production tooling; a module in the field
+   * already has its certificate and refuses (406 / 409). Here so the SDK
+   * covers the API one to one.
    *
    * @param {object} cert   Result of Broker.provisioning()
    * @param {string|null} [token]
@@ -3289,6 +3302,13 @@ class HEM {
    * Resolves with the installed certificate, or null when there is nothing to
    * do: `crt` present (provisioned - a DIAG build also returns `csr` then), or
    * no `key` (an EPA, whose certificate comes with the bootstrap).
+   *
+   * GET config/attestation + Broker.provisioning() + installProvisioning():
+   * the factory flow in one call.
+   * In practice: a factory step. A PPA is provisioned once, in production,
+   * before personalisation, by the production tooling; a module in the field
+   * already has its certificate and refuses (406 / 409). Here so the SDK
+   * covers the API one to one.
    *
    * @param {string|null} [token]  Any valid JWT; the attestation endpoint accepts any
    * @returns {Promise<object|null>}

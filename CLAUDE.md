@@ -99,7 +99,7 @@ What each consumer relies on today, from reading their code:
 | `encedo-pgp` (current copy) | `hemCheckin`, `authorizePassword`, `searchKeys`, `createKeyPair`, `getPubKey`, `importPublicKey`, `exdsaSignBytes`, `exdsaVerify`, `ecdh` | binary in / binary out |
 | `encedo-meet` (713-line copy under `src/vendor`) | `authorizePassword`, `hemCheckin`, `authorizeRemote` | — |
 | `www` kit pages | `hemCheckin`, `authorizePassword`, `createKeyPair` | — |
-| `encedo-manager` v2 | everything above plus `Broker`, `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `provision`, `registerDomain`, `verifyLog`, upload `onProgress` | `hemCheckin()` resolving to the step-3 object |
+| `encedo-manager` v2 | everything above plus `Broker`, `listExtAuth`, `deleteExtAuth`, `hasExtAuth`, `registerDomain`, `verifyLog`, upload `onProgress` (not `provision` - checked 2026-11-15, nothing in `manager/app` calls it) | `hemCheckin()` resolving to the step-3 object |
 
 The table is a map of blast radius, not a freeze. Breaking changes are allowed
 (decided 2026-09-03) — the rule is that a change which breaks a row is made
@@ -232,6 +232,13 @@ implemented** — they are hardware-destructive Common Criteria test hooks.
    code) stays out of the SDK — hand data to the caller via a callback.
 8. Cover it in `test/sdk.test.mjs`: extend the mock with the endpoint and add
    a `test()` that drives the public method.
+9. One to one with the firmware API (owner's decision, 2026-11-15): every
+   release endpoint has a method, also those no application uses in the field
+   - factory (`installProvisioning`, `provision`, `Broker.provisioning`), the
+   host system (`bootstrap`, the OpenWrt inject), service (`rebootToUsbMode`).
+   Their JSDoc says where they are used, starting with "In practice:", so a
+   reader knows before calling one. The method follows the API as it is; the
+   comment, not missing code, says what is practical.
 
 ## After any change to `hem-sdk.js`
 
