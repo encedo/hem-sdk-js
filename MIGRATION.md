@@ -20,10 +20,11 @@ included). Every release endpoint has a method; these are the fixes.
   (8)). `match` is null without `crt`. In the field the host system sends the
   bootstrap (OpenWrt inject); the method keeps the SDK one to one with the API.
 - **Device limits checked before the request** (`HemError` `invalid_arg`
-  instead of the device's bare 400): token `ctx` 1..64 characters
-  (`authorizePassword`, `authorizeMaster` - the device dropped a longer one
-  silently while the SDK cached the token under it), `authorizeRemote` `note`
-  1..128, message 1..2048 B in `exdsaSign` / `exdsaVerify` / `mldsaSign` /
+  instead of the device's bare 400): token `ctx` 1..64 bytes of UTF-8
+  (`authorizePassword`, `authorizeMaster`, `authorizeRemote` with `require`
+  added - the device dropped a longer one silently while the SDK cached the
+  token under it), `authorizeRemote` `note` 1..128 bytes of UTF-8 (the
+  reference says "chars", the firmware counts `strlen`, so `'ż'` is 2), message 1..2048 B in `exdsaSign` / `exdsaVerify` / `mldsaSign` /
   `mldsaVerify` / `hpkeSeal`, ciphertext up to 2064 B in `cipherDecrypt` /
   `cipherUnwrap` / `hpkeOpen` (17..2064), signature `ctx` 1..255 B, `aad`
   1..256 B, a KID in the path of `getKeyPublicInfo` / `deleteKey` 32 hex.

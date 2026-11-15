@@ -235,7 +235,7 @@ export declare class HEM {
 
   /** Pass null or '' to reuse cached derived keys (set on first call with a real password). */
   /** `remember: false` uses the derived key for this call alone; the next scope needs the password again. */
-  /** A cached token answers for every scope it holds; `ctx` (1..64 chars) is copied into the token. */
+  /** A cached token answers for every scope it holds; `ctx` (1..64 bytes of UTF-8) is copied into the token. */
   authorizePassword(password: string | null, scope: HemScope, opts?: { expSeconds?: number; remember?: boolean; ctx?: string | null } | null): Promise<string>;
 
   /**
@@ -243,11 +243,11 @@ export declare class HEM {
    * the event from the broker; rejects with code `aborted`, `timeout` or `denied`.
    */
   authorizeRemote(scope: HemScope, opts?: PollOpts & {
-    /** 1..64 chars (with `require` added), copied into the token. The token lifetime is the phone's answer. */
+    /** 1..64 bytes of UTF-8 (with `require` added), copied into the token. The token lifetime is the phone's answer. */
     ctx?: string | null;
     /** What the app must ask of its user, sent as `uv=bio` / `uv=pin` in ctx. A request; the token's actx says what it did. */
     require?: { uv?: 'bio' | 'pin' } | null;
-    /** 1..128 chars shown with the request on the phone. */
+    /** 1..128 bytes of UTF-8 shown with the request on the phone. */
     note?: string | null;
     /** Called once with the broker event id. */
     onEvent?: (eventid: string) => void;

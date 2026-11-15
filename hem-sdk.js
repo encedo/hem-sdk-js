@@ -75,6 +75,12 @@ function strToBytes(s) {
   return new TextEncoder().encode(s);
 }
 
+/** The length the firmware sees for a text field: bytes of its UTF-8, not JS (UTF-16) characters. */
+function inUtf8Len(s, min, max) {
+  const n = strToBytes(String(s)).length;
+  return n >= min && n <= max;
+}
+
 // --- JWT helpers --------------------------------------------------------------
 
 /** Decode a JWT payload without verifying it (scope, exp, sub...). Returns null on malformed input. */
@@ -992,8 +998,8 @@ const LIMITS = Object.freeze({
   cryptoCt: 2064,                 // cipher/decrypt, cipher/unwrap, hpke/open: msg / ct decoded at most 2064 B
   aad: 256,                       // cipher/encrypt, cipher/decrypt, hpke/seal, hpke/open: aad 1..256 B
   sigCtx: 255,                    // exdsa/sign, exdsa/verify, pqc/mldsa/sign, pqc/mldsa/verify: ctx 1..255 B
-  tokenCtx: 64,                   // auth/token (auth claim), auth/ext/request: ctx 1..64 chars
-  remoteNote: 128,                // auth/ext/request: note 1..128 chars
+  tokenCtx: 64,                   // auth/token (auth claim), auth/ext/request: ctx 1..64 B of UTF-8 (the firmware counts strlen)
+  remoteNote: 128,                // auth/ext/request: note 1..128 B of UTF-8
   certDer: 2048,                  // POST /api/system/config (bootstrap): att.crt, at most 2048 B decoded
 });
 const HKDF_RESERVED = strToBytes(LIMITS.hkdfReserved);
@@ -1193,13 +1199,14 @@ function checkLen(op, name, bytes, max, min = 1) {
 }
 
 /**
- * The `ctx` of a token request, 1..64 characters. The device copies it into
+ * The `ctx` of a token request, 1..64 bytes of UTF-8 (the firmware counts bytes, not characters). The device copies it into
  * the token, and a longer one it drops without a word - while the SDK would
  * cache the token under the value the caller passed.
  */
 function checkTokenCtx(op, ctx) {
-  if (ctx !== null && ctx !== undefined && (String(ctx).length < 1 || String(ctx).length > LIMITS.tokenCtx)) {
-    throw new HemError(`${op}: ctx is 1..${LIMITS.tokenCtx} characters`, { code: 'invalid_arg' });
+  // The firmware counts bytes (strlen of the decoded UTF-8), not JS characters: 'ż' is 2.
+  if (ctx !== null && ctx !== undefined && !inUtf8Len(ctx, 1, LIMITS.tokenCtx)) {
+    throw new HemError(`${op}: ctx is 1..${LIMITS.tokenCtx} bytes of UTF-8`, { code: 'invalid_arg' });
   }
 }
 
@@ -1405,7 +1412,7 @@ export class HEM {
    * @param {object} [opts]
    * @param {number} [opts.expSeconds=300]  Requested token lifetime (the device's own
    *   default without one would be 60 s)
-   * @param {string} [opts.ctx]  1..64 characters, copied into the token
+   * @param {string} [opts.ctx]  1..64 bytes of UTF-8, copied into the token
    * @param {boolean} [opts.remember=true]  Keep the derived key for the scopes
    *   that follow. With `false` it is used for this call alone and the next
    *   scope needs the password typed again — v1's "save password for this
@@ -1459,7 +1466,7 @@ export class HEM {
    * @param {string|string[]} scope  As authorizePassword
    * @param {object} [opts]
    * @param {number} [opts.expSeconds=300]  As authorizePassword
-   * @param {string} [opts.ctx]  1..64 characters, copied into the token
+   * @param {string} [opts.ctx]  1..64 bytes of UTF-8, copied into the token
    * @param {boolean} [opts.legacy=false]  Device personalised by the v1 Manager,
    *   whose master key came from the BIP39 seed at a one-nibble offset.
    * @returns {Promise<string>}  JWT token
@@ -1633,9 +1640,9 @@ export class HEM {
    * request to the app, not a guarantee: what the app did is in the token's
    * `actx`, signed by the app, and that is what a verifier checks.
    *
-   * @param {string} [opts.ctx]        1..64 chars (with `require` added), copied into the token
+   * @param {string} [opts.ctx]        1..64 bytes of UTF-8 (with `require` added), copied into the token
    * @param {{uv?: 'bio'|'pin'}} [opts.require]  What the app must ask of its user
-   * @param {string} [opts.note]       1..128 chars shown with the request on the phone
+   * @param {string} [opts.note]       1..128 bytes of UTF-8 shown with the request on the phone
    * @param {number} [opts.pollInterval=2000]  Poll interval in ms
    * @param {number} [opts.pollTimeout=60000]  Max wait time in ms
    * @param {Function} [opts.onPending]        Called each poll while waiting (no args)
@@ -1655,8 +1662,8 @@ export class HEM {
   } = {}) {
     checkScope(scope);
     ctx = remoteCtx(ctx, need);
-    if (note !== null && (String(note).length < 1 || String(note).length > LIMITS.remoteNote)) {
-      throw new HemError(`authorizeRemote: note is 1..${LIMITS.remoteNote} characters`, { code: 'invalid_arg' });
+    if (note !== null && !inUtf8Len(note, 1, LIMITS.remoteNote)) {
+      throw new HemError(`authorizeRemote: note is 1..${LIMITS.remoteNote} bytes of UTF-8`, { code: 'invalid_arg' });
     }
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
@@ -3578,7 +3585,7 @@ function certBytes(c) {
 
 /**
  * The `ctx` of an ext/request: the caller's, plus what the app must ask of
- * its user (`uv=bio` / `uv=pin`), joined with ';'. 1..64 chars (API reference,
+ * its user (`uv=bio` / `uv=pin`), joined with ';'. 1..64 bytes of UTF-8 (API reference,
  * POST /api/auth/ext/request).
  */
 function remoteCtx(ctx, need) {
@@ -3591,7 +3598,7 @@ function remoteCtx(ctx, need) {
     if (need.uv) parts.push(`uv=${need.uv}`);
   }
   const out = parts.join(';');
-  if (out.length > LIMITS.tokenCtx) throw new HemError(`authorizeRemote: ctx is at most ${LIMITS.tokenCtx} chars`, { code: 'invalid_arg' });
+  if (!inUtf8Len(out, 0, LIMITS.tokenCtx)) throw new HemError(`authorizeRemote: ctx is at most ${LIMITS.tokenCtx} bytes of UTF-8`, { code: 'invalid_arg' });
   return out || null;
 }
 

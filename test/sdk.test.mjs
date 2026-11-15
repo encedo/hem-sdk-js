@@ -1282,6 +1282,10 @@ test('device limits are checked before a request goes out', async () => {
   await assert.rejects(hem.authorizePassword('correct horse', 'keymgmt:get', { ctx: 'x'.repeat(65) }), bad, 'token ctx 1..64');
   await assert.rejects(hem.authorizePassword('correct horse', 'keymgmt:get', { ctx: '' }), bad, 'an empty ctx too');
   await assert.rejects(hem.authorizeRemote('keymgmt:get', { note: 'n'.repeat(129) }), bad, 'note 1..128');
+  // The firmware counts bytes of UTF-8 (strlen), so 33 x 'ż' (66 B) is over 64 although it is 33 characters.
+  await assert.rejects(hem.authorizePassword('correct horse', 'keymgmt:get', { ctx: 'ż'.repeat(33) }), bad, 'token ctx counted in UTF-8 bytes');
+  await assert.rejects(hem.authorizeRemote('keymgmt:get', { note: 'ż'.repeat(65) }), bad, 'note counted in UTF-8 bytes');
+  await assert.rejects(hem.authorizeRemote('keymgmt:get', { ctx: 'ż'.repeat(30), require: { uv: 'pin' } }), bad, 'remote ctx with require counted in UTF-8 bytes');
   await assert.rejects(hem.exdsaSign(token, kid, new Uint8Array(2049)), bad, 'msg 1..2048');
   await assert.rejects(hem.exdsaSign(token, kid, 'm', { alg: 'Ed25519ctx', ctx: new Uint8Array(256) }), bad, 'ctx 1..255');
   await assert.rejects(hem.mldsaVerify(token, kid, new Uint8Array(2049), new Uint8Array(1)), bad);
