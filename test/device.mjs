@@ -188,7 +188,7 @@ await step('hmacHash / hmacVerify true / false', async () => {
 });
 await step('cipher GCM / CBC / ChaCha20 + peer HKDF fields', async () => {
   const t = await use(k.aes.kid);
-  for (const alg of ['AES256-GCM', 'AES128-CBC', 'CHACHA20-POLY1305']) {
+  for (const alg of ['AES256-GCM', 'AES256-CBC', 'CHACHA20-POLY1305']) {   // the alg size is the key's (firmware DEV-519)
     const e = await hem.cipherEncrypt(t, k.aes.kid, 'plain text', alg, { aad: alg.includes('CBC') ? null : Buffer.from('hdr') });
     const p = await hem.cipherDecrypt(t, k.aes.kid, e.ciphertext, alg, { iv: e.iv, tag: e.tag, aad: alg.includes('CBC') ? null : Buffer.from('hdr') });
     ok(Buffer.from(p).toString() === 'plain text', alg);

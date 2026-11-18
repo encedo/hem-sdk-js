@@ -2446,7 +2446,8 @@ export class HEM {
    * @param {string} kid
    * @param {Uint8Array|string} data  1..2048 bytes
    * @param {string} alg  'AES128-CBC' ... 'AES256-GCM' or 'CHACHA20-POLY1305' (a 256-bit
-   *   key: an AES256 key in the HEM). No ECB.
+   *   key: an AES256 key in the HEM). No ECB. With a stored key the size must be the key's - an
+   *   AES256 key takes AES256-* only (firmware DEV-519: a smaller size is 400, it used the key cut short).
    * @param {object} [opts]
    * @param {string} [opts.extKid]      Peer public key stored in the HEM
    * @param {Uint8Array} [opts.pubkey]  Raw peer public key; not with extKid
@@ -2510,7 +2511,7 @@ export class HEM {
    * @param {string} kid
    * @param {Uint8Array} data  16..2048 bytes, a multiple of 8
    * @param {object} [opts]
-   * @param {'AES128'|'AES192'|'AES256'} [opts.alg='AES256']  KEK size
+   * @param {'AES128'|'AES192'|'AES256'} [opts.alg='AES256']  KEK size; with a stored key it must be the key's (firmware DEV-519: 400)
    * @param {Uint8Array} [opts.iv]  8 bytes; default the RFC 3394 IV
    * @param {string} [opts.extKid]
    * @param {Uint8Array} [opts.pubkey]

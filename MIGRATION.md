@@ -1,5 +1,15 @@
 # Upgrading the SDK
 
+## AES key size in alg (2026-11-18, firmware DEV-519)
+
+With a stored AES key, `cipherEncrypt` / `cipherDecrypt` / `cipherWrap` /
+`cipherUnwrap` take only the key's own size in `alg` - an `AES256` key takes
+`AES256-*` (wrap: `AES256`). Before, a smaller size was accepted and used the
+first bytes of the key; firmware with DEV-519 answers it with 400. The SDK
+does not check it (it does not know the key size); a caller that asked for a
+smaller size gets `HemError` `http_400`. The peer modes (`extKid` / `pubkey`)
+are not affected.
+
 ## updateKey field by field; authorizeRemote refuses a widened scope (2026-11-18, firmware DEV-519)
 
 - **`updateKey(token, kid, label, descr)`** changes what is given and keeps the
