@@ -1,5 +1,22 @@
 # Upgrading the SDK
 
+## Logger key proof under a label (2026-11-18, firmware DEV-519)
+
+`GET /api/logger/key` signs the ASCII label `encedo-logger-key:v1:` followed by
+the nonce; before DEV-519 the device signed the nonce alone. The label keeps
+the proof apart from the log header certificate, which the same key signs over
+32 raw bytes. The answer has the same fields (`key`, `nonce`, `nonce_signed`),
+and `nonce` is still the bare nonce.
+
+- **`verifyLoggerKey()` checks the labelled signature only.** Against firmware
+  without DEV-519 it resolves `false`, and so does `keyProven` of
+  `verifyLogFile()`. What to do: upgrade the firmware; there is no switch for
+  the old form.
+- Who this touches: the Manager (the audit-log screen reads `keyProven`); no
+  other consumer calls `getLoggerKey` / `verifyLoggerKey` / `verifyLogFile`.
+- A verifier of your own: verify `nonce_signed` over
+  `utf8('encedo-logger-key:v1:') || nonce`, 21 + 32..64 bytes.
+
 ## Checked against the API reference 1.3.x (2026-11-15)
 
 The SDK was read against the firmware API reference as of 2026-11-13 (DEV-511

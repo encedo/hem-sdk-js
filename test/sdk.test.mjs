@@ -177,9 +177,9 @@ async function handle(req, res) {
   if (path === '/dev/api/system/defrag/check') return json(res, 200, defragReport);
   if (path === '/dev/api/system/defrag/start') return json(res, state.defragStatus ?? 202, defragReport);
   if (path.startsWith('/dev/api/logger/key')) {
-    // /logger/key/<nonce base64url> signs the caller's nonce; without it, a nonce of the device's own
+    // /logger/key/<nonce base64url> signs the label + the caller's nonce; without it, the label + a nonce of the device's own (DEV-519)
     const asked = path.split('/')[5];
-    if (asked) return json(res, 200, { key: state.loggerKeyB64, nonce: b64(Buffer.from(asked, 'base64url')), nonce_signed: b64(new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, state.loggerPriv, Buffer.from(asked, 'base64url')))) });
+    if (asked) return json(res, 200, { key: state.loggerKeyB64, nonce: b64(Buffer.from(asked, 'base64url')), nonce_signed: b64(new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, state.loggerPriv, Buffer.concat([Buffer.from(LOGGER_KEY_PROOF_LABEL), Buffer.from(asked, 'base64url')])))) });
     return json(res, 200, { key: state.loggerKeyB64, nonce: state.loggerNonce, nonce_signed: state.loggerNonceSig });
   }
   if (path.startsWith('/dev/api/logger/')) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(state.logText); }
@@ -522,6 +522,7 @@ test('getVersion honours timeoutMs as a cancelled request', async () => {
 // with the device log key, every line signed with the per-file key, a key
 // rotation at a day change (LOGGER_KEY_ROTATE naming the next key, then its header).
 const ed = async (priv, bytes) => new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, priv, bytes));
+const LOGGER_KEY_PROOF_LABEL = 'encedo-logger-key:v1:';   // GET /api/logger/key: the device signs this label + the nonce (firmware DEV-519)
 const rawPub = async (kp) => new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
 
 async function buildLog() {
@@ -530,7 +531,8 @@ async function buildLog() {
   state.loggerKeyB64 = b64(await rawPub(dev));
   const proof = crypto.getRandomValues(new Uint8Array(32));   // what /api/logger/key signs without a nonce of ours
   state.loggerNonce = b64(proof);
-  state.loggerNonceSig = b64(await ed(dev.privateKey, proof));
+  state.loggerNonceSig = b64(await ed(dev.privateKey, Buffer.concat([Buffer.from(LOGGER_KEY_PROOF_LABEL), proof])));
+  state.loggerNonceSigRaw = b64(await ed(dev.privateKey, proof));   // what firmware before DEV-519 sent: the nonce alone
 
   const file1 = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
   const file2 = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
@@ -590,6 +592,7 @@ test('the logger key is only worth something if the device signed our nonce', as
   assert.equal(await verifyLoggerKey(await hem.getLoggerKey(token)), true, 'though it is a valid signature');
   assert.equal(await verifyLoggerKey({ ...answer, key: state.spkB64 }, nonce), false, 'another key entirely');
   assert.equal(await verifyLoggerKey({ key: answer.key }), false, 'no proof at all');
+  assert.equal(await verifyLoggerKey({ key: state.loggerKeyB64, nonce: state.loggerNonce, nonce_signed: state.loggerNonceSigRaw }), false, 'a signature over the nonce alone (firmware before DEV-519) is not the proof');
   assert.equal(await verifyLoggerKey(undefined), false);
   await assert.rejects(hem.getLoggerKey(token, { nonce: new Uint8Array(16) }), (e) => e.code === 'invalid_arg');
 });

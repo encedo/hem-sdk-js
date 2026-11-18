@@ -957,7 +957,11 @@ export async function verifyLog(deviceKey, logText) {
 /**
  * Check that the device still holds the private half of the logger key it just
  * handed over: `/api/logger/key` answers with the public key, a fresh nonce and
- * that nonce's Ed25519 signature. Verifying a log file against a key nobody has
+ * an Ed25519 signature over the label `encedo-logger-key:v1:` followed by that
+ * nonce (firmware DEV-519; the label keeps this proof apart from the log header
+ * certificate, which the same key signs over 32 raw bytes). A signature over
+ * the nonce alone - what firmware before DEV-519 sent - is a false.
+ * Verifying a log file against a key nobody has
  * proved possession of shows only that the file is self-consistent, so do this
  * first and treat a false as "this device did not sign anything".
  *
@@ -966,13 +970,20 @@ export async function verifyLog(deviceKey, logText) {
  *   device must have signed exactly that, or the answer may be a replay
  * @returns {Promise<boolean>}
  */
+const LOGGER_KEY_PROOF_LABEL = 'encedo-logger-key:v1:';   // GET /api/logger/key: nonce_signed is over this label + nonce (DEV-519)
+
 export async function verifyLoggerKey(loggerKey, expectedNonce = null) {
   const { key, nonce, nonce_signed: signature } = loggerKey ?? {};
   if (!key || !nonce || !signature) return false;
   if (expectedNonce && !bytesEqual(fromB64(nonce), expectedNonce)) return false;
   try {
     const pubKey = await crypto.subtle.importKey('raw', fromB64(key), { name: 'Ed25519' }, false, ['verify']);
-    return await crypto.subtle.verify({ name: 'Ed25519' }, pubKey, fromB64(signature), fromB64(nonce));
+    const label = strToBytes(LOGGER_KEY_PROOF_LABEL);
+    const nonceBytes = fromB64(nonce);
+    const signed = new Uint8Array(label.length + nonceBytes.length);   // label || nonce
+    signed.set(label);
+    signed.set(nonceBytes, label.length);
+    return await crypto.subtle.verify({ name: 'Ed25519' }, pubKey, fromB64(signature), signed);
   } catch {
     return false;      // a key that will not even import has not signed anything
   }
@@ -3225,7 +3236,8 @@ export class HEM {
   // -- Logger / Audit Log ------------------------------------------------------
 
   /**
-   * The device log key (Ed25519) and its signature over a nonce. The log key
+   * The device log key (Ed25519) and its signature over the label
+   * `encedo-logger-key:v1:` + a nonce (firmware DEV-519). The log key
    * certifies the per-file keys that sign every log line (verifyLog()).
    * Pass a fresh `nonce` of your own to make the answer a proof that the
    * device holds the key now; without one the device signs a time-based nonce

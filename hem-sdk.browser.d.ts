@@ -29,7 +29,8 @@ export interface LogVerification {
 export declare function verifyLog(deviceKey: string | Uint8Array, logText: string): Promise<LogVerification>;
 
 /**
- * Verify that the device signed getLoggerKey()'s nonce, so the key is one it holds.
+ * Verify that the device signed getLoggerKey()'s nonce (the label `encedo-logger-key:v1:` + the nonce,
+ * firmware DEV-519; a signature over the nonce alone is false), so the key is one it holds.
  * Pass the nonce given to getLoggerKey() as `expectedNonce`, or the answer may be a replay.
  */
 export declare function verifyLoggerKey(loggerKey: { key: string; nonce: string; nonce_signed: string } | undefined, expectedNonce?: Uint8Array | null): Promise<boolean>;

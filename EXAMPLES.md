@@ -594,7 +594,7 @@ const token = await hem.authorizePassword('my-password', 'logger:get');
 // The device log key, with its signature over a nonce of ours: proof the device holds it now.
 const nonce = crypto.getRandomValues(new Uint8Array(32));
 const loggerKey = await hem.getLoggerKey(token, { nonce });   // { key, nonce, nonce_signed }
-const proven = await verifyLoggerKey(loggerKey, nonce);
+const proven = await verifyLoggerKey(loggerKey, nonce);       // the signature is over 'encedo-logger-key:v1:' + nonce (firmware with DEV-519)
 
 // One file per power-up; the one being written is `current`, not listed (and 409 if asked for).
 const { id: ids, total, current } = await hem.listLogFiles(token, { offset: 0 });
