@@ -320,8 +320,8 @@ export declare class HEM {
   deriveKey(token: string, label: string, type: string, kid: string, opts?: HemPeerKeyOpts & {
     hkdfSalt?: Uint8Array | string | null; descr?: Uint8Array | string | null; mode?: HemKeyMode | null; returnPubkey?: boolean;
   }): Promise<HemKey>;
-  /** Replace label and description; null removes the description. Scope: keymgmt:upd. */
-  updateKey(token: string, kid: string, label: string, descr?: Uint8Array | string | null): Promise<void>;
+  /** Change the label, the description or both (firmware with DEV-519): label null = kept; descr not given = kept, null / '' = removed. Scope: keymgmt:upd. */
+  updateKey(token: string, kid: string, label: string | null, descr?: Uint8Array | string | null): Promise<void>;
   /**
    * ECDSA (raw r ‖ s) or EdDSA signature. `data` is bytes or UTF-8 text; for alg 'ECDSA' the digest.
    * `ctx` (1..255 B) for Ed25519ctx / Ed25519ph / Ed448; `det` for RFC 6979 ECDSA.

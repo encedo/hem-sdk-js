@@ -115,8 +115,12 @@ await step('searchKeys prefix / suffix / contains / type filter', async () => {
   ok(typ.list.length === 1 && typ.list[0].kid === k.xh.kid, 'type+mode filter');
   return `prefix ${pre.list.length} (listed ${pre.listed}), suffix 1, type+mode 1`;
 });
-await step('updateKey (and remove description)', async () => {
-  await hem.updateKey(await tok('keymgmt:upd'), k.aes.kid, 'SDK-TEST-aes2', null);
+await step('updateKey: label only keeps the description, null removes it', async () => {
+  const before = await hem.getKeyPublicInfo(await tok('keymgmt:get'), k.aes.kid);
+  await hem.updateKey(await tok('keymgmt:upd'), k.aes.kid, 'SDK-TEST-aes2');
+  const kept = await hem.getKeyPublicInfo(await tok('keymgmt:get'), k.aes.kid);
+  ok(kept.label === 'SDK-TEST-aes2' && kept.description !== null && String(kept.description) === String(before.description), 'description not kept (firmware without DEV-519?)');
+  await hem.updateKey(await tok('keymgmt:upd'), k.aes.kid, null, null);
   const i = await hem.getKeyPublicInfo(await tok('keymgmt:get'), k.aes.kid);
   ok(i.label === 'SDK-TEST-aes2' && i.description === null, 'not updated');
 });

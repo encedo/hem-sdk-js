@@ -312,9 +312,11 @@ const imported = await hem.importPublicKey(impToken, 'Peer key', 'ED25519', rawP
 // NIST curves take a COMPRESSED SEC1 point (0x02/0x03 || X) and a mode:
 const nistPeer = await hem.importPublicKey(impToken, 'Peer P-384', 'SECP384R1', compressedPoint /* 49 B */, { mode: 'ECDH' });
 
-// Update label/description (scope: keymgmt:upd); no description removes it.
+// Update label and/or description (scope: keymgmt:upd): what is not given is kept, null / '' removes the description.
 const updToken = await hem.authorizePassword('my-password', 'keymgmt:upd');
 await hem.updateKey(updToken, kid, 'Renamed key', 'new description');
+await hem.updateKey(updToken, kid, 'Renamed again');          // the description stays
+await hem.updateKey(updToken, kid, null, null);                // only the description goes
 
 // Metadata and public part of one key - never private material (scope: keymgmt:get)
 const getToken = await hem.authorizePassword('my-password', 'keymgmt:get');

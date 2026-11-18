@@ -1,5 +1,22 @@
 # Upgrading the SDK
 
+## updateKey field by field; authorizeRemote refuses a widened scope (2026-11-18, firmware DEV-519)
+
+- **`updateKey(token, kid, label, descr)`** changes what is given and keeps the
+  rest - the firmware with DEV-519 does the same (`keymgmt/update`: an absent
+  field is kept, `descr: ""` removes the description, a request with neither
+  field is 400). `label` null keeps the stored label; `descr` not given keeps
+  the description, `null` / `''` / empty bytes remove it. Before, leaving
+  `descr` out removed the description. Who this touches: a caller that relied
+  on that - pass `null` to remove it. The Manager passes the form's value, so
+  an emptied field still removes it. A paired phone's record takes a new
+  label; its description cannot change (409).
+- **`authorizeRemote()`** checks the token against the request: the phone may
+  approve less (the token is returned and cached on what it holds), a token
+  with a value that was not asked for rejects with `HemError` code
+  `scope_widened`. The firmware takes the phone's answer as it is - a decision
+  made for DEV-519 - so this check is the SDK's.
+
 ## Logger key proof under a label (2026-11-18, firmware DEV-519)
 
 `GET /api/logger/key` signs the ASCII label `encedo-logger-key:v1:` followed by

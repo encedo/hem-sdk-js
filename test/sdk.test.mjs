@@ -114,8 +114,10 @@ async function handle(req, res) {
     state.initIss = payload.iss;
     return json(res, 200, { instanceid: 'INST-1', token: fakeJwt({ scope: 'system:config', sub: 'U', exp: Math.floor(Date.now() / 1000) + 28800 }) });
   }
-  if (path === '/dev/api/auth/ext/request') return json(res, 200, { authreq: 'AUTHREQ', epk: body.epk });
-  if (path === '/dev/api/auth/ext/token') return json(res, 200, { token: fakeJwt({ scope: 'remote', exp: Math.floor(Date.now() / 1000) + 300 }) });
+  if (path === '/dev/api/auth/ext/request') { state.extAsked = body.scope; return json(res, 200, { authreq: 'AUTHREQ', epk: body.epk }); }
+  // the phone answers with what was asked, unless a test sets what it approves (state.extGranted)
+  if (path === '/dev/api/auth/ext/token') return json(res, 200, { token: fakeJwt({ scope: state.extGranted ?? state.extAsked ?? 'remote', exp: Math.floor(Date.now() / 1000) + 300 }) });
+  if (path === '/dev/api/keymgmt/update') return json(res, 200, {});
   if (path === '/dev/api/auth/ext/init') return json(res, 200, { eid: state.eid, request: 'REQUEST-JWT' });
   if (path === '/dev/api/auth/ext/validate') return json(res, 200, { confirmed: body.pid });
   if (path === '/dev/api/auth/ext/mac') return json(res, 200, { nonce: 'N', mac: 'M', eid: state.eid });
@@ -1299,4 +1301,35 @@ test('device limits are checked before a request goes out', async () => {
   await assert.rejects(hem.getKeyPublicInfo(token, '../system/reboot'), bad, 'a KID in the path is 32 hex');
   await assert.rejects(hem.deleteKey(token, 'zz'), bad);
   assert.equal(state.log.length, before, 'none of them reached the device');
+});
+
+test('authorizeRemote: a narrower token is returned and cached on what it holds; a wider one is refused (scope_widened)', async () => {
+  state.eventPolls = 0; state.eventReadyAfter = 1; state.eventAnswer = { authreply: 'reply-from-phone' };
+  const hem = mk();
+  state.extGranted = ['keymgmt:list'];                          // the phone approved one of the two
+  const t = await hem.authorizeRemote(['keymgmt:list', 'logger:get'], { pollInterval: 5 });
+  assert.deepEqual(jwtParse(t).scope, ['keymgmt:list']);
+  assert.ok(hem.tokens.some((e) => JSON.stringify(e.scope) === JSON.stringify(['keymgmt:list'])), 'cached on the scope it holds');
+  hem.clearKeys();
+  state.extGranted = 'system:config';                           // more than was asked
+  await assert.rejects(hem.authorizeRemote('keymgmt:list', { pollInterval: 5 }), (e) => e instanceof HemError && e.code === 'scope_widened');
+  assert.equal(hem.tokens.length, 0, 'not cached');
+  state.extGranted = undefined;
+});
+
+test('updateKey sends only what changes: label, description, both; null / "" removes the description (firmware with DEV-519)', async () => {
+  const hem = mk();
+  const sent = () => state.log.filter((e) => e.path === '/dev/api/keymgmt/update').at(-1).body;
+  const kid = '00112233445566778899aabbccddeeff';
+  await hem.updateKey('t', kid, 'new label');
+  assert.deepEqual(sent(), { kid, label: 'new label' }, 'descr not given: kept on the device');
+  await hem.updateKey('t', kid, null, 'note');
+  assert.deepEqual(sent(), { kid, descr: b64(new TextEncoder().encode('note')) }, 'label null: kept');
+  await hem.updateKey('t', kid, 'both', new Uint8Array([1, 2]));
+  assert.deepEqual(sent(), { kid, label: 'both', descr: b64([1, 2]) });
+  await hem.updateKey('t', kid, null, null);
+  assert.deepEqual(sent(), { kid, descr: '' }, 'null removes the description');
+  await hem.updateKey('t', kid, 'x', '');
+  assert.deepEqual(sent(), { kid, label: 'x', descr: '' });
+  await assert.rejects(hem.updateKey('t', kid, null), (e) => e.code === 'invalid_arg', 'nothing to change');
 });

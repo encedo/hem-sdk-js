@@ -1640,7 +1640,9 @@ class HEM {
    * Cancelling (`signal`) or running out of time withdraws the event from the
    * broker, so the phone stops showing a request nobody is waiting for. Both
    * reject with HemError: code `aborted` or `timeout`; a refusal on the phone
-   * is `denied`.
+   * is `denied`. The phone may approve less than was asked (the token holds
+   * what it approved); a token holding a value that was not asked for is
+   * refused here with `scope_widened` - the firmware does not compare them.
    *
    * @param {string|string[]} scope  As authorizePassword
    * @param {object} [opts]
@@ -1713,6 +1715,15 @@ class HEM {
     });
 
     if (!resp.token) throw new HemError('No token in ext/token response', { code: 'auth_failed' });
+
+    // The phone may approve less than was asked - the cache keys the token on what it holds. More than was asked
+    // is refused here: the firmware takes the phone's answer as it is (a decision, DEV-519), the SDK checks it.
+    const granted = scopeList(jwtParse(resp.token)?.scope ?? scope);
+    const asked = scopeList(scope);
+    const extra = granted.filter((s) => !asked.includes(s));
+    if (extra.length) {
+      throw new HemError(`authorizeRemote: the token carries scope that was not asked for: ${extra.join(' ')}`, { code: 'scope_widened' });
+    }
 
     this.#cacheStore(scope, resp.token, ctx);
     return resp.token;
@@ -2045,22 +2056,31 @@ class HEM {
   }
 
   /**
-   * Replace a key's label and description; `updated` becomes now. The record
-   * is rewritten, so the key moves to the end of the list. System records
-   * (TLS key and certificate, EPA attestation key) are read-only: 409.
+   * Change a key's label, its description, or both; `updated` becomes now. The
+   * record is rewritten, so the key moves to the end of the list. What is not
+   * given is kept (firmware with DEV-519; before, a missing description was
+   * removed). A label cannot be removed. System records (TLS key and
+   * certificate, EPA attestation key) are read-only: 409. A paired phone's
+   * record takes a new label, but its description cannot change: 409.
    *
    * Required scope: 'keymgmt:upd'
    *
    * @param {string} token
    * @param {string} kid
-   * @param {string} label
-   * @param {Uint8Array|string|null} [descr=null]  null removes the description
+   * @param {string|null} label  The new label, or null to keep the stored one
+   * @param {Uint8Array|string|null} [descr]  Not given: kept; null, '' or empty bytes: removed; otherwise the new description
    * @returns {Promise<void>}
    */
-  async updateKey(token, kid, label, descr = null) {
-    const body = { kid, label };
-    const bytes = descr === null ? null : asBytes(descr);
-    if (bytes?.length) body.descr = toB64(bytes);
+  async updateKey(token, kid, label, descr = undefined) {
+    const body = { kid };
+    if (label !== null && label !== undefined) body.label = label;
+    if (descr !== undefined) {
+      const bytes = descr === null ? null : asBytes(descr);
+      body.descr = bytes?.length ? toB64(bytes) : '';      // '' removes it on the device
+    }
+    if (!('label' in body) && !('descr' in body)) {
+      throw new HemError('updateKey: nothing to change - give a label, a description, or both', { code: 'invalid_arg' });
+    }
     await this.#req('POST', `${this.#baseUrl}/api/keymgmt/update`, body, token);
   }
 
