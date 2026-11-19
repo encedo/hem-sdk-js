@@ -104,7 +104,7 @@ async function handle(req, res) {
   if (path === '/dev/api/auth/token' && req.method === 'POST') {
     const { ok, payload } = await verifyEjwt(body.auth);
     if (!ok) return json(res, 401, { error: 'bad signature' });
-    return json(res, 200, { token: fakeJwt({ scope: payload.scope, exp: payload.exp, sub: 'user', ...(payload.ctx ? { ctx: payload.ctx } : {}) }) });
+    return json(res, 200, { token: fakeJwt({ scope: payload.scope, exp: payload.exp, sub: state.nextSub ?? 'U', ...(payload.ctx ? { ctx: payload.ctx } : {}) }) });
   }
   if (path === '/dev/api/auth/init' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-init', exp: Math.floor(Date.now() / 1000) + 300 });
   if (path === '/dev/api/auth/init' && req.method === 'POST') {
@@ -292,17 +292,27 @@ test('a password change sends the new public key and a proof it can be used', as
   state.configNonce = b64(crypto.getRandomValues(new Uint8Array(32)));
   const hem = mk();
   const token = await hem.authorizePassword('correct horse', 'system:config');
-  await hem.setUserPassword(token, 'a new password');
+  const signin = state.log.filter((e) => e.path === '/dev/api/auth/token' && e.method === 'POST').at(-1).body;
+  const currentPub = JSON.parse(Buffer.from(signin.auth.split('.')[1], 'base64url').toString()).iss;
+
+  // A password-issued token (sub U) needs the current password too (firmware DEV-519).
+  await assert.rejects(hem.setUserPassword(token, 'a new password'), (e) => e.code === 'current_password_required');
+  await assert.rejects(hem.setUserPassword(token, 'a new password', 'correct horse'), (e) => e.code === 'invalid_arg',
+    'the current password goes in the options');
+  await hem.setUserPassword(token, 'a new password', { currentPassword: 'correct horse' });
 
   const sent = state.log.filter((e) => e.path === '/dev/api/system/config' && e.method === 'POST').at(-1).body;
   assert.deepEqual(Object.keys(sent).sort(), ['userkey', 'userkey_hmac', 'userkey_nonce']);
   assert.equal(sent.userkey_nonce, state.configNonce);
   assert.equal(fromB64(sent.userkey).length, 32, 'a public key, not a password');
 
-  // The device checks the proof by doing the same ECDH from its side.
-  const userPub = await crypto.subtle.importKey('raw', fromB64(sent.userkey), 'X25519', false, []);
-  const shared = await crypto.subtle.deriveBits({ name: 'X25519', public: userPub }, state.devKeys.privateKey, 256);
-  const key = await crypto.subtle.importKey('raw', shared, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  // The device checks the proof by doing the same ECDH from its side, with the new key and the current one.
+  const ecdh = async (pubB64) => {
+    const pub = await crypto.subtle.importKey('raw', fromB64(pubB64), 'X25519', false, []);
+    return new Uint8Array(await crypto.subtle.deriveBits({ name: 'X25519', public: pub }, state.devKeys.privateKey, 256));
+  };
+  const both = new Uint8Array([...await ecdh(sent.userkey), ...await ecdh(currentPub)]);
+  const key = await crypto.subtle.importKey('raw', both, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
   assert.equal(await crypto.subtle.verify('HMAC', key, fromB64(sent.userkey_hmac), fromB64(state.configNonce)), true);
 
   // And the key really is the one that password derives to.
@@ -311,6 +321,26 @@ test('a password change sends the new public key and a proof it can be used', as
   const proof = state.log.filter((e) => e.path === '/dev/api/auth/token' && e.method === 'POST').at(-1).body;
   const payload = JSON.parse(Buffer.from(proof.auth.split('.')[1], 'base64url').toString());
   assert.equal(payload.iss, sent.userkey, 'the module can now be unlocked with it');
+});
+
+test('a password change with the 24 words needs no current password', async () => {
+  state.configNonce = b64(crypto.getRandomValues(new Uint8Array(32)));
+  const hem = mk();
+  state.nextSub = 'M';   // the mock module answers as to the master key
+  let token;
+  try {
+    token = await hem.authorizeMaster(await generateMnemonic(), 'system:config');
+  } finally {
+    delete state.nextSub;
+  }
+  await hem.setUserPassword(token, 'forgotten one replaced');
+
+  const sent = state.log.filter((e) => e.path === '/dev/api/system/config' && e.method === 'POST').at(-1).body;
+  const pub = await crypto.subtle.importKey('raw', fromB64(sent.userkey), 'X25519', false, []);
+  const shared = await crypto.subtle.deriveBits({ name: 'X25519', public: pub }, state.devKeys.privateKey, 256);
+  const key = await crypto.subtle.importKey('raw', shared, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  assert.equal(await crypto.subtle.verify('HMAC', key, fromB64(sent.userkey_hmac), fromB64(state.configNonce)), true,
+    'the proof is over the new key alone');
 });
 
 test('authorising with the master secret never reuses a token the words did not make', async () => {

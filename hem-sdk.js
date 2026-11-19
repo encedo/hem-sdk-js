@@ -2891,23 +2891,44 @@ export class HEM {
    * device's own nonce under the shared secret. A module that took a public key
    * without that proof would take one from anybody who could reach this endpoint.
    *
+   * With a token the password issued (role `U`) the device also wants proof of
+   * the current password (firmware DEV-519): the HMAC key is then the shared
+   * secret of the new key followed by that of the current one, 64 bytes. A
+   * stolen token alone no longer changes the password. With a token of the
+   * 24 words (role `M`) the current password is not needed - that is how a
+   * forgotten one is replaced.
+   *
    * The master passphrase is not touched: this is the everyday password, and the
    * 24 words still open the device if it is forgotten.
+   *
+   * The device answers 400 when the proof does not match (a wrong current
+   * password, an old nonce) and keeps the password it had.
    *
    * Required scope: 'system:config'
    *
    * @param {string} token        Bearer JWT
    * @param {string} newPassword
+   * @param {{currentPassword?: string}} [opts]  required with a role `U` token
    * @returns {Promise<object>}
    */
   async setUserPassword(token, newPassword) {
+    const { currentPassword = null } = optsArg('setUserPassword', arguments, 2);
+    const role = jwtParse(token)?.sub;
+    if (role !== 'M' && currentPassword == null) {
+      throw new HemError('A password-issued token changes the password only with the current one (currentPassword)',
+        { code: 'current_password_required' });
+    }
     const cfg = await this.getConfig(token);
     const { eid, spk, nonce } = cfg;
     if (!eid || !spk || !nonce) {
       throw new HemError('The device did not send eid, spk and nonce to change a password against', { code: 'config_incomplete' });
     }
     const user = await this.#deriveX25519(newPassword, eid);
-    const shared = await x25519(user.privKey, fromB64(spk));
+    let shared = await x25519(user.privKey, fromB64(spk));
+    if (role !== 'M') {   // DEV-519: the current password's shared secret follows the new one's
+      const current = await this.#deriveX25519(currentPassword, eid);
+      shared = concat(shared, await x25519(current.privKey, fromB64(spk)));
+    }
     const hmacKey = await crypto.subtle.importKey('raw', shared, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, fromB64(nonce)));
     return this.setConfig(token, {

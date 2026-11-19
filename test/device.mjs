@@ -296,6 +296,27 @@ await step('getLoggerKey with our nonce, listLogFiles, verifyLogFile (v2)', asyn
   return `${l.total} files, newest ${newest}: ok ${r.ok}, ${r.lines} lines, ${r.headers} headers, gaps ${r.gaps.length}${r.reason ? ', ' + r.reason + '@' + r.line : ''}; ${cur}`;
 });
 
+// --- password change (firmware DEV-519: a password token needs the current password) ---
+await step('setUserPassword: wrong current 400, right current, and back', async () => {
+  const other = `${PASS} (changed)`;
+  const t = await tok('system:config');
+  let wrong = 'accepted';
+  try { await hem.setUserPassword(t, other, { currentPassword: `${PASS}?` }); } catch (e) { wrong = e.code; }
+  ok(wrong === 'http_400', `wrong current password: ${wrong}`);
+  await hem.setUserPassword(t, other, { currentPassword: PASS });
+  hem.clearCache();
+  hem.clearKeys();
+  try {
+    const t2 = await hem.authorizePassword(other, 'system:config', { remember: false });
+    await hem.setUserPassword(t2, PASS, { currentPassword: other });
+  } finally {
+    hem.clearCache();
+    hem.clearKeys();
+  }
+  await tok('system:config');   // the original password opens it again
+  return `wrong current ${wrong}`;
+});
+
 // --- clean up -------------------------------------------------------------------------
 await step(`deleteKey x${made.length} (cleanup)`, async () => {
   const t = await tok('keymgmt:del');

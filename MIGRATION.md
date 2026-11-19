@@ -1,5 +1,20 @@
 # Upgrading the SDK
 
+## setUserPassword needs the current password (2026-11-19, firmware DEV-519)
+
+`setUserPassword(token, newPassword, { currentPassword })`. With a token the
+password issued (role `U`), firmware with DEV-519 wants proof of the current
+password as well: the HMAC of the device nonce is keyed with the shared secret
+of the new key followed by that of the current one (64 bytes). A token on its
+own - a session left open - no longer changes the password. With a token of
+the 24 words (role `M`) nothing changes: the proof is over the new key alone,
+which is how a forgotten password is replaced. The SDK reads the role from
+the token and throws `HemError` `current_password_required` before any request
+when a `U` token comes without `currentPassword`; a wrong current password is
+`http_400` from the device (before, a wrong proof left the password unchanged
+and answered 200). Who this touches: the Manager (settings, password card -
+changed in the same sitting); no other consumer calls it.
+
 ## AES key size in alg (2026-11-18, firmware DEV-519)
 
 With a stored AES key, `cipherEncrypt` / `cipherDecrypt` / `cipherWrap` /

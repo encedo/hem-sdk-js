@@ -385,8 +385,9 @@ export declare class HEM {
   getStatus(opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<Record<string, unknown>>;
   /** Scope: system:config, logger:get or auth:ext:pair. */
   getConfig(token: string): Promise<Record<string, unknown>>;
-  /** Change the everyday password. Sends the key it derives to, plus a proof of ECDH; the 24 words are untouched. */
-  setUserPassword(token: string, newPassword: string): Promise<unknown>;
+  /** Change the everyday password. Sends the key it derives to, plus a proof of ECDH; the 24 words are untouched.
+   *  A password-issued token (role U) needs `currentPassword` (firmware DEV-519); a token of the 24 words (role M) does not. */
+  setUserPassword(token: string, newPassword: string, opts?: { currentPassword?: string }): Promise<unknown>;
   setConfig(token: string, cfg: Record<string, unknown>): Promise<{ updated: boolean }>;
   /** Key storage reclaim report, a dry run. Scope: system:config. */
   defragCheck(token: string): Promise<{ used: number; keys: number; deleted: number; deleted_size: number; invalid: number;
