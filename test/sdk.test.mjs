@@ -351,13 +351,18 @@ test('keyCacheTtl ends a remembered password that many seconds after it was type
   }
 });
 
-test('a password or the 24 words over plain http are refused unless allowed; a cached token is still served (DEV-532)', async () => {
+test('a password, the 24 words, initialize and a password change over plain http are refused unless allowed; a cached token is still served (DEV-532)', async () => {
   const plain = new HEM(`${base}/dev`, { broker: `${base}/brk` });
   const sent = state.log.length;
   const refused = (e) => e instanceof HemError && e.code === 'plain_http_login';
   await assert.rejects(plain.authorizePassword('correct horse', 'keymgmt:list'), refused);
   await assert.rejects(plain.authorizePassword(null, 'keymgmt:list'), refused, 'with a remembered key or without');
   await assert.rejects(plain.authorizeMaster(await generateMnemonic(), 'system:config'), refused);
+  await assert.rejects(plain.initialize({ mnemonic: await generateMnemonic() }, 'user-password'), refused, 'initialize');
+  const exp = Math.floor(Date.now() / 1000) + 300;
+  await assert.rejects(plain.setUserPassword(fakeJwt({ scope: 'system:config', sub: 'U', exp }), 'new one', { currentPassword: 'correct horse' }),
+    refused, 'setUserPassword with a U token');
+  await assert.rejects(plain.setUserPassword(fakeJwt({ scope: 'system:config', sub: 'M', exp }), 'new one'), refused, 'and with an M token');
   assert.equal(state.log.length, sent, 'nothing was sent');
 
   // authorizeRemote is not affected, and the token it brings needs no login to be handed out again

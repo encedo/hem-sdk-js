@@ -174,8 +174,9 @@ certificate chained to pki.encedo.com, the audit log. It makes its own keys
   non-extractable HMAC key. It ends when the device reboots, after the
   optional `keyCacheTtl` seconds (`new HEM(url, { keyCacheTtl })`) or at
   `clearKeys()`, and gives no way back to the password's key.
-- A password or the 24 words to an `http://` URL are refused
-  (`plain_http_login`) unless `new HEM(url, { allowPlainHttpLogin: true })`.
+- A password or the 24 words to an `http://` URL, and `initialize` /
+  `setUserPassword` there, are refused (`plain_http_login`) unless
+  `new HEM(url, { allowPlainHttpLogin: true })` - a service mode.
 - Call `clearKeys()` on logout to forget the remembered password and the tokens.
 
 ## License

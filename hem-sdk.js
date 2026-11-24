@@ -1299,9 +1299,11 @@ export class HEM {
    * @param {number} [opts.keyCacheTtl=0]  How long a remembered password (authorizePassword
    *   `remember`) lasts, in seconds from the moment it was typed. 0 / absent: no limit of the
    *   SDK's own - it lasts until the device reboots or clearKeys().
-   * @param {boolean} [opts.allowPlainHttpLogin=false]  Allow authorizePassword / authorizeMaster
-   *   against an `http://` base URL. Without it they throw `plain_http_login` before any request:
-   *   over plain http the eJWT and the token it is exchanged for can be read on the way.
+   * @param {boolean} [opts.allowPlainHttpLogin=false]  Allow authorizePassword / authorizeMaster,
+   *   initialize and setUserPassword against an `http://` base URL. Without it they throw
+   *   `plain_http_login` before any request: over plain http the eJWT and the token it is
+   *   exchanged for can be read on the way. Plain http is a service mode (repairing TLS on a
+   *   personalised device, a mock on localhost); set it only for that.
    */
   constructor(hsmUrl, { broker = 'https://api.encedo.com', debug = false, keyCacheTtl = 0, allowPlainHttpLogin = false } = {}) {
     this.#baseUrl = hsmUrl.replace(/\/+$/, '');
@@ -1434,10 +1436,11 @@ export class HEM {
 
   // DEV-532: a password or the 24 words over plain http are refused unless the
   // caller said otherwise - the eJWT and the token that comes back travel in the
-  // clear. Checked before any request; a cached token needs none and is still served.
+  // clear. Login, initialisation and a password change. Checked before any
+  // request; a cached token needs none and is still served.
   #refusePlainHttp(what) {
     if (this.#allowPlainHttpLogin || !/^http:\/\//i.test(this.#baseUrl)) return;
-    throw new HemError(`${what} login over plain http is refused (options.allowPlainHttpLogin)`, { code: 'plain_http_login' });
+    throw new HemError(`${what} over plain http is refused (options.allowPlainHttpLogin)`, { code: 'plain_http_login' });
   }
 
   // -- Authorization: Password -------------------------------------------------
@@ -1477,7 +1480,7 @@ export class HEM {
     checkTokenCtx('authorizePassword', ctx);
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
-    this.#refusePlainHttp('Password');   // DEV-532: before any request
+    this.#refusePlainHttp('Password login');   // DEV-532: before any request
 
     // DEV-532: without a password only a remembered session key will do. One
     // that is gone or out of its keyCacheTtl is known without asking the device.
@@ -1557,7 +1560,7 @@ export class HEM {
     const { expSeconds = 300, legacy = false, ctx = null } = optsArg('authorizeMaster', arguments, 2);
     checkScope(scope);
     checkTokenCtx('authorizeMaster', ctx);
-    this.#refusePlainHttp('Master secret');   // DEV-532: before any request
+    this.#refusePlainHttp('Master secret login');   // DEV-532: before any request
     // No cache read here, deliberately. A cached token for this scope may have
     // come from the password, and a caller asking to authorise with the master
     // secret is asking for that key in particular — handing back a token the
@@ -1837,8 +1840,11 @@ export class HEM {
    *                                userkey are filled in and override any value passed here.
    * @returns {Promise<{instanceid: string, token: string, csr?: string, genuine?: string,
    *          reboot_required?: boolean}>}  The token (system:config, 8 h) is also cached
+   * @throws {HemError} `plain_http_login` against an `http://` base URL without
+   *   `allowPlainHttpLogin` (DEV-532), before any request
    */
   async initialize(admin, userPassword, cfg = {}) {
+    this.#refusePlainHttp('Initialisation');   // DEV-532: before any request
     // Phase 1 -- challenge
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/init`);
     // { eid: string (salt), spk: base64 (device X25519 pubkey), jti, exp }
@@ -2989,6 +2995,8 @@ export class HEM {
    * @param {string} newPassword
    * @param {{currentPassword?: string}} [opts]  required with a role `U` token
    * @returns {Promise<object>}
+   * @throws {HemError} `plain_http_login` against an `http://` base URL without
+   *   `allowPlainHttpLogin` (DEV-532), before any request
    */
   async setUserPassword(token, newPassword) {
     const { currentPassword = null } = optsArg('setUserPassword', arguments, 2);
@@ -2997,6 +3005,7 @@ export class HEM {
       throw new HemError('A password-issued token changes the password only with the current one (currentPassword)',
         { code: 'current_password_required' });
     }
+    this.#refusePlainHttp('Password change');   // DEV-532: before any request
     const cfg = await this.getConfig(token);
     const { eid, spk, nonce } = cfg;
     if (!eid || !spk || !nonce) {

@@ -232,8 +232,9 @@ export declare class HEM {
      */
     keyCacheTtl?: number;
     /**
-     * Allow authorizePassword / authorizeMaster against an `http://` base URL.
-     * Default false: they throw `plain_http_login` before any request (a cached token is still returned).
+     * Allow authorizePassword / authorizeMaster, initialize and setUserPassword against an `http://`
+     * base URL - a service mode (TLS repair, a local mock). Default false: they throw `plain_http_login`
+     * before any request (a cached token is still returned).
      */
     allowPlainHttpLogin?: boolean;
   });
@@ -286,6 +287,7 @@ export declare class HEM {
    * Provision a factory-fresh device. Pass the master secret as `{ mnemonic }`
    * (from generateMnemonic) or `{ entropy }`; a password string still works.
    * masterkey/userkey are written into cfg automatically.
+   * Against an `http://` base URL without `allowPlainHttpLogin`: `plain_http_login`, nothing sent.
    */
   initialize(admin: string | { mnemonic: string } | { entropy: Uint8Array }, userPassword: string, cfg?: Record<string, unknown>): Promise<{
     instanceid: string; token: string; csr?: string; genuine?: string; reboot_required?: boolean;
@@ -411,7 +413,8 @@ export declare class HEM {
   /** Scope: system:config, logger:get or auth:ext:pair. */
   getConfig(token: string): Promise<Record<string, unknown>>;
   /** Change the everyday password. Sends the key it derives to, plus a proof of ECDH; the 24 words are untouched.
-   *  A password-issued token (role U) needs `currentPassword` (firmware DEV-519); a token of the 24 words (role M) does not. */
+   *  A password-issued token (role U) needs `currentPassword` (firmware DEV-519); a token of the 24 words (role M) does not.
+   *  Against an `http://` base URL without `allowPlainHttpLogin`: `plain_http_login`, nothing sent. */
   setUserPassword(token: string, newPassword: string, opts?: { currentPassword?: string }): Promise<unknown>;
   setConfig(token: string, cfg: Record<string, unknown>): Promise<{ updated: boolean }>;
   /** Key storage reclaim report, a dry run. Scope: system:config. */

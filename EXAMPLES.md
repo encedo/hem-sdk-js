@@ -12,7 +12,7 @@ const hem = new HEM('https://abc.ence.do', {
   // broker: 'https://api.encedo.com',  // notification broker (default)
   // debug: true,                        // log every request/response
   // keyCacheTtl: 900,                   // a remembered password lasts 15 min (default: until the device reboots)
-  // allowPlainHttpLogin: true,          // password / 24-word login to an http:// URL (refused by default)
+  // allowPlainHttpLogin: true,          // login / initialize / password change to an http:// URL (refused by default)
 });
 ```
 
@@ -103,7 +103,8 @@ async function tokenFor(scope) {
 A password (and the 24 words) to an `http://` URL is refused with
 `plain_http_login` before anything is sent, unless the HEM was made with
 `{ allowPlainHttpLogin: true }`; a token already cached is still handed out.
-`authorizeRemote` and calls with a token are not affected.
+`initialize` and `setUserPassword` follow the same rule. `authorizeRemote`
+and the other calls with a token are not affected.
 
 ### Mobile-push login (remote)
 

@@ -83,8 +83,9 @@ here**, never in a downstream copy.
   the optional `keyCacheTtl` deadline; never the X25519 private key).
   `clearCache()` / `clearKeys()` drop them. `authorizeMaster` and
   `setUserPassword` never read or write `#sessionKey`.
-- Password / master login against an `http://` base URL throws
-  `plain_http_login` unless `new HEM(url, { allowPlainHttpLogin: true })`.
+- Password / master login, `initialize` and `setUserPassword` against an
+  `http://` base URL throw `plain_http_login` unless
+  `new HEM(url, { allowPlainHttpLogin: true })` - plain http is a service mode.
 
 ## One line, no branches
 

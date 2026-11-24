@@ -29,6 +29,12 @@ same `auth` eJWT, `iss` = the password's public key, HS256.
   (that sends nothing). `authorizeRemote` and every call with a token are not
   affected. What to do: use `https://`, or, where plain http is meant (a mock
   device on localhost, a test bench), `new HEM(url, { allowPlainHttpLogin: true })`.
+- **`initialize` and `setUserPassword` to an `http://` URL are refused too**
+  (2026-11-24, same option): the first sends the user password's key and
+  the master public key, the second a new password's key, so the same
+  `plain_http_login` comes before any request unless `allowPlainHttpLogin`.
+  Plain http is a service mode (repairing TLS on a personalised device);
+  the option is for that and for a local mock, not for everyday use.
 - `authorizeMaster` remembers nothing (as before); `setUserPassword` derives
   from the passwords typed for it and never from the remembered one.
 
