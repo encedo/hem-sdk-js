@@ -74,10 +74,17 @@ here**, never in a downstream copy.
     socket failed as `network` - seen on a PPA, 2026-11-06.
   - Non-2xx responses throw `HemError`.
 - Auth crypto helpers (module-level): `x25519*`, `toB64`/`toB64url`/`fromB64`,
-  `strToBytes`, `jwtParse`. eJWT building is `#buildEjwt`; password→X25519 key
-  derivation is `#deriveX25519` (PBKDF2-SHA256, 600 000 iterations).
-- Caches: `#tokenCache` (scoped JWTs, auto-purged on expiry), `#derivedKeys`
-  (derived X25519 key pair). `clearCache()` / `clearKeys()` drop them.
+  `strToBytes`, `jwtParse`, `sessionHmacKey`. eJWT building is `#buildEjwt`
+  (signs with an HMAC CryptoKey); password→X25519 key derivation is
+  `#deriveX25519` (PBKDF2-SHA256, 600 000 iterations).
+- Caches: `#tokenCache` (scoped JWTs, auto-purged on expiry), `#sessionKey`
+  (DEV-532: the remembered password as K_s = X25519(user_sk, spk), a
+  non-extractable HMAC key bound to `eid` + `spk`, i.e. one device boot, plus
+  the optional `keyCacheTtl` deadline; never the X25519 private key).
+  `clearCache()` / `clearKeys()` drop them. `authorizeMaster` and
+  `setUserPassword` never read or write `#sessionKey`.
+- Password / master login against an `http://` base URL throws
+  `plain_http_login` unless `new HEM(url, { allowPlainHttpLogin: true })`.
 
 ## One line, no branches
 

@@ -368,6 +368,19 @@ async function keysFromSeed(seed) {
   return { privKey, pubkeyB64: toB64(await x25519(privKey, X25519_BASE_POINT)) };
 }
 
+// DEV-532: K_s = X25519(user_sk, spk), the HMAC-SHA256 key of the `auth` eJWT
+// for one boot of the device (`spk` is new after every reboot). Imported at once
+// as a non-extractable HMAC key and the raw bytes zeroed, so what a session keeps
+// opens nothing after the device reboots and does not give `user_sk` back.
+async function sessionHmacKey(privKey, spkB64) {
+  const ks = await x25519(privKey, fromB64(spkB64));
+  try {
+    return await crypto.subtle.importKey('raw', ks, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  } finally {
+    ks.fill(0);
+  }
+}
+
 // --- BIP39: the master secret -------------------------------------------------
 //
 // The master secret of a HEM is 256 bits of entropy from the system CSPRNG.
@@ -1271,18 +1284,36 @@ export class HEM {
   #broker;
   #debug;
   #tokenCache = [];
-  #derivedKeys = null;   // { privKey: CryptoKey (non-extractable), pubkeyB64: string }
+  // DEV-532: the remembered password is the session secret of one device boot,
+  // not the X25519 key the password derives to:
+  // { eid, spk, iss: base64 user_pk, ks: HMAC CryptoKey (non-extractable), until: ms | null }
+  #sessionKey = null;
+  #keyCacheTtl = 0;             // DEV-532: seconds, 0 = no limit of the SDK's own
+  #allowPlainHttpLogin = false; // DEV-532
 
   /**
    * @param {string} hsmUrl   Base URL of the Encedo HEM device (e.g. 'https://abc.ence.do')
    * @param {object} [opts]
    * @param {string|Broker} [opts.broker='https://api.encedo.com']  Broker URL, or a Broker instance to share
    * @param {boolean} [opts.debug=false]  Log requests to console
+   * @param {number} [opts.keyCacheTtl=0]  How long a remembered password (authorizePassword
+   *   `remember`) lasts, in seconds from the moment it was typed. 0 / absent: no limit of the
+   *   SDK's own - it lasts until the device reboots or clearKeys().
+   * @param {boolean} [opts.allowPlainHttpLogin=false]  Allow authorizePassword / authorizeMaster
+   *   against an `http://` base URL. Without it they throw `plain_http_login` before any request:
+   *   over plain http the eJWT and the token it is exchanged for can be read on the way.
    */
-  constructor(hsmUrl, { broker = 'https://api.encedo.com', debug = false } = {}) {
+  constructor(hsmUrl, { broker = 'https://api.encedo.com', debug = false, keyCacheTtl = 0, allowPlainHttpLogin = false } = {}) {
     this.#baseUrl = hsmUrl.replace(/\/+$/, '');
     this.#broker = broker instanceof Broker ? broker : new Broker(broker, { debug });
     this.#debug = debug;
+    // DEV-532
+    const ttl = keyCacheTtl ?? 0;
+    if (typeof ttl !== 'number' || !Number.isFinite(ttl) || ttl < 0) {
+      throw new HemError('keyCacheTtl is a number of seconds, 0 or more', { code: 'invalid_arg' });
+    }
+    this.#keyCacheTtl = ttl;
+    this.#allowPlainHttpLogin = allowPlainHttpLogin === true;
   }
 
   /** The Broker this instance uses for every api.encedo.com call. */
@@ -1291,13 +1322,13 @@ export class HEM {
   // -- Key Cache ---------------------------------------------------------------
 
   /**
-   * Discard cached derived keys (e.g. on logout).
-   * Expired JWT tokens are also purged.
+   * Forget the remembered password (the session key of this device boot, DEV-532)
+   * and every cached token (e.g. on logout).
    * The CryptoKey object will be garbage-collected; there is no explicit destroy
    * in Web Crypto API — non-extractable keys cannot be read back from memory by JS.
    */
   clearKeys() {
-    this.#derivedKeys = null;
+    this.#sessionKey = null;   // DEV-532
     this.#tokenCache = [];
   }
 
@@ -1386,24 +1417,27 @@ export class HEM {
   /**
    * Build eJWT: base64url(header).base64url(payload).HMAC-SHA256sig
    * Header is { ecdh: 'x25519' } -- matches JS reference implementation.
-   * Shared secret = X25519(seed, devicePubkey) -- same as nacl.scalarMult(seed, remotePub).
+   * `hmacKey` is the shared secret X25519(seed, devicePubkey) -- same as
+   * nacl.scalarMult(seed, remotePub) -- imported by sessionHmacKey (DEV-532).
    */
-  async #buildEjwt(privKey, devicePubkeyB64, payload) {
+  async #buildEjwt(hmacKey, payload) {
     // Header matches jwt_generate_hs256 reference: adds alg+typ to the caller-supplied fields
     const hdr = toB64url(strToBytes(JSON.stringify({ ecdh: 'x25519', alg: 'HS256', typ: 'JWT' })));
     const bdy = toB64url(strToBytes(JSON.stringify(payload)));
     const input = `${hdr}.${bdy}`;
 
-    // Shared secret: X25519(seed, devicePubkey)
-    const sharedSecret = await x25519(privKey, fromB64(devicePubkeyB64));
-
     // HMAC-SHA256(input, sharedSecret)
-    const hmacKey = await crypto.subtle.importKey(
-      'raw', sharedSecret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-    );
     const sig = await crypto.subtle.sign('HMAC', hmacKey, strToBytes(input));
 
     return `${input}.${toB64url(new Uint8Array(sig))}`;
+  }
+
+  // DEV-532: a password or the 24 words over plain http are refused unless the
+  // caller said otherwise - the eJWT and the token that comes back travel in the
+  // clear. Checked before any request; a cached token needs none and is still served.
+  #refusePlainHttp(what) {
+    if (this.#allowPlainHttpLogin || !/^http:\/\//i.test(this.#baseUrl)) return;
+    throw new HemError(`${what} login over plain http is refused (options.allowPlainHttpLogin)`, { code: 'plain_http_login' });
   }
 
   // -- Authorization: Password -------------------------------------------------
@@ -1424,11 +1458,18 @@ export class HEM {
    * @param {number} [opts.expSeconds=300]  Requested token lifetime (the device's own
    *   default without one would be 60 s)
    * @param {string} [opts.ctx]  1..64 bytes of UTF-8, copied into the token
-   * @param {boolean} [opts.remember=true]  Keep the derived key for the scopes
+   * @param {boolean} [opts.remember=true]  Remember the password for the scopes
    *   that follow. With `false` it is used for this call alone and the next
    *   scope needs the password typed again — v1's "save password for this
-   *   session", unticked. Tokens are cached either way.
+   *   session", unticked. Tokens are cached either way. What is remembered is
+   *   the session key of this device boot (DEV-532), not the password or the
+   *   key it derives to: after the device reboots, after `keyCacheTtl` seconds
+   *   (a constructor option) or after clearKeys(), a call without the password
+   *   throws `auth_password_required`.
    * @returns {Promise<string>}  JWT token
+   * @throws {HemError} `auth_password_required` without a password and nothing
+   *   remembered for this device boot; `plain_http_login` against an `http://`
+   *   base URL without `allowPlainHttpLogin` (a cached token is still returned)
    */
   async authorizePassword(password, scope, opts) {
     const { expSeconds = 300, remember = true, ctx = null } = optsArg('authorizePassword', arguments, 2);
@@ -1436,28 +1477,55 @@ export class HEM {
     checkTokenCtx('authorizePassword', ctx);
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
+    this.#refusePlainHttp('Password');   // DEV-532: before any request
+
+    // DEV-532: without a password only a remembered session key will do. One
+    // that is gone or out of its keyCacheTtl is known without asking the device.
+    const remembered = () => {
+      const s = this.#sessionKey;
+      if (s && (s.until === null || Date.now() < s.until)) return s;
+      this.#sessionKey = null;
+      throw new HemError('Password required (no remembered password for this device boot)', { code: 'auth_password_required' });
+    };
+    if (!password) remembered();
 
     // Phase 1 -- get challenge (always needed for fresh jti + spk)
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
     // { eid: string (stable salt), spk: base64 (device X25519 pubkey), jti: string (nonce) }
 
-    // Derive X25519 keys from the password, or reuse what a previous call kept.
-    // Whether to keep them is the caller's to decide: a UI that offers "remember
-    // the password for this session" keeps them and never asks again, one that
-    // does not asks for every scope, and with `remember: false` the key lives no
-    // longer than this call. Tokens are cached either way, so the same scope is
-    // not asked about twice.
-    let keys = this.#derivedKeys;
+    // Sign with the password, or with what a previous call kept. Whether to keep
+    // it is the caller's to decide: a UI that offers "remember the password for
+    // this session" keeps it and never asks again, one that does not asks for
+    // every scope, and with `remember: false` nothing outlives this call. Tokens
+    // are cached either way, so the same scope is not asked about twice.
+    // DEV-532: what is kept is K_s = X25519(user_sk, spk), the HMAC key of this
+    // device boot, not user_sk: a new spk (a reboot) makes it worthless.
+    let session;
     if (password) {
-      keys = await this.#deriveX25519(password, challenge.eid);
-      if (remember) this.#derivedKeys = keys;
+      const typedAt = Date.now();
+      let derived = await this.#deriveX25519(password, challenge.eid);
+      session = {
+        eid: challenge.eid,
+        spk: challenge.spk,
+        iss: derived.pubkeyB64,
+        ks: await sessionHmacKey(derived.privKey, challenge.spk),
+        until: this.#keyCacheTtl > 0 ? typedAt + this.#keyCacheTtl * 1000 : null,
+      };
+      derived = null;   // the X25519 private key is not kept anywhere
       // Note: JS strings are immutable — the password primitive cannot be zeroed here.
       // The caller should not hold a long-lived reference to it.
+    } else {
+      session = remembered();
+      if (session.eid !== challenge.eid || session.spk !== challenge.spk) {   // another device, or it rebooted
+        this.#sessionKey = null;
+        throw new HemError('Password required (no remembered password for this device boot)', { code: 'auth_password_required' });
+      }
     }
-    if (!keys) {
-      throw new HemError('Password required (no cached keys)', { code: 'auth_password_required' });
-    }
-    return this.#authorizeWithKeys(keys, challenge, scope, expSeconds, ctx);
+    const token = await this.#authorizeWithSession(session, challenge, scope, expSeconds, ctx);
+    // DEV-532: remembered only once the device took it - a refused password is
+    // not kept and does not replace the remembered one.
+    if (password && remember) this.#sessionKey = session;
+    return token;
   }
 
   // -- Authorization: Master secret (the 24 words) ------------------------------
@@ -1481,11 +1549,15 @@ export class HEM {
    * @param {boolean} [opts.legacy=false]  Device personalised by the v1 Manager,
    *   whose master key came from the BIP39 seed at a one-nibble offset.
    * @returns {Promise<string>}  JWT token
+   * @throws {HemError} `plain_http_login` against an `http://` base URL without
+   *   `allowPlainHttpLogin` (DEV-532) - the master secret over plain http is
+   *   exposed the same way a password is. Nothing is remembered for later calls.
    */
   async authorizeMaster(mnemonic, scope, opts) {
     const { expSeconds = 300, legacy = false, ctx = null } = optsArg('authorizeMaster', arguments, 2);
     checkScope(scope);
     checkTokenCtx('authorizeMaster', ctx);
+    this.#refusePlainHttp('Master secret');   // DEV-532: before any request
     // No cache read here, deliberately. A cached token for this scope may have
     // come from the password, and a caller asking to authorise with the master
     // secret is asking for that key in particular — handing back a token the
@@ -1495,27 +1567,34 @@ export class HEM {
     if (seed.length !== 32) {
       throw new HemError('The master secret must be 24 words (256 bits)', { code: 'mnemonic_invalid', data: { bytes: seed.length } });
     }
-    const keys = await keysFromSeed(seed);
+    let keys = await keysFromSeed(seed);
     seed.fill(0);
 
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
-    return this.#authorizeWithKeys(keys, challenge, scope, expSeconds, ctx);
+    // DEV-532: the same K_s signing path as a password, used for this call only -
+    // the master key's session key is never written to #sessionKey.
+    const session = { iss: keys.pubkeyB64, ks: await sessionHmacKey(keys.privKey, challenge.spk) };
+    keys = null;
+    return this.#authorizeWithSession(session, challenge, scope, expSeconds, ctx);
   }
 
-  /** Sign the device's challenge with `keys` and exchange it for a scoped token. */
-  async #authorizeWithKeys({ privKey, pubkeyB64 }, challenge, scope, expSeconds, ctx = null) {
+  /**
+   * Sign the device's challenge with the session key `ks` (HMAC key K_s) as
+   * `iss` and exchange it for a scoped token. DEV-532: was #authorizeWithKeys.
+   */
+  async #authorizeWithSession({ iss, ks }, challenge, scope, expSeconds, ctx = null) {
     const iat = Math.floor(Date.now() / 1000) - 5;   // -5s for clock drift
     const payload = {
       jti: challenge.jti,
       aud: challenge.spk,
       exp: iat + expSeconds,
       iat,
-      iss: pubkeyB64,   // our X25519 public key as standard base64
+      iss,   // our X25519 public key as standard base64
       scope,
     };
     if (ctx) payload.ctx = ctx;
 
-    const ejwt = await this.#buildEjwt(privKey, challenge.spk, payload);
+    const ejwt = await this.#buildEjwt(ks, payload);   // DEV-532
     const resp = await this.#req('POST', `${this.#baseUrl}/api/auth/token`, { auth: ejwt });
 
     if (!resp.token) throw new HemError('No token in auth response', { code: 'auth_failed' });
@@ -1797,7 +1876,7 @@ export class HEM {
     };
 
     // eJWT signed with the ADMIN key
-    const ejwt = await this.#buildEjwt(adminKeys.privKey, challenge.spk, payload);
+    const ejwt = await this.#buildEjwt(await sessionHmacKey(adminKeys.privKey, challenge.spk), payload);   // DEV-532
     const result = await this.#req('POST', `${this.#baseUrl}/api/auth/init`, { init: ejwt });
     // The answer carries a system:config token (8 h): what the personalisation
     // does next (format wait, domain, certificate) needs no second sign-in.
@@ -2923,6 +3002,8 @@ export class HEM {
     if (!eid || !spk || !nonce) {
       throw new HemError('The device did not send eid, spk and nonce to change a password against', { code: 'config_incomplete' });
     }
+    // DEV-532: both keys are derived from the passwords typed here, never taken
+    // from #sessionKey - a remembered password must not change the password.
     const user = await this.#deriveX25519(newPassword, eid);
     let shared = await x25519(user.privKey, fromB64(spk));
     if (role !== 'M') {   // DEV-519: the current password's shared secret follows the new one's

@@ -104,6 +104,7 @@ async function handle(req, res) {
   if (path === '/dev/api/auth/token' && req.method === 'POST') {
     const { ok, payload } = await verifyEjwt(body.auth);
     if (!ok) return json(res, 401, { error: 'bad signature' });
+    if (state.userIss && payload.iss !== state.userIss) return json(res, 401, { error: 'not the userkey' });   // DEV-532 test: a wrong password
     return json(res, 200, { token: fakeJwt({ scope: payload.scope, exp: payload.exp, sub: state.nextSub ?? 'U', ...(payload.ctx ? { ctx: payload.ctx } : {}) }) });
   }
   if (path === '/dev/api/auth/init' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-init', exp: Math.floor(Date.now() / 1000) + 300 });
@@ -245,7 +246,9 @@ before(async () => {
 });
 after(() => server.close());
 
-const mk = () => new HEM(`${base}/dev`, { broker: `${base}/brk` });
+// The mock listens on plain http, so a login needs allowPlainHttpLogin (DEV-532).
+const mk = (opts = {}) => new HEM(`${base}/dev`, { broker: `${base}/brk`, allowPlainHttpLogin: true, ...opts });
+const authPosts = () => state.log.filter((e) => e.path === '/dev/api/auth/token' && e.method === 'POST');
 
 test('hemCheckin returns the device payload with update flags', async () => {
   const r = await mk().hemCheckin();
@@ -286,6 +289,110 @@ test('a password can be used once and not kept, and tokens are cached either way
   const kept = mk();
   await kept.authorizePassword('correct horse', 'keymgmt:list');
   assert.ok(await kept.authorizePassword(null, 'keymgmt:gen'), 'a scope it has no token for still works');
+});
+
+test('a remembered password signs with the session key of this boot, the same auth JWT the password makes (DEV-532)', async (t) => {
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);   // one clock for both, so iat / exp match
+  const kept = mk();
+  await kept.authorizePassword('correct horse', 'keymgmt:list');
+  assert.ok(await kept.authorizePassword(null, 'keymgmt:gen'), 'same spk: no password needed');
+  const remembered = authPosts().at(-1).body.auth;
+
+  await mk().authorizePassword('correct horse', 'keymgmt:gen');   // the same challenge, from the password
+  assert.equal(authPosts().at(-1).body.auth, remembered, 'byte for byte: iss = user_pk, HS256 under K_s');
+  assert.equal(JSON.parse(Buffer.from(remembered.split('.')[0], 'base64url').toString()).alg, 'HS256');
+});
+
+test('after the device reboots (a new spk) a remembered password is gone (DEV-532)', async () => {
+  const hem = mk();
+  await hem.authorizePassword('correct horse', 'keymgmt:list');
+  const old = { devKeys: state.devKeys, spkB64: state.spkB64 };
+  state.devKeys = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+  state.spkB64 = b64(new Uint8Array(await crypto.subtle.exportKey('raw', state.devKeys.publicKey)));
+  try {
+    const signed = authPosts().length;
+    await assert.rejects(hem.authorizePassword(null, 'keymgmt:gen'), (e) => e instanceof HemError && e.code === 'auth_password_required');
+    assert.equal(authPosts().length, signed, 'nothing signed with the key of the old boot');
+
+    const asked = state.log.length;
+    await assert.rejects(hem.authorizePassword(null, 'keymgmt:gen'), (e) => e.code === 'auth_password_required');
+    assert.equal(state.log.length, asked, 'the entry was dropped: the next call does not even ask for a challenge');
+
+    assert.ok(await hem.authorizePassword('correct horse', 'keymgmt:gen'), 'typed again, it works on the new boot');
+    assert.ok(await hem.authorizePassword(null, 'logger:get'), 'and is remembered for this one');
+  } finally {
+    Object.assign(state, old);
+  }
+});
+
+test('keyCacheTtl ends a remembered password that many seconds after it was typed (DEV-532)', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const hem = mk({ keyCacheTtl: 60 });
+  await hem.authorizePassword('correct horse', 'keymgmt:list');
+  now += 59_000;
+  assert.ok(await hem.authorizePassword(null, 'keymgmt:gen'), 'inside the TTL');
+  now += 2_000;
+  const asked = state.log.length;
+  await assert.rejects(hem.authorizePassword(null, 'logger:get'), (e) => e.code === 'auth_password_required');
+  assert.equal(state.log.length, asked, 'known without asking the device');
+  assert.ok(await hem.authorizePassword(null, 'keymgmt:list'), 'tokens already issued live by their own exp');
+
+  const forever = mk({ keyCacheTtl: 0 });
+  await forever.authorizePassword('correct horse', 'keymgmt:list');
+  now += 10 * 86400_000;
+  assert.ok(await forever.authorizePassword(null, 'keymgmt:gen'), '0: no limit of the SDK\'s own');
+  forever.clearKeys();
+  await assert.rejects(forever.authorizePassword(null, 'keymgmt:gen'), (e) => e.code === 'auth_password_required', 'clearKeys drops it');
+
+  for (const bad of [-1, NaN, Infinity, '60']) {
+    assert.throws(() => mk({ keyCacheTtl: bad }), (e) => e.code === 'invalid_arg', String(bad));
+  }
+});
+
+test('a password or the 24 words over plain http are refused unless allowed; a cached token is still served (DEV-532)', async () => {
+  const plain = new HEM(`${base}/dev`, { broker: `${base}/brk` });
+  const sent = state.log.length;
+  const refused = (e) => e instanceof HemError && e.code === 'plain_http_login';
+  await assert.rejects(plain.authorizePassword('correct horse', 'keymgmt:list'), refused);
+  await assert.rejects(plain.authorizePassword(null, 'keymgmt:list'), refused, 'with a remembered key or without');
+  await assert.rejects(plain.authorizeMaster(await generateMnemonic(), 'system:config'), refused);
+  assert.equal(state.log.length, sent, 'nothing was sent');
+
+  // authorizeRemote is not affected, and the token it brings needs no login to be handed out again
+  const remote = await plain.authorizeRemote('keymgmt:list', { pollInterval: 5 });
+  assert.equal(await plain.authorizePassword(null, 'keymgmt:list'), remote);
+
+  assert.ok(await mk().authorizePassword('correct horse', 'keymgmt:list'), 'allowPlainHttpLogin: true lets it through');
+  await assert.rejects(new HEM('https://hem.invalid').authorizePassword(null, 'keymgmt:list'), (e) => e.code === 'auth_password_required',
+    'an https base URL is not refused');
+});
+
+test('the 24 words are never remembered (DEV-532)', async () => {
+  const hem = mk();
+  state.nextSub = 'M';
+  try {
+    assert.ok(await hem.authorizeMaster(await generateMnemonic(), 'system:config'));
+  } finally {
+    delete state.nextSub;
+  }
+  await assert.rejects(hem.authorizePassword(null, 'keymgmt:list'), (e) => e.code === 'auth_password_required');
+});
+
+test('a password the device refuses is not remembered and does not replace the remembered one (DEV-532)', async () => {
+  const hem = mk();
+  await hem.authorizePassword('correct horse', 'keymgmt:list');
+  state.userIss = JSON.parse(Buffer.from(authPosts().at(-1).body.auth.split('.')[1], 'base64url').toString()).iss;
+  try {
+    const fresh = mk();
+    await assert.rejects(fresh.authorizePassword('wrong horse', 'keymgmt:list'), (e) => e.code === 'http_401');
+    await assert.rejects(fresh.authorizePassword(null, 'keymgmt:gen'), (e) => e.code === 'auth_password_required');
+    await assert.rejects(hem.authorizePassword('wrong horse', 'keymgmt:gen'), (e) => e.code === 'http_401');
+    assert.ok(await hem.authorizePassword(null, 'keymgmt:gen'), 'the remembered password still answers');
+  } finally {
+    delete state.userIss;
+  }
 });
 
 test('a password change sends the new public key and a proof it can be used', async () => {

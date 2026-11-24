@@ -1,5 +1,45 @@
 # Upgrading the SDK
 
+## A remembered password lasts one device boot; no password login over plain http (2026-11-24, DEV-532)
+
+Behaviour changes, no signature changes. The wire format is the same: the
+same `auth` eJWT, `iss` = the password's public key, HS256.
+
+- **A remembered password is gone after the HEM reboots.**
+  `authorizePassword(password, scope)` with `remember` (the default) used to
+  keep the X25519 key the password derives to - a credential with no end. It
+  now keeps the session key of this device boot, K_s = X25519(user_sk, spk),
+  as a non-extractable HMAC key, bound to the device's `eid` and `spk`. The
+  device has a new `spk` after every reboot (an upgrade, the reboot button, a
+  power cut), so `authorizePassword(null, scope)` then throws `HemError`
+  `auth_password_required` - the same code as before when nothing was
+  remembered - and the remembered entry is dropped. What to do: on
+  `auth_password_required` ask for the password again (a caller that handled
+  `remember: false` already does). Tokens already issued are not touched.
+- **New option `keyCacheTtl`** (`new HEM(url, { keyCacheTtl: 900 })`):
+  seconds a remembered password lasts from the moment it was typed; 0 / not
+  given is no limit of the SDK's own (until the device reboots or
+  `clearKeys()`). A value that is not a number >= 0 throws `invalid_arg`.
+- **Password login to an `http://` URL is refused.** `authorizePassword` (with
+  a password or a remembered one) and `authorizeMaster` against a base URL
+  that starts with `http://` throw `HemError` `plain_http_login` before any
+  request: the eJWT (the public key in it is enough to test password guesses
+  offline) and the token the device answers with would travel in the clear;
+  the 24 words get the same rule. A token already cached is still returned
+  (that sends nothing). `authorizeRemote` and every call with a token are not
+  affected. What to do: use `https://`, or, where plain http is meant (a mock
+  device on localhost, a test bench), `new HEM(url, { allowPlainHttpLogin: true })`.
+- `authorizeMaster` remembers nothing (as before); `setUserPassword` derives
+  from the passwords typed for it and never from the remembered one.
+
+Who this touches: the Manager - `app/session.js` builds `new HEM(hem, { broker })`
+with the URL from `app/config.js`, which is `http://` for the dev server's mock
+module (`?hem=http://localhost:8080/mock`) and for a page served by the module
+over plain http; its `dev/session.test.mjs` signs in to an `http://` mock.
+Every other consumer constructs `new HEM(url, { debug? })` against an
+`https://` device and keeps its copy until it takes this one; with it, a
+remembered password needs asking again after a device reboot.
+
 ## setUserPassword needs the current password (2026-11-19, firmware DEV-519)
 
 `setUserPassword(token, newPassword, { currentPassword })`. With a token the

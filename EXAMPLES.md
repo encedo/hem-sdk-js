@@ -11,6 +11,8 @@ import { HEM, HemError } from './hem-sdk.js';
 const hem = new HEM('https://abc.ence.do', {
   // broker: 'https://api.encedo.com',  // notification broker (default)
   // debug: true,                        // log every request/response
+  // keyCacheTtl: 900,                   // a remembered password lasts 15 min (default: until the device reboots)
+  // allowPlainHttpLogin: true,          // password / 24-word login to an http:// URL (refused by default)
 });
 ```
 
@@ -66,17 +68,42 @@ const taken = await hem.broker.domainTaken('my');          // true / false
 PBKDF2 + X25519 ECDH happen locally; the device returns a scoped JWT.
 
 ```js
-// First call derives the X25519 key from the password (cached afterwards).
+// First call derives the key from the password and remembers the password for
+// this device boot (remember: true is the default).
 const listToken = await hem.authorizePassword('my-password', 'keymgmt:list');
 
-// Escalate to another scope — pass null to reuse the cached derived key,
-// so the password is not needed (and not re-derived) again.
+// Escalate to another scope — pass null to use the remembered password,
+// so it is not needed (and not re-derived) again.
 const useToken = await hem.authorizePassword(null, `keymgmt:use:${kid}`);
 
 // expSeconds — requested token lifetime (default 300). Optional values go in
 // the options object; a number in its place throws (MIGRATION.md).
 const longToken = await hem.authorizePassword('my-password', 'keymgmt:list', { expSeconds: 3600 });
 ```
+
+What is remembered is not the password or the X25519 key it derives to but
+the session key of this device boot, K_s = X25519(user_sk, spk), as a
+non-extractable HMAC key (DEV-532). The device has a new `spk` after every
+reboot, so a remembered password ends there; also after the constructor's
+`keyCacheTtl` seconds (counted from the moment it was typed) and at
+`clearKeys()`. Then a call without the password throws
+`auth_password_required` — ask for it again:
+
+```js
+async function tokenFor(scope) {
+  try {
+    return await hem.authorizePassword(null, scope);    // cached token, or the remembered password
+  } catch (e) {
+    if (e.code !== 'auth_password_required') throw e;
+    return hem.authorizePassword(await askPassword(), scope);
+  }
+}
+```
+
+A password (and the 24 words) to an `http://` URL is refused with
+`plain_http_login` before anything is sent, unless the HEM was made with
+`{ allowPlainHttpLogin: true }`; a token already cached is still handed out.
+`authorizeRemote` and calls with a token are not affected.
 
 ### Mobile-push login (remote)
 
@@ -699,7 +726,7 @@ try {
     //        broker_error, auth_failed, auth_password_required, denied,
     //        sign_error, verify_failed, ecdh_error, hmac_error, cipher_error,
     //        pqc_error, ext_register_error, domain_error, mnemonic_invalid,
-    //        mnemonic_checksum
+    //        mnemonic_checksum, plain_http_login
   } else {
     throw e;
   }
@@ -710,7 +737,7 @@ try {
 
 ```js
 hem.clearCache();   // drop cached JWT tokens
-hem.clearKeys();    // drop cached derived X25519 keys AND all tokens — on logout
+hem.clearKeys();    // forget the remembered password AND all tokens — on logout
 ```
 
 ## Reading a token

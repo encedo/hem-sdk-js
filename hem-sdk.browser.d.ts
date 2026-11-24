@@ -222,7 +222,21 @@ export interface HemCipherResult {
 }
 
 export declare class HEM {
-  constructor(hsmUrl: string, opts?: { broker?: string | Broker; debug?: boolean });
+  constructor(hsmUrl: string, opts?: {
+    broker?: string | Broker;
+    debug?: boolean;
+    /**
+     * Seconds a remembered password lasts from the moment it was typed. 0 / absent:
+     * no limit of the SDK's own (until the device reboots or clearKeys()).
+     * Not a number >= 0: throws `invalid_arg`.
+     */
+    keyCacheTtl?: number;
+    /**
+     * Allow authorizePassword / authorizeMaster against an `http://` base URL.
+     * Default false: they throw `plain_http_login` before any request (a cached token is still returned).
+     */
+    allowPlainHttpLogin?: boolean;
+  });
 
   /** The Broker this instance uses for every api.encedo.com call. */
   readonly broker: Broker;
@@ -234,9 +248,16 @@ export declare class HEM {
    */
   hemCheckin(): Promise<{ status: string; newfws?: string; newuis?: string; [key: string]: unknown }>;
 
-  /** Pass null or '' to reuse cached derived keys (set on first call with a real password). */
-  /** `remember: false` uses the derived key for this call alone; the next scope needs the password again. */
-  /** A cached token answers for every scope it holds; `ctx` (1..64 bytes of UTF-8) is copied into the token. */
+  /**
+   * Pass null or '' to use the remembered password (kept by an earlier call with
+   * `remember`, the default). What is kept is the session key of this device boot,
+   * K_s = X25519(user_sk, spk) as a non-extractable HMAC key: after the device
+   * reboots, after `keyCacheTtl` or clearKeys() a call without the password throws
+   * `auth_password_required`.
+   * `remember: false` uses the password for this call alone; the next scope needs it again.
+   * A cached token answers for every scope it holds; `ctx` (1..64 bytes of UTF-8) is copied into the token.
+   * Against an `http://` base URL without `allowPlainHttpLogin`: `plain_http_login`, nothing sent.
+   */
   authorizePassword(password: string | null, scope: HemScope, opts?: { expSeconds?: number; remember?: boolean; ctx?: string | null } | null): Promise<string>;
 
   /**
@@ -270,7 +291,11 @@ export declare class HEM {
     instanceid: string; token: string; csr?: string; genuine?: string; reboot_required?: boolean;
   }>;
 
-  /** Authenticate with the 24-word master secret. `legacy`: device personalised by the v1 Manager. */
+  /**
+   * Authenticate with the 24-word master secret. `legacy`: device personalised by the v1 Manager.
+   * Nothing is remembered for later calls. Against an `http://` base URL without
+   * `allowPlainHttpLogin`: `plain_http_login`, nothing sent.
+   */
   authorizeMaster(mnemonic: string, scope: HemScope, opts?: { expSeconds?: number; legacy?: boolean; ctx?: string | null } | null): Promise<string>;
 
   /** Broker MAC data for the paired-authenticator calls; listExtAuth / deleteExtAuth do the round trip. */
@@ -461,7 +486,7 @@ export declare class HEM {
 
   /** Cached scopes and when each stops working — the tokens themselves stay inside. */
   readonly tokens: Array<{ scope: HemScope; exp: number }>;
-  /** Discard cached derived keys and all JWT tokens (call on logout). */
+  /** Forget the remembered password (session key of this device boot) and all JWT tokens (call on logout). */
   clearKeys(): void;
 }
 

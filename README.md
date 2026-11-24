@@ -168,8 +168,15 @@ certificate chained to pki.encedo.com, the audit log. It makes its own keys
 ## Security notes
 
 - Passwords are zeroed in memory immediately after key derivation.
-- Derived X25519 private keys are non-extractable `CryptoKey` objects.
-- Call `clearKeys()` on logout to discard cached keys and tokens.
+- Derived X25519 private keys are non-extractable `CryptoKey` objects, and
+  none is kept: a remembered password (`authorizePassword`'s `remember`) is the
+  session key of one device boot, K_s = X25519(user_sk, spk), a
+  non-extractable HMAC key. It ends when the device reboots, after the
+  optional `keyCacheTtl` seconds (`new HEM(url, { keyCacheTtl })`) or at
+  `clearKeys()`, and gives no way back to the password's key.
+- A password or the 24 words to an `http://` URL are refused
+  (`plain_http_login`) unless `new HEM(url, { allowPlainHttpLogin: true })`.
+- Call `clearKeys()` on logout to forget the remembered password and the tokens.
 
 ## License
 
