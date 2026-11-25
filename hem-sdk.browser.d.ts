@@ -495,6 +495,8 @@ export declare class HEM {
 
 /** SHA-256 of the DER of the Encedo Root CA, pinned by Attest.verifyDevice(). */
 export declare const ENCEDO_ROOT_SHA256: string;
+/** SHA-256 of the DER of the device CAs (Encedo Custody CA, Encedo EPA Custody CA), pinned by Attest.verifyDevice(). */
+export declare const ENCEDO_DEVICE_CA_SHA256: readonly string[];
 
 export interface AttestRequest {
   nonce: Uint8Array;
@@ -590,9 +592,11 @@ export declare class Attest {
     /** Fail 'auth' without a login context. */ requireAuth?: boolean;
     /** Fail 'org' unless the login came from this Origin (exact). */ org?: string | null;
     /** Fail 'age' when the login started longer ago (s). */ maxAge?: number | null }): Promise<AttestVerification>;
-  /** Level 1_ext. CA certificates from pki() unless `cas` is given; dates and revocation are not checked here. */
-  verifyDevice(point: Uint8Array, crt: string | Uint8Array, opts?: { cas?: Array<string | Uint8Array> | null; rootSha256?: string }): Promise<{
-    ok: boolean; chain: string[]; reason?: 'certificate' | 'key' | 'issuer' | 'signature' | 'root';
+  /** Level 1_ext. CA certificates from pki() unless `cas` is given; dates and revocation are not checked here.
+   *  The device certificate must be issued by a device CA (`deviceCaSha256`), else 'not_device'. */
+  verifyDevice(point: Uint8Array, crt: string | Uint8Array, opts?: { cas?: Array<string | Uint8Array> | null; rootSha256?: string;
+    deviceCaSha256?: readonly string[] }): Promise<{
+    ok: boolean; chain: string[]; reason?: 'certificate' | 'key' | 'issuer' | 'signature' | 'not_device' | 'root';
   }>;
   /** Level 2: attest.encedo.com's verdict. */
   validate(jwt: string | { attestation: string }, opts?: { crt?: string | Uint8Array | null }): Promise<{ status: 'valid' | 'valid_unverified' | 'invalid'; expired?: boolean }>;

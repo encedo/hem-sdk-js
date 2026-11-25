@@ -3565,6 +3565,16 @@ const ATTEST_ISS = 'https://attest.encedo.com';
 const ATTEST_TYP = 'encedo-attest+jwt';
 /** SHA-256 of the DER of the Encedo Root CA (pki.encedo.com). */
 const ENCEDO_ROOT_SHA256 = 'b28f4ee4cf26028260cf4f0db18bd2fb7234d172925797dca7f81e53a2816e9c';
+/**
+ * SHA-256 of the DER of the CAs that issue device certificates (pki.encedo.com):
+ * Encedo Custody CA (HEM PPA) and Encedo EPA Custody CA (HEM EPA). The root has
+ * another branch, the Encedo Signer CA (firmware release keys); a certificate
+ * from it chains to the same root but is not a device.
+ */
+const ENCEDO_DEVICE_CA_SHA256 = Object.freeze([
+  '1f1751e757c04ed3e8a897f8793bef6ae41e707c5e0d5545df9ecd9c1dec5c67',   // Encedo Custody CA
+  'fa6b1688b86e6e6e3bdff8efec29de3d77eb8bdd11237c723f16e1ad85f5591e',   // Encedo EPA Custody CA
+]);
 const POP_SIG = 'encedo-attest-pop:v1:sig';
 const POP_ECDH = 'encedo-attest-pop:v1:ecdh';
 
@@ -3982,21 +3992,25 @@ class Attest {
   }
 
   /**
-   * Level 1_ext: the device certificate carries the attested key and chains to
-   * the Encedo Root CA (its SHA-256 pinned). `point` is verify()'s `point`.
-   * The CA certificates come from pki() unless passed in `cas` (PEM, base64
-   * DER or bytes) - so after one fetch this runs offline. Certificate dates
-   * and revocation are not checked here (see the note above the class).
+   * Level 1_ext: the device certificate carries the attested key, is issued
+   * by a device CA (Custody CA or EPA Custody CA, their SHA-256 pinned) and
+   * chains to the Encedo Root CA (its SHA-256 pinned). `point` is verify()'s
+   * `point`. The CA certificates come from pki() unless passed in `cas` (PEM,
+   * base64 DER or bytes) - so after one fetch this runs offline. Certificate
+   * dates and revocation are not checked here (see the note above the class).
+   * A certificate from another branch of the root (the Encedo Signer CA) is
+   * `not_device`, even for the same key.
    *
    * @param {Uint8Array} point  The device key, 04 || x || y
    * @param {string|Uint8Array} crt  `crt` of HEM.getAttestation() (base64 DER), PEM or bytes
    * @param {object} [opts]
    * @param {Array<string|Uint8Array>} [opts.cas]
    * @param {string} [opts.rootSha256=ENCEDO_ROOT_SHA256]
-   * @returns {Promise<{ok: boolean, chain: string[], reason?: 'certificate'|'key'|'issuer'|'signature'|'root'}>}
+   * @param {string[]} [opts.deviceCaSha256=ENCEDO_DEVICE_CA_SHA256]  The CAs allowed to issue the device certificate
+   * @returns {Promise<{ok: boolean, chain: string[], reason?: 'certificate'|'key'|'issuer'|'signature'|'not_device'|'root'}>}
    *          `chain`: the common names from the device up to the root
    */
-  async verifyDevice(point, crt, { cas = null, rootSha256 = ENCEDO_ROOT_SHA256 } = {}) {
+  async verifyDevice(point, crt, { cas = null, rootSha256 = ENCEDO_ROOT_SHA256, deviceCaSha256 = ENCEDO_DEVICE_CA_SHA256 } = {}) {
     let cert;
     try { cert = parseCertificate(certBytes(crt)); } catch { return { ok: false, chain: [], reason: 'certificate' }; }
     const chain = [nameCN(cert.subject)];
@@ -4008,6 +4022,8 @@ class Attest {
       const parent = pool.find(p => bytesEqual(p.subject, cert.issuer));
       if (!parent) return { ok: false, chain, reason: 'issuer' };
       if (!await certSignedBy(cert, parent)) return { ok: false, chain, reason: 'signature' };
+      // the device certificate itself must come from a device CA, not from another branch of the root
+      if (depth === 0 && !deviceCaSha256.includes(toHex(await sha256(parent.der)))) return { ok: false, chain, reason: 'not_device' };
       if (parent === cert) {
         // Self-signed: the end of the chain, and it must be the pinned root.
         const fp = toHex(await sha256(parent.der));
@@ -4060,5 +4076,5 @@ class Attest {
   }
 }
 
-export { Attest, Broker, ENCEDO_ROOT_SHA256, HEM, HemError, entropyToMnemonic, generateMnemonic, jwtParse, mnemonicToEntropy, validateMnemonic, verifyLog, verifyLoggerKey };
+export { Attest, Broker, ENCEDO_DEVICE_CA_SHA256, ENCEDO_ROOT_SHA256, HEM, HemError, entropyToMnemonic, generateMnemonic, jwtParse, mnemonicToEntropy, validateMnemonic, verifyLog, verifyLoggerKey };
 //# sourceMappingURL=hem-sdk.browser.js.map

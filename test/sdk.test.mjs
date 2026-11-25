@@ -1272,29 +1272,82 @@ test('Attest.verify: ECDH-MAC PoP on X25519 and P-256', async () => {
   await assert.rejects(Attest.prepare({ aud: 'a', pop: 'sig' }), (e) => e.code === 'invalid_arg', 'a PoP needs a key');
 });
 
-test('Attest.verifyDevice: the certificate holds the token key and chains to the pinned root', async () => {
+const pemDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----|\s/g, ''), 'base64');
+const sha256Hex = (der) => nodeCrypto.createHash('sha256').update(der).digest('hex');
+const TEST_DEVICE_CA = [sha256Hex(pemDer(PKI.custody))];   // the test PKI's Custody CA stands for the real device CAs
+
+test('Attest.verifyDevice: the certificate holds the token key, comes from a device CA and chains to the pinned root', async () => {
   const { state } = await Attest.prepare({ aud: 'x' });
   const { jwt, point } = await deviceToken({ state });
   const r = await Attest.verify(jwt, state);
   const attest = new Attest(`${base}/att`);
   const cas = [PKI.root, PKI.attestation, PKI.custody];
-  const ok = await attest.verifyDevice(r.point, PKI.device, { cas, rootSha256: PKI.rootSha256 });
+  const pin = { rootSha256: PKI.rootSha256, deviceCaSha256: TEST_DEVICE_CA };
+  const ok = await attest.verifyDevice(r.point, PKI.device, { cas, ...pin });
   assert.deepEqual(ok, { ok: true, chain: ['#0123TESTDEVICE', 'Encedo TEST Custody CA', 'Encedo TEST Attestation CA', 'Encedo TEST Root CA'] });
-  assert.equal((await attest.verifyDevice(point, Buffer.from(PKI.device, 'base64'), { cas, rootSha256: PKI.rootSha256 })).ok, true, 'DER bytes too');
+  assert.equal((await attest.verifyDevice(point, Buffer.from(PKI.device, 'base64'), { cas, ...pin })).ok, true, 'DER bytes too');
 
-  assert.equal((await attest.verifyDevice(r.point, PKI.device, { cas })).reason, 'root', 'the real Encedo root is pinned by default');
-  assert.equal((await attest.verifyDevice(r.point, PKI.device, { cas: [PKI.root, PKI.custody], rootSha256: PKI.rootSha256 })).reason, 'issuer');
+  assert.equal((await attest.verifyDevice(r.point, PKI.device, { cas, deviceCaSha256: TEST_DEVICE_CA })).reason, 'root', 'the real Encedo root is pinned by default');
+  assert.equal((await attest.verifyDevice(r.point, PKI.device, { cas, rootSha256: PKI.rootSha256 })).reason, 'not_device', 'the real device CAs are pinned by default');
+  assert.equal((await attest.verifyDevice(r.point, PKI.device, { cas: [PKI.root, PKI.custody], ...pin })).reason, 'issuer');
   const wrongKey = new Uint8Array(point); wrongKey[5] ^= 1;
-  assert.equal((await attest.verifyDevice(wrongKey, PKI.device, { cas, rootSha256: PKI.rootSha256 })).reason, 'key', 'a certificate for another key');
+  assert.equal((await attest.verifyDevice(wrongKey, PKI.device, { cas, ...pin })).reason, 'key', 'a certificate for another key');
   const tampered = Buffer.from(PKI.device, 'base64'); tampered[tampered.length - 80] ^= 1;   // inside the signature
-  assert.equal((await attest.verifyDevice(r.point, tampered, { cas, rootSha256: PKI.rootSha256 })).reason, 'signature');
+  assert.equal((await attest.verifyDevice(r.point, tampered, { cas, ...pin })).reason, 'signature');
   assert.equal((await attest.verifyDevice(r.point, 'not a certificate', { cas })).reason, 'certificate');
 
   // Without cas the CA certificates come from attest.encedo.com /v1/pki, once.
   const before = mockLog().length;
-  assert.equal((await attest.verifyDevice(r.point, PKI.device, { rootSha256: PKI.rootSha256 })).ok, true);
-  await attest.verifyDevice(r.point, PKI.device, { rootSha256: PKI.rootSha256 });
+  assert.equal((await attest.verifyDevice(r.point, PKI.device, pin)).ok, true);
+  await attest.verifyDevice(r.point, PKI.device, pin);
   assert.equal(mockLog().slice(before).filter((l) => l.path === '/att/v1/pki').length, 1);
+});
+
+// A minimal X.509 writer for the CAs this test makes while it runs (nothing kept): DER, ECDSA P-256.
+function der(tag, ...parts) {
+  const body = Buffer.concat(parts.map((p) => Buffer.from(p)));
+  let len = [body.length];
+  if (body.length > 127) { len = []; for (let n = body.length; n; n >>= 8) len.unshift(n & 0xff); len.unshift(0x80 | len.length); }
+  return Buffer.concat([Buffer.from([tag, ...len]), body]);
+}
+const derSeq = (...p) => der(0x30, ...p);
+function derOid(s) {
+  const a = s.split('.').map(Number), out = [40 * a[0] + a[1]];
+  for (const v of a.slice(2)) { const b = [v & 0x7f]; for (let n = v >> 7; n; n >>= 7) b.unshift((n & 0x7f) | 0x80); out.push(...b); }
+  return der(0x06, Buffer.from(out));
+}
+const derName = (cn) => derSeq(der(0x31, derSeq(derOid('2.5.4.3'), der(0x0c, Buffer.from(cn)))));
+const derTime = (ms) => der(0x17, Buffer.from(new Date(ms).toISOString().replace(/[-:T]/g, '').slice(2, 14) + 'Z'));
+function makeCert({ serial, issuer, subject, publicKey, signWith, ca }) {
+  const sigAlg = derSeq(derOid('1.2.840.10045.4.3.2'));                               // ecdsa-with-SHA256
+  const ext = ca ? [der(0xa3, derSeq(derSeq(derOid('2.5.29.19'), der(0x01, [0xff]), der(0x04, derSeq(der(0x01, [0xff]))))))] : [];
+  const tbs = derSeq(der(0xa0, der(0x02, [2])), der(0x02, [serial]), sigAlg, derName(issuer),
+    derSeq(derTime(Date.now() - 86400e3), derTime(Date.now() + 86400e3)), derName(subject),
+    publicKey.export({ type: 'spki', format: 'der' }), ...ext);
+  return derSeq(tbs, sigAlg, der(0x03, Buffer.concat([Buffer.from([0]), nodeCrypto.sign('sha256', tbs, signWith)])));
+}
+
+test('Attest.verifyDevice: a certificate for the device key from another branch of the root is not a device', async () => {
+  // Made now, for this test only: a root, a CA that is not a device CA (like the Encedo Signer CA,
+  // which certifies the firmware release keys) and a certificate it issues for the device's own key.
+  const { state } = await Attest.prepare({ aud: 'x' });
+  const { jwt } = await deviceToken({ state });
+  const r = await Attest.verify(jwt, state);
+  const ec = () => nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const root = ec(), signer = ec();
+  const devicePub = nodeCrypto.createPublicKey(nodeCrypto.createPrivateKey({ key: Buffer.from(PKI.devicePkcs8, 'base64'), format: 'der', type: 'pkcs8' }));
+  const rootDer = makeCert({ serial: 1, issuer: 'TEST Root', subject: 'TEST Root', publicKey: root.publicKey, signWith: root.privateKey, ca: true });
+  const signerDer = makeCert({ serial: 3, issuer: 'TEST Root', subject: 'TEST Signer CA', publicKey: signer.publicKey, signWith: root.privateKey, ca: true });
+  const leafDer = makeCert({ serial: 1, issuer: 'TEST Signer CA', subject: 'User1', publicKey: devicePub, signWith: signer.privateKey });
+
+  const attest = new Attest(`${base}/att`);
+  const opts = { cas: [rootDer, signerDer], rootSha256: sha256Hex(rootDer) };
+  assert.deepEqual(await attest.verifyDevice(r.point, leafDer, { ...opts, deviceCaSha256: TEST_DEVICE_CA }),
+    { ok: false, chain: ['User1'], reason: 'not_device' }, 'right key, valid chain to the pinned root, but not a device CA');
+  assert.equal((await attest.verifyDevice(r.point, leafDer, opts)).reason, 'not_device', 'nor with the default device CAs');
+  // the same chain passes only when that CA is named a device CA - so the chain itself is valid
+  assert.deepEqual(await attest.verifyDevice(r.point, leafDer, { ...opts, deviceCaSha256: [sha256Hex(signerDer)] }),
+    { ok: true, chain: ['User1', 'TEST Signer CA', 'TEST Root'] });
 });
 
 test('Attest level 2: validate and skidKnown at attest.encedo.com', async () => {

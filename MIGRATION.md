@@ -1,5 +1,27 @@
 # Upgrading the SDK
 
+## verifyDevice: the device certificate must come from a device CA (2026-11-25)
+
+The Encedo Root CA has a second branch since 2026-11-25: the Encedo Signer CA,
+which certifies the keys of the firmware release (cloud_signer operators and the
+firmware publisher). Its certificates chain to the same root. Until now
+`attest.verifyDevice()` accepted any certificate holding the attested key that
+chained to the pinned root, so a certificate from that branch, issued for a P-256
+key that also signed an attestation token, came back `ok: true`.
+
+- `verifyDevice` now also requires the CA that issued the device certificate to
+  be a device CA: Encedo Custody CA (HEM PPA) or Encedo EPA Custody CA (HEM EPA),
+  pinned by the SHA-256 of their DER in the new export `ENCEDO_DEVICE_CA_SHA256`.
+  Any other issuer gives `{ ok: false, reason: 'not_device' }` - a new reason
+  value.
+- New option `deviceCaSha256` (array of hex SHA-256), next to `rootSha256`, for a
+  test PKI.
+- What to do: nothing for real devices (a HEM PPA certificate is issued by the
+  Custody CA). A caller that branches on `reason` should know `not_device`. A
+  test with its own PKI passes `deviceCaSha256` as it passes `rootSha256`.
+  encedo-oidc (`src/services/attestation.js`) uses the defaults and reports
+  `chain:not_device`.
+
 ## A remembered password lasts one device boot; no password login over plain http (2026-11-24, DEV-532)
 
 Behaviour changes, no signature changes. The wire format is the same: the
