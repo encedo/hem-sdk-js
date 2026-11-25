@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import nodeCrypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { HEM, Broker, Attest, HemError, jwtParse, verifyLog, verifyLoggerKey, generateMnemonic, entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '../hem-sdk.js';
+import { HEM, Broker, Attest, HemError, REQUIRED_SCOPES, jwtParse, verifyLog, verifyLoggerKey, generateMnemonic, entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '../hem-sdk.js';
 
 const b64 = (bytes) => Buffer.from(bytes).toString('base64');
 const b64url = (bytes) => Buffer.from(bytes).toString('base64url');
@@ -81,6 +81,15 @@ async function handle(req, res) {
     return json(res, 200, { status: 'ok', newfws: 'v2.0.1+/x', newuis: null });
   }
   if (path === '/dev/api/system/version') return json(res, 200, { hwv: '1', blv: '1', fwv: '2', fws: 'x', conf: 'PPA' });
+  // DEV-535: one device boot. A reboot gives a new spk, restarts the uptime and
+  // refuses every token issued before it (401), as the firmware does.
+  if (path === '/dev/api/system/status') return json(res, 200, { uptime: Math.floor((Date.now() - state.bootAt) / 1000) });
+  if (path === '/dev/api/system/reboot') {
+    if (staleToken(req)) return json(res, 401, { error: 'token of another boot' });
+    await rebootMock();
+    return json(res, 200, { rebooting: true });
+  }
+  if (path === '/dev/api/system/config' && req.method === 'GET' && staleToken(req)) return json(res, 401, { error: 'token of another boot' });
   if (path === '/dev/api/system/config' && req.method === 'GET') {
     return json(res, 200, { eid: state.eid, user: 'Ann', email: 'ann@example.com', hostname: 'my.ence.do', spk: state.spkB64, nonce: state.configNonce });
   }
@@ -105,7 +114,7 @@ async function handle(req, res) {
     const { ok, payload } = await verifyEjwt(body.auth);
     if (!ok) return json(res, 401, { error: 'bad signature' });
     if (state.userIss && payload.iss !== state.userIss) return json(res, 401, { error: 'not the userkey' });   // DEV-532 test: a wrong password
-    return json(res, 200, { token: fakeJwt({ scope: payload.scope, exp: payload.exp, sub: state.nextSub ?? 'U', ...(payload.ctx ? { ctx: payload.ctx } : {}) }) });
+    return json(res, 200, { token: fakeJwt({ scope: payload.scope, exp: payload.exp, sub: state.nextSub ?? 'U', boot: state.boot, ...(payload.ctx ? { ctx: payload.ctx } : {}) }) });
   }
   if (path === '/dev/api/auth/init' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-init', exp: Math.floor(Date.now() / 1000) + 300 });
   if (path === '/dev/api/auth/init' && req.method === 'POST') {
@@ -236,8 +245,24 @@ async function handle(req, res) {
   json(res, 404, { error: 'unmocked ' + req.method + ' ' + path });
 }
 
+// DEV-535: a token carries the boot it was issued in; one of another boot is refused.
+function staleToken(req) {
+  const t = (req.headers.authorization ?? '').replace(/^Bearer /, '');
+  if (!t) return false;
+  const boot = jwtParse(t)?.boot;
+  return boot !== undefined && boot !== state.boot;
+}
+async function rebootMock() {
+  state.boot += 1;
+  state.bootAt = Date.now();
+  state.devKeys = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+  state.spkB64 = b64(new Uint8Array(await crypto.subtle.exportKey('raw', state.devKeys.publicKey)));
+}
+
 let server, base;
 before(async () => {
+  state.boot = 1;
+  state.bootAt = Date.now() - 3600_000;   // up for an hour
   state.devKeys = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
   state.spkB64 = b64(new Uint8Array(await crypto.subtle.exportKey('raw', state.devKeys.publicKey)));
   server = http.createServer((req, res) => handle(req, res).catch((e) => json(res, 500, { error: e.message })));
@@ -1527,4 +1552,86 @@ test('updateKey sends only what changes: label, description, both; null / "" rem
   await hem.updateKey('t', kid, 'x', '');
   assert.deepEqual(sent(), { kid, label: 'x', descr: '' });
   await assert.rejects(hem.updateKey('t', kid, null), (e) => e.code === 'invalid_arg', 'nothing to change');
+});
+
+// -- DEV-535: the SDK picks the token -------------------------------------------------
+
+const scopeOfPost = (entry) => JSON.parse(Buffer.from(entry.body.auth.split('.')[1], 'base64url').toString()).scope;
+
+test('REQUIRED_SCOPES names only methods HEM has; each gives one or more scopes, a kid in its own', () => {
+  for (const [name, entry] of Object.entries(REQUIRED_SCOPES)) {
+    assert.equal(typeof HEM.prototype[name], 'function', name);
+    const list = typeof entry === 'function' ? entry('K9', 'CT', { extKid: 'X9' }) : entry;
+    assert.ok(Array.isArray(list) && list.length >= 1, name);
+    for (const s of list.flat()) assert.match(s, /^(system|keymgmt|logger|auth):[a-z:0-9]+$/i, name);
+  }
+  assert.deepEqual(REQUIRED_SCOPES.exdsaSign('K9'), ['keymgmt:use:K9']);
+  assert.deepEqual(REQUIRED_SCOPES.xwingDecaps('K9', 'CT', { extKid: 'X9' }), [['keymgmt:use:K9', 'keymgmt:use:X9']], 'one token holding both');
+  assert.equal(REQUIRED_SCOPES.reboot[0], 'system:config');
+});
+
+test('a call without a token uses any cached token that satisfies it, and asks for nothing', async () => {
+  const hem = mk();
+  await hem.authorizePassword('correct horse', 'logger:get');
+  const posts = authPosts().length;
+  const config = await hem.getConfig();                 // accepts system:config, logger:get, auth:ext:pair
+  assert.equal(config.eid, state.eid);
+  assert.equal(authPosts().length, posts, 'the logger:get token served it');
+  assert.ok(state.log.at(-1).auth.startsWith('Bearer '));
+});
+
+test('nothing cached: the first scope is obtained with the password remembered for this boot', async () => {
+  const hem = mk();
+  await hem.authorizePassword('correct horse', 'keymgmt:list');
+  const posts = authPosts().length;
+  await hem.reboot();                                   // system:config, system:upgrade or system:shutdown
+  assert.equal(authPosts().length, posts + 1);
+  assert.equal(scopeOfPost(authPosts().at(-1)), 'system:config', 'the first of the three');
+});
+
+test('nothing cached and nothing remembered: the authorize callback is asked, or auth_password_required', async () => {
+  const asked = [];
+  const hem = mk({ authorize: async (scope) => { asked.push(scope); return hem.authorizePassword('correct horse', scope, { remember: false }); } });
+  const keys = await hem.listKeys();
+  assert.ok(Array.isArray(keys.list));
+  assert.deepEqual(asked, ['keymgmt:list']);
+  await hem.listKeys();
+  assert.deepEqual(asked, ['keymgmt:list'], 'cached the second time');
+  await assert.rejects(mk().listKeys(), (e) => e.code === 'auth_password_required');
+  assert.throws(() => mk({ authorize: 'no' }), (e) => e.code === 'invalid_arg');
+});
+
+test('a token passed is used as it is; null still means no token', async () => {
+  const hem = mk();
+  await hem.getConfig('explicit-token');
+  assert.equal(state.log.at(-1).auth, 'Bearer explicit-token');
+  await hem.selftest(null).catch(() => {});
+  assert.equal(state.log.at(-1).auth, null);
+});
+
+test('a reboot seen in /status drops the tokens of the previous boot - even for authorizePassword with the password typed', async () => {
+  const hem = mk();
+  await hem.authorizePassword('correct horse', 'system:config');
+  await hem.getStatus();                                // up for a while: nothing dropped
+  assert.equal(hem.tokens.length, 1);
+  // A real reboot takes seconds; the SDK allows 3 s for the uptime's whole seconds.
+  await new Promise((r) => setTimeout(r, 3500));
+  await rebootMock();
+  await hem.getStatus();                                // the uptime is now shorter than the token's age
+  assert.equal(hem.tokens.length, 0, 'dropped');
+  const posts = authPosts().length;
+  const token = await hem.authorizePassword('correct horse', 'system:config');
+  assert.equal(authPosts().length, posts + 1, 'a new token, not the cached one (2026-11-25, Manager sign-in after a reboot)');
+  await hem.getConfig(token);
+});
+
+test('a picked token refused with 401 (a reboot the SDK did not see) is renewed once and the call goes through', async () => {
+  const asked = [];
+  const hem = mk({ authorize: async (scope) => { asked.push(scope); return hem.authorizePassword('correct horse', scope); } });
+  await hem.authorizePassword('correct horse', 'system:config');
+  await hem.getStatus();                                // fresh: no status check before the next call
+  await rebootMock();                                   // behind the SDK's back
+  const config = await hem.getConfig();
+  assert.equal(config.eid, state.eid);
+  assert.deepEqual(asked, ['system:config'], 'the remembered password was of the old boot: the callback was asked');
 });

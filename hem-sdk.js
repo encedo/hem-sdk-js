@@ -1279,11 +1279,96 @@ function checkMode(type, mode, { importing = false } = {}) {
     { code: 'bad_mode' });
 }
 
+// DEV-535: the scopes the device accepts for each call (firmware API reference
+// 1.3, the scope column), so a caller never has to know them. Any cached token
+// holding one of them serves the call; with none cached the FIRST is asked for.
+// An inner array is one token holding all of its scopes (X-Wing: the key and
+// its CURVE25519 half). A function builds the list from the call's arguments.
+// Not here, so a token stays the caller's to pass: calls taking "any token"
+// (getAttestation, attest, random), storage lock / unlock (the disk is in the
+// scope) and HPKE (the recipient decides the scope).
+const USE = (kid) => `keymgmt:use:${kid}`;
+const SYSTEM_UPGRADE = ['system:upgrade', 'system:config'];
+export const REQUIRED_SCOPES = Object.freeze({
+  getExtAuthMac: ['system:config', 'auth:ext:pair'],
+  listExtAuth: ['system:config', 'auth:ext:pair'],
+  deleteExtAuth: ['system:config', 'auth:ext:pair'],
+  registerExtAuth: ['system:config'],
+  createKeyPair: ['keymgmt:gen'],
+  importPublicKey: ['keymgmt:imp'],
+  deriveKey: ['keymgmt:derive', 'keymgmt:gen'],
+  updateKey: ['keymgmt:upd'],
+  getKeyPublicInfo: (kid) => ['keymgmt:get', 'keymgmt:gen', USE(kid)],
+  listKeys: ['keymgmt:list'],
+  listKeysAll: ['keymgmt:list'],
+  searchKeys: ['keymgmt:search', 'keymgmt:list', 'auth:ext:pair'],
+  searchKeysAll: ['keymgmt:search', 'keymgmt:list', 'auth:ext:pair'],
+  deleteKey: ['keymgmt:del'],
+  exdsaSign: (kid) => [USE(kid)],
+  exdsaVerify: (kid) => [USE(kid)],
+  ecdh: (kid) => [USE(kid)],          // a stored peer extKid needs no scope of its own
+  ecdhHkdf: (kid) => [USE(kid)],
+  hmacHash: (kid) => [USE(kid)],
+  hmacVerify: (kid) => [USE(kid)],
+  cipherEncrypt: (kid) => [USE(kid)],
+  cipherDecrypt: (kid) => [USE(kid)],
+  cipherWrap: (kid) => [USE(kid)],
+  cipherUnwrap: (kid) => [USE(kid)],
+  mlkemEncaps: (kid) => [USE(kid)],
+  mlkemDecaps: (kid) => [USE(kid)],
+  mldsaSign: (kid) => [USE(kid)],
+  mldsaVerify: (kid) => [USE(kid)],
+  xwingEncaps: (kid, opts) => [[USE(kid), USE(opts?.extKid)]],
+  xwingDecaps: (kid, ct, opts) => [[USE(kid), USE(opts?.extKid)]],
+  kdf: (kid) => [USE(kid)],
+  otp: (kid) => [USE(kid)],
+  otpVerify: (kid) => [USE(kid)],
+  setUserPassword: ['system:config'],
+  getConfig: ['system:config', 'logger:get', 'auth:ext:pair'],
+  setConfig: ['system:config'],
+  reboot: ['system:config', 'system:upgrade', 'system:shutdown'],
+  shutdown: ['system:config', 'system:shutdown'],
+  selftest: ['system:config'],
+  defragCheck: ['system:config'],
+  defragStart: ['system:config'],
+  rebootToUsbMode: SYSTEM_UPGRADE,
+  uploadFirmware: ['system:upgrade'],
+  checkFirmware: SYSTEM_UPGRADE,
+  waitFirmwareCheck: SYSTEM_UPGRADE,
+  installFirmware: SYSTEM_UPGRADE,
+  uploadUi: ['system:upgrade'],
+  checkUi: SYSTEM_UPGRADE,
+  waitUiCheck: SYSTEM_UPGRADE,
+  installUi: SYSTEM_UPGRADE,
+  getLoggerKey: ['logger:get'],
+  listLogFiles: ['logger:get'],
+  getLogFile: ['logger:get'],
+  verifyLogFile: ['logger:get'],
+  registerDomain: ['system:config'],
+});
+
+/** The scopes `REQUIRED_SCOPES` names for a call with these arguments. */
+function scopesFor(name, args) {
+  const entry = REQUIRED_SCOPES[name];
+  return typeof entry === 'function' ? entry(...args) : entry;
+}
+
+// DEV-535: a token is good for one device boot. A cached one is checked against
+// /api/system/status at most this often: an uptime shorter than the token's
+// age means the device rebooted since it was issued.
+const BOOT_CHECK_MS = 10_000;
+const BOOT_SLACK_MS = 3_000;   // uptime is whole seconds, plus the request's own time
+
 export class HEM {
   #baseUrl;
   #broker;
   #debug;
   #tokenCache = [];
+  // DEV-535
+  #authorize = null;       // the caller's way to get a token for a scope: (scope) => Promise<string>
+  #picked = new Map();     // token the SDK picked -> the scopes it was for (a 401 asks again)
+  #renewed = new Map();    // token refused with 401 -> its replacement, for the same call's next request
+  #seenAt = 0;             // ms: the device last showed its boot - /api/system/status, or a token it issued
   // DEV-532: the remembered password is the session secret of one device boot,
   // not the X25519 key the password derives to:
   // { eid, spk, iss: base64 user_pk, ks: HMAC CryptoKey (non-extractable), until: ms | null }
@@ -1304,8 +1389,13 @@ export class HEM {
    *   `plain_http_login` before any request: over plain http the eJWT and the token it is
    *   exchanged for can be read on the way. Plain http is a service mode (repairing TLS on a
    *   personalised device, a mock on localhost); set it only for that.
+   * @param {(scope: string|string[]) => Promise<string>} [opts.authorize]  DEV-535: called when a
+   *   method needs a token (it was called without one), none is cached for any scope it accepts,
+   *   and no password is remembered for this device boot. A UI asks the person here - the
+   *   password (authorizePassword) or the phone (authorizeRemote) - and returns the token. Without
+   *   it such a call throws `auth_password_required`.
    */
-  constructor(hsmUrl, { broker = 'https://api.encedo.com', debug = false, keyCacheTtl = 0, allowPlainHttpLogin = false } = {}) {
+  constructor(hsmUrl, { broker = 'https://api.encedo.com', debug = false, keyCacheTtl = 0, allowPlainHttpLogin = false, authorize = null } = {}) {
     this.#baseUrl = hsmUrl.replace(/\/+$/, '');
     this.#broker = broker instanceof Broker ? broker : new Broker(broker, { debug });
     this.#debug = debug;
@@ -1316,6 +1406,10 @@ export class HEM {
     }
     this.#keyCacheTtl = ttl;
     this.#allowPlainHttpLogin = allowPlainHttpLogin === true;
+    if (authorize !== null && typeof authorize !== 'function') {
+      throw new HemError('authorize is a function (scope) => Promise<token>', { code: 'invalid_arg' });
+    }
+    this.#authorize = authorize;   // DEV-535
   }
 
   /** The Broker this instance uses for every api.encedo.com call. */
@@ -1332,6 +1426,71 @@ export class HEM {
   clearKeys() {
     this.#sessionKey = null;   // DEV-532
     this.#tokenCache = [];
+    this.#picked.clear();      // DEV-535
+    this.#renewed.clear();
+  }
+
+  // -- Tokens the SDK picks itself (DEV-535) -------------------------------------
+
+  /**
+   * A token for `name` called with `args`: `token` itself when the caller passed
+   * one (null included: no token, where the device allows it), otherwise a
+   * cached token holding any scope the call accepts, otherwise one obtained for
+   * the first of them.
+   */
+  async #auto(token, name, ...args) {
+    if (token !== undefined) return token;
+    const alternatives = scopesFor(name, args);
+    await this.#bootCheck();
+    for (const scope of alternatives) {
+      const hit = this.#cacheFind(scope);
+      if (hit) { this.#picked.set(hit, alternatives); return hit; }
+    }
+    const fresh = await this.#obtain(alternatives[0]);
+    this.#picked.set(fresh, alternatives);
+    return fresh;
+  }
+
+  /** A new token for `scope`: the password remembered for this boot, else the caller's authorize. */
+  async #obtain(scope) {
+    try {
+      return await this.authorizePassword(null, scope);
+    } catch (e) {
+      if (!(e instanceof HemError) || e.code !== 'auth_password_required' || !this.#authorize) throw e;
+    }
+    const token = await this.#authorize(scope);
+    if (typeof token !== 'string' || !token) {
+      throw new HemError(`No token for ${scopeList(scope).join(', ')}`, { code: 'auth_password_required' });
+    }
+    return token;
+  }
+
+  /**
+   * Did the device reboot since the cached tokens were issued? Asks
+   * /api/system/status when the device has shown nothing of its boot (a status,
+   * a new token) for BOOT_CHECK_MS and there is something to lose; a device
+   * that does not answer leaves the cache alone.
+   */
+  async #bootCheck() {
+    if (!this.#tokenCache.length && !this.#sessionKey) return;
+    if (Date.now() - this.#seenAt < BOOT_CHECK_MS) return;
+    try { await this.getStatus({ timeoutMs: 5000 }); } catch (e) { if (!(e instanceof HemError)) throw e; }
+  }
+
+  /**
+   * An uptime the device reported: tokens issued and a password remembered
+   * before its last boot are worthless - dropped, so the next call asks again
+   * instead of being refused.
+   */
+  #observeUptime(uptime) {
+    if (!Number.isFinite(uptime) || uptime < 0) return;
+    const now = Date.now();
+    this.#seenAt = now;
+    const bootedAt = now - uptime * 1000 - BOOT_SLACK_MS;
+    const before = this.#tokenCache.length;
+    this.#tokenCache = this.#tokenCache.filter(e => e.issuedAt >= bootedAt);
+    if (this.#sessionKey && this.#sessionKey.at < bootedAt) this.#sessionKey = null;
+    if (this.#tokenCache.length !== before && this.#debug) console.log('[HEM] the device rebooted: tokens of the previous boot dropped');
   }
 
   // -- Token Cache -------------------------------------------------------------
@@ -1345,7 +1504,9 @@ export class HEM {
     const payload = jwtParse(jwt);
     const exp = payload?.exp ?? (Math.floor(Date.now() / 1000) + 300);
     const granted = payload?.scope ?? scope;
-    this.#tokenCache.push({ scope: granted, scopes: scopeList(granted), ctx, token: jwt, exp });
+    // issuedAt (this machine's clock): a device uptime shorter than the token's age means it rebooted since (DEV-535)
+    this.#tokenCache.push({ scope: granted, scopes: scopeList(granted), ctx, token: jwt, exp, issuedAt: Date.now() });
+    this.#seenAt = Date.now();   // a token just issued shows the device's current boot as well as /status does
     this.#cachePurge();
   }
 
@@ -1382,7 +1543,22 @@ export class HEM {
   // -- HTTP --------------------------------------------------------------------
 
   async #req(method, url, body = null, token = null, opts = {}) {
-    return httpRequest(method, url, { body, token, debug: this.#debug, tag: 'HEM', ...opts });
+    token = this.#renewed.get(token) ?? token;   // DEV-535: replaced earlier in the same call
+    try {
+      return await httpRequest(method, url, { body, token, debug: this.#debug, tag: 'HEM', ...opts });
+    } catch (e) {
+      // DEV-535: a token the SDK picked, refused - the device rebooted, or the
+      // token ran out on the way. Dropped, and the request sent once more with
+      // a new one. A token the caller passed is the caller's to renew.
+      const alternatives = token && this.#picked.get(token);
+      if (!alternatives || !(e instanceof HemError) || e.code !== 'http_401') throw e;
+      this.#picked.delete(token);
+      this.#tokenCache = this.#tokenCache.filter(c => c.token !== token);
+      const fresh = await this.#obtain(alternatives[0]);
+      this.#picked.set(fresh, alternatives);
+      this.#renewed.set(token, fresh);
+      return httpRequest(method, url, { body, token: fresh, debug: this.#debug, tag: 'HEM', ...opts });
+    }
   }
 
   // -- eJWT generation (PBKDF2 + X25519 ECDH + HMAC-SHA256) -------------------
@@ -1478,6 +1654,7 @@ export class HEM {
     const { expSeconds = 300, remember = true, ctx = null } = optsArg('authorizePassword', arguments, 2);
     checkScope(scope);
     checkTokenCtx('authorizePassword', ctx);
+    await this.#bootCheck();   // DEV-535: never a token of the device's previous boot
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
     this.#refusePlainHttp('Password login');   // DEV-532: before any request
@@ -1513,6 +1690,7 @@ export class HEM {
         iss: derived.pubkeyB64,
         ks: await sessionHmacKey(derived.privKey, challenge.spk),
         until: this.#keyCacheTtl > 0 ? typedAt + this.#keyCacheTtl * 1000 : null,
+        at: typedAt,   // DEV-535: dropped when the device reports an uptime shorter than its age
       };
       derived = null;   // the X25519 private key is not kept anywhere
       // Note: JS strings are immutable — the password primitive cannot be zeroed here.
@@ -1760,6 +1938,7 @@ export class HEM {
     if (note !== null && !inUtf8Len(note, 1, LIMITS.remoteNote)) {
       throw new HemError(`authorizeRemote: note is 1..${LIMITS.remoteNote} bytes of UTF-8`, { code: 'invalid_arg' });
     }
+    await this.#bootCheck();   // DEV-535
     const cached = this.#cacheFind(scope, ctx);
     if (cached) return cached;
 
@@ -1923,6 +2102,7 @@ export class HEM {
     onPending = null,
     signal = null,
   } = {}) {
+    token = await this.#auto(token, 'registerExtAuth');   // DEV-535: none passed - the SDK picks it
     // Step 1 -- device config (need eid + metadata for the QR)
     const config = await this.#req('GET', `${this.#baseUrl}/api/system/config`, null, token);
     if (!config.eid) throw new HemError('No eid in device config', { code: 'ext_register_error' });
@@ -1982,6 +2162,7 @@ export class HEM {
    * @returns {Promise<{nonce: string, mac: string, eid: string, epk: string}>}
    */
   async getExtAuthMac(token) {
+    token = await this.#auto(token, 'getExtAuthMac');   // DEV-535: none passed - the SDK picks it
     const config = await this.#req('GET', `${this.#baseUrl}/api/system/config`, null, token);
     if (!config.eid) throw new HemError('No eid in device config', { code: 'ext_register_error' });
 
@@ -2004,6 +2185,7 @@ export class HEM {
    * @returns {Promise<Array<{pid: string, [key: string]: any}>>}
    */
   async listExtAuth(token) {
+    token = await this.#auto(token, 'listExtAuth');   // DEV-535: none passed - the SDK picks it
     const mac = await this.getExtAuthMac(token);
     return this.#broker.subscribersList(mac);
   }
@@ -2019,6 +2201,7 @@ export class HEM {
    * @returns {Promise<object>}
    */
   async deleteExtAuth(token, pid) {
+    token = await this.#auto(token, 'deleteExtAuth');   // DEV-535: none passed - the SDK picks it
     const mac = await this.getExtAuthMac(token);
     return this.#broker.subscribersDelete({ ...mac, pid });
   }
@@ -2064,6 +2247,7 @@ export class HEM {
    * @returns {Promise<KeyEntry>}  The key as stored; `pubkey` only when asked for
    */
   async createKeyPair(token, label, type, { descr = null, mode = null, returnPubkey = false } = {}) {
+    token = await this.#auto(token, 'createKeyPair');   // DEV-535: none passed - the SDK picks it
     checkMode(type, mode);
     const body = { type, label };
     if (descr !== null) body.descr = toB64(asBytes(descr));
@@ -2091,6 +2275,7 @@ export class HEM {
    * @returns {Promise<{kid: string}>}
    */
   async importPublicKey(token, label, type, pubkey, { descr = null, mode = null } = {}) {
+    token = await this.#auto(token, 'importPublicKey');   // DEV-535: none passed - the SDK picks it
     checkMode(type, mode, { importing: true });
     const body = { type, label, pubkey: toB64(pubkey) };
     if (descr !== null) body.descr = toB64(asBytes(descr));
@@ -2124,6 +2309,7 @@ export class HEM {
    * @returns {Promise<KeyEntry>}
    */
   async deriveKey(token, label, type, kid, { extKid = null, pubkey = null, hkdfSalt = null, descr = null, mode = null, returnPubkey = false } = {}) {
+    token = await this.#auto(token, 'deriveKey');   // DEV-535: none passed - the SDK picks it
     checkMode(type, mode);
     const body = { type, label, kid };
     applyPeerKey(body, { extKid, pubkey }, 'deriveKey');
@@ -2157,6 +2343,7 @@ export class HEM {
    * @returns {Promise<void>}
    */
   async updateKey(token, kid, label, descr = undefined) {
+    token = await this.#auto(token, 'updateKey');   // DEV-535: none passed - the SDK picks it
     const body = { kid };
     if (label !== null && label !== undefined) body.label = label;
     if (descr !== undefined) {
@@ -2182,6 +2369,7 @@ export class HEM {
    * @returns {Promise<KeyEntry>}  With `der` (Uint8Array) for a certificate record
    */
   async getKeyPublicInfo(token, kid) {
+    token = await this.#auto(token, 'getKeyPublicInfo', kid);   // DEV-535: none passed - the SDK picks it
     checkKid('getKeyPublicInfo', kid);
     const data = await this.#req('GET', `${this.#baseUrl}/api/keymgmt/get/${kid}`, null, token);
     return keyEntry({ ...data, kid });
@@ -2205,6 +2393,7 @@ export class HEM {
    * @returns {Promise<{list: KeyEntry[], total: number, listed: number, deleted: number, invalid: number, offset: number}>}
    */
   async listKeys(token, { offset = 0, limit = 15, returnPubkey = false } = {}) {
+    token = await this.#auto(token, 'listKeys');   // DEV-535: none passed - the SDK picks it
     const data = await this.#req('GET',
       `${this.#baseUrl}/api/keymgmt/list/${offset}/${limit}${returnPubkey ? '/pubkey' : ''}`, null, token);
     return keyPage(data, offset);
@@ -2233,6 +2422,7 @@ export class HEM {
    * @returns {Promise<{list: KeyEntry[], total: number, listed: number, deleted: number, invalid: number, offset: number}>}
    */
   async searchKeys(token, pattern, { match = 'prefix', offset = 0, limit = 15, type = null, mode = null, returnPubkey = false } = {}) {
+    token = await this.#auto(token, 'searchKeys');   // DEV-535: none passed - the SDK picks it
     const b64 = toB64(asBytes(pattern));
     const descr = match === 'prefix' ? '^' + b64 : match === 'suffix' ? b64 + '$' : b64;
     const body = { descr, offset, limit };
@@ -2260,6 +2450,7 @@ export class HEM {
    * @returns {AsyncGenerator<KeyEntry>}
    */
   async *listKeysAll(token, { returnPubkey = false } = {}) {
+    token = await this.#auto(token, 'listKeysAll');   // DEV-535: none passed - the SDK picks it
     let offset = 0;
     for (;;) {
       const page = await this.listKeys(token, { offset, limit: LIMITS.pageSize, returnPubkey });
@@ -2285,6 +2476,7 @@ export class HEM {
    * @returns {AsyncGenerator<KeyEntry>}
    */
   async *searchKeysAll(token, pattern, { match = 'prefix', type = null, mode = null, returnPubkey = false } = {}) {
+    token = await this.#auto(token, 'searchKeysAll');   // DEV-535: none passed - the SDK picks it
     let offset = 0;
     for (;;) {
       const page = await this.searchKeys(token, pattern, { match, offset, limit: LIMITS.pageSize, type, mode, returnPubkey });
@@ -2306,6 +2498,7 @@ export class HEM {
    * @returns {Promise<void>}
    */
   async deleteKey(token, kid) {
+    token = await this.#auto(token, 'deleteKey');   // DEV-535: none passed - the SDK picks it
     checkKid('deleteKey', kid);
     await this.#req('DELETE', `${this.#baseUrl}/api/keymgmt/delete/${kid}`, null, token);
   }
@@ -2336,6 +2529,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async exdsaSign(token, kid, data, opts) {
+    token = await this.#auto(token, 'exdsaSign', kid);   // DEV-535: none passed - the SDK picks it
     const { alg = 'Ed25519', ctx = null, det = false } = optsArg('exdsaSign', arguments, 3);
     const msg = asBytes(data);
     checkMsgSize('exdsaSign', msg);
@@ -2365,6 +2559,7 @@ export class HEM {
    * @returns {Promise<boolean>}  true: the signature is valid; false: it is not
    */
   async exdsaVerify(token, kid, data, sig, opts) {
+    token = await this.#auto(token, 'exdsaVerify', kid);   // DEV-535: none passed - the SDK picks it
     const { alg = 'Ed25519', ctx = null } = optsArg('exdsaVerify', arguments, 4);
     const msg = asBytes(data);
     checkMsgSize('exdsaVerify', msg);
@@ -2404,6 +2599,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async ecdh(token, kid, opts) {
+    token = await this.#auto(token, 'ecdh', kid);   // DEV-535: none passed - the SDK picks it
     const { extKid = null, pubkey = null, alg = null, hkdfSalt = null, hkdfCtx = null, hkdfLen = null } = optsArg('ecdh', arguments, 2);
     const body = { kid };
     applyPeerKey(body, { extKid, pubkey }, 'ecdh', { required: true });
@@ -2439,6 +2635,7 @@ export class HEM {
    * @returns {Promise<Uint8Array[]>}  In the order of `items`
    */
   async ecdhHkdf(token, kid, opts) {
+    token = await this.#auto(token, 'ecdhHkdf', kid);   // DEV-535: none passed - the SDK picks it
     const { extKid = null, pubkey = null, alg = 'HKDF-SHA2-256', items = null } = optsArg('ecdhHkdf', arguments, 2);
     if (typeof alg !== 'string' || !alg.startsWith('HKDF-')) {
       throw new HemError(`ecdhHkdf: alg is HKDF-SHA2-256 / -384 / -512, not ${alg}`, { code: 'invalid_arg' });
@@ -2480,6 +2677,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}  32 / 48 / 64 bytes
    */
   async hmacHash(token, kid, data, opts) {
+    token = await this.#auto(token, 'hmacHash', kid);   // DEV-535: none passed - the SDK picks it
     const { alg = null, extKid = null, pubkey = null } = optsArg('hmacHash', arguments, 3);
     const bytes = asBytes(data);
     checkMsgSize('hmacHash', bytes);
@@ -2509,6 +2707,7 @@ export class HEM {
    * @returns {Promise<boolean>}  true: the MAC matches
    */
   async hmacVerify(token, kid, data, mac, opts) {
+    token = await this.#auto(token, 'hmacVerify', kid);   // DEV-535: none passed - the SDK picks it
     const { alg = null, extKid = null, pubkey = null } = optsArg('hmacVerify', arguments, 4);
     const bytes = asBytes(data);
     checkMsgSize('hmacVerify', bytes);
@@ -2542,6 +2741,7 @@ export class HEM {
    * @returns {Promise<{ciphertext: Uint8Array, iv: Uint8Array, tag: Uint8Array|null}>}
    */
   async cipherEncrypt(token, kid, data, alg, opts = {}) {
+    token = await this.#auto(token, 'cipherEncrypt', kid);   // DEV-535: none passed - the SDK picks it
     const bytes = asBytes(data);
     checkMsgSize('cipherEncrypt', bytes);
     const body = { kid, msg: toB64(bytes), alg };
@@ -2574,6 +2774,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async cipherDecrypt(token, kid, ciphertext, alg, opts = {}) {
+    token = await this.#auto(token, 'cipherDecrypt', kid);   // DEV-535: none passed - the SDK picks it
     const body = { kid, msg: toB64(checkLen('cipherDecrypt', 'ciphertext', ciphertext, LIMITS.cryptoCt)), alg };
     applyPeerKey(body, opts, 'cipherDecrypt');
     applyHkdf(body, opts, 'cipherDecrypt');
@@ -2605,6 +2806,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async cipherWrap(token, kid, data, opts = {}) {
+    token = await this.#auto(token, 'cipherWrap', kid);   // DEV-535: none passed - the SDK picks it
     checkMsgSize('cipherWrap', data);
     const body = { kid, msg: toB64(data) };
     if (opts.alg) body.alg = opts.alg;
@@ -2629,6 +2831,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async cipherUnwrap(token, kid, wrapped, opts = {}) {
+    token = await this.#auto(token, 'cipherUnwrap', kid);   // DEV-535: none passed - the SDK picks it
     const body = { kid, msg: toB64(checkLen('cipherUnwrap', 'wrapped', wrapped, LIMITS.cryptoCt)) };
     if (opts.alg) body.alg = opts.alg;
     applyPeerKey(body, opts, 'cipherUnwrap');
@@ -2651,6 +2854,7 @@ export class HEM {
    *          ss: 32-byte shared secret; ct: 768 / 1088 / 1568 bytes for the peer
    */
   async mlkemEncaps(token, kid) {
+    token = await this.#auto(token, 'mlkemEncaps', kid);   // DEV-535: none passed - the SDK picks it
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mlkem/encaps`, { kid }, token);
     if (!ret.ss || !ret.ct) throw new HemError('Missing ss/ct in mlkem/encaps response', { code: 'pqc_error' });
     return { alg: ret.alg, ss: fromB64(ret.ss), ct: fromB64(ret.ct) };
@@ -2669,6 +2873,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}  32-byte shared secret
    */
   async mlkemDecaps(token, kid, ct) {
+    token = await this.#auto(token, 'mlkemDecaps', kid);   // DEV-535: none passed - the SDK picks it
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/mlkem/decaps`, { kid, ct: toB64(ct) }, token);
     if (!ret.ss) throw new HemError('No ss in mlkem/decaps response', { code: 'pqc_error' });
     return fromB64(ret.ss);
@@ -2695,6 +2900,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async mldsaSign(token, kid, data, { ctx = null, mode = null } = {}) {
+    token = await this.#auto(token, 'mldsaSign', kid);   // DEV-535: none passed - the SDK picks it
     const body = { kid, msg: toB64(checkLen('mldsaSign', 'data', asBytes(data), LIMITS.cryptoMsg)) };
     if (ctx !== null) body.ctx = toB64(checkLen('mldsaSign', 'ctx', asBytes(ctx), LIMITS.sigCtx));
     if (mode) body.mode = mode;
@@ -2720,6 +2926,7 @@ export class HEM {
    * @returns {Promise<boolean>}  true: the signature is valid
    */
   async mldsaVerify(token, kid, data, sign, { ctx = null, mode = null } = {}) {
+    token = await this.#auto(token, 'mldsaVerify', kid);   // DEV-535: none passed - the SDK picks it
     const body = { kid, msg: toB64(checkLen('mldsaVerify', 'data', asBytes(data), LIMITS.cryptoMsg)), sign: toB64(sign) };
     if (ctx !== null) body.ctx = toB64(checkLen('mldsaVerify', 'ctx', asBytes(ctx), LIMITS.sigCtx));
     if (mode) body.mode = mode;
@@ -2742,6 +2949,7 @@ export class HEM {
    * @returns {Promise<{alg: string, ss: Uint8Array, ct: Uint8Array}>}  ss 32 B; ct 1120 B (ct_M ‖ ct_X)
    */
   async xwingEncaps(token, kid, opts) {
+    token = await this.#auto(token, 'xwingEncaps', kid, opts);   // DEV-535: none passed - the SDK picks it
     const { extKid = null } = optsArg('xwingEncaps', arguments, 2);
     if (!extKid) throw new HemError('xwingEncaps: needs extKid, the CURVE25519 half', { code: 'invalid_arg' });
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/xwing/encaps`, { kid, ext_kid: extKid }, token);
@@ -2764,6 +2972,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}  32-byte shared secret
    */
   async xwingDecaps(token, kid, ct, opts) {
+    token = await this.#auto(token, 'xwingDecaps', kid, ct, opts);   // DEV-535: none passed - the SDK picks it
     const { extKid = null } = optsArg('xwingDecaps', arguments, 3);
     if (!extKid) throw new HemError('xwingDecaps: needs extKid, the CURVE25519 half', { code: 'invalid_arg' });
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/pqc/xwing/decaps`, { kid, ext_kid: extKid, ct: toB64(ct) }, token);
@@ -2863,6 +3072,7 @@ export class HEM {
    * @returns {Promise<Uint8Array>}
    */
   async kdf(token, kid, alg, len, { salt = null, info = null } = {}) {
+    token = await this.#auto(token, 'kdf', kid);   // DEV-535: none passed - the SDK picks it
     if (salt !== null && alg !== 'HKDF') throw new HemError('kdf: a salt is for HKDF only', { code: 'invalid_arg' });
     const body = { kid, alg, len };
     if (salt !== null) body.salt = toB64(asBytes(salt));
@@ -2891,6 +3101,7 @@ export class HEM {
    * @returns {Promise<{code: string, step: number}>}
    */
   async otp(token, kid, opts = {}) {
+    token = await this.#auto(token, 'otp', kid);   // DEV-535: none passed - the SDK picks it
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/otp`, otpBody(kid, opts), token);
     if (typeof ret.code !== 'string') throw new HemError('No code in hmac/otp response', { code: 'otp_error' });
     return { code: ret.code, step: ret.step };
@@ -2911,6 +3122,7 @@ export class HEM {
    * @returns {Promise<{verified: boolean, step?: number}>}  `step`: the matching step / counter
    */
   async otpVerify(token, kid, code, { window = null, ...opts } = {}) {
+    token = await this.#auto(token, 'otpVerify', kid);   // DEV-535: none passed - the SDK picks it
     const body = { ...otpBody(kid, opts), code: String(code) };
     if (window !== null) body.window = window;
     const ret = await this.#req('POST', `${this.#baseUrl}/api/crypto/hmac/otp`, body, token);
@@ -2966,7 +3178,9 @@ export class HEM {
    * @returns {Promise<object>}
    */
   async getStatus(opts = {}) {
-    return this.#req('GET', `${this.#baseUrl}/api/system/status`, null, null, opts);
+    const status = await this.#req('GET', `${this.#baseUrl}/api/system/status`, null, null, opts);
+    this.#observeUptime(status?.uptime);   // DEV-535: a reboot since a token was issued drops it
+    return status;
   }
 
   /**
@@ -2999,6 +3213,7 @@ export class HEM {
    *   `allowPlainHttpLogin` (DEV-532), before any request
    */
   async setUserPassword(token, newPassword) {
+    token = await this.#auto(token, 'setUserPassword');   // DEV-535: none passed - the SDK picks it
     const { currentPassword = null } = optsArg('setUserPassword', arguments, 2);
     const role = jwtParse(token)?.sub;
     if (role !== 'M' && currentPassword == null) {
@@ -3037,6 +3252,7 @@ export class HEM {
    * @returns {Promise<object>}  Config object (eid, user, email, hostname, ...)
    */
   async getConfig(token) {
+    token = await this.#auto(token, 'getConfig');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/system/config`, null, token);
   }
 
@@ -3052,6 +3268,7 @@ export class HEM {
    * @returns {Promise<{updated: boolean}>}
    */
   async setConfig(token, cfg) {
+    token = await this.#auto(token, 'setConfig');   // DEV-535: none passed - the SDK picks it
     return this.#req('POST', `${this.#baseUrl}/api/system/config`, cfg, token);
   }
 
@@ -3065,6 +3282,7 @@ export class HEM {
    * @returns {Promise<object>}
    */
   async reboot(token) {
+    token = await this.#auto(token, 'reboot');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/system/reboot`, null, token);
   }
 
@@ -3078,6 +3296,7 @@ export class HEM {
    * @returns {Promise<object>}
    */
   async shutdown(token) {
+    token = await this.#auto(token, 'shutdown');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/system/shutdown`, null, token);
   }
 
@@ -3093,6 +3312,7 @@ export class HEM {
    * @returns {Promise<object>}
    */
   async selftest(token) {
+    token = await this.#auto(token, 'selftest');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/system/selftest`, null, token);
   }
 
@@ -3110,6 +3330,7 @@ export class HEM {
    *          duplicates: number, reclaimable: boolean, reclaimable_size: number, reserved: string}>}
    */
   async defragCheck(token) {
+    token = await this.#auto(token, 'defragCheck');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/system/defrag/check`, null, token);
   }
 
@@ -3127,6 +3348,7 @@ export class HEM {
    * @returns {Promise<{started: boolean, report: object|null}>}  report as defragCheck()
    */
   async defragStart(token) {
+    token = await this.#auto(token, 'defragStart');   // DEV-535: none passed - the SDK picks it
     const r = await this.#req('GET', `${this.#baseUrl}/api/system/defrag/start`, null, token, { withStatus: true });
     return { started: r.status === 202, report: r.data && typeof r.data === 'object' ? r.data : null };
   }
@@ -3198,6 +3420,7 @@ export class HEM {
    * @returns {Promise<void>}
    */
   async rebootToUsbMode(token) {
+    token = await this.#auto(token, 'rebootToUsbMode');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/usbmode`, null, token);
   }
 
@@ -3235,6 +3458,7 @@ export class HEM {
    * @returns {Promise<void>}
    */
   async uploadFirmware(token, bytes, { format = null, onProgress = null, signal = null } = {}) {
+    token = await this.#auto(token, 'uploadFirmware');   // DEV-535: none passed - the SDK picks it
     const hex = format ? format === 'hex' : bytes[0] === 0x3a;
     await this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_fw`,
       bytes, token, { binary: true, filename: hex ? 'firmware.hex' : 'firmware.bin', onProgress, signal });
@@ -3253,6 +3477,7 @@ export class HEM {
    * @returns {Promise<true|null>}  null while the device is still checking
    */
   async checkFirmware(token, { signal = null } = {}) {
+    token = await this.#auto(token, 'checkFirmware');   // DEV-535: none passed - the SDK picks it
     const r = await this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_fw`, null, token, { signal, withStatus: true });
     return r.status === 200 ? true : null;
   }
@@ -3279,6 +3504,7 @@ export class HEM {
    * @returns {Promise<object>}
    */
   async installFirmware(token) {
+    token = await this.#auto(token, 'installFirmware');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/install_fw`, null, token);
   }
 
@@ -3295,6 +3521,7 @@ export class HEM {
    * @returns {Promise<void>}
    */
   async uploadUi(token, bytes, { onProgress = null, signal = null } = {}) {
+    token = await this.#auto(token, 'uploadUi');   // DEV-535: none passed - the SDK picks it
     await this.#req('POST', `${this.#baseUrl}/api/system/upgrade/upload_ui`,
       bytes, token, { binary: true, filename: 'webroot.tar', onProgress, signal });
   }
@@ -3311,6 +3538,7 @@ export class HEM {
    * @returns {Promise<true|null>}
    */
   async checkUi(token, { signal = null } = {}) {
+    token = await this.#auto(token, 'checkUi');   // DEV-535: none passed - the SDK picks it
     const r = await this.#req('GET', `${this.#baseUrl}/api/system/upgrade/check_ui`, null, token, { signal, withStatus: true });
     return r.status === 200 ? true : null;
   }
@@ -3329,6 +3557,7 @@ export class HEM {
    * @returns {Promise<object>}
    */
   async installUi(token) {
+    token = await this.#auto(token, 'installUi');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/system/upgrade/install_ui`, null, token);
   }
 
@@ -3383,6 +3612,7 @@ export class HEM {
    * @returns {Promise<{key: string, nonce: string, nonce_signed: string}>}  base64
    */
   async getLoggerKey(token, { nonce = null } = {}) {
+    token = await this.#auto(token, 'getLoggerKey');   // DEV-535: none passed - the SDK picks it
     if (nonce && (nonce.length < 32 || nonce.length > 64)) {
       throw new HemError(`getLoggerKey: nonce is ${nonce.length} bytes, must be 32..64`, { code: 'invalid_arg' });
     }
@@ -3406,6 +3636,7 @@ export class HEM {
    *          oldest?: string, newest?: string, current?: string}>}
    */
   async listLogFiles(token, { offset = 0, limit = 128 } = {}) {
+    token = await this.#auto(token, 'listLogFiles');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/logger/list/${offset}/${limit}`, null, token);
   }
 
@@ -3420,6 +3651,7 @@ export class HEM {
    * @returns {Promise<string>}
    */
   async getLogFile(token, id) {
+    token = await this.#auto(token, 'getLogFile');   // DEV-535: none passed - the SDK picks it
     return this.#req('GET', `${this.#baseUrl}/api/logger/${id}`, null, token);
   }
 
@@ -3496,6 +3728,7 @@ export class HEM {
    * @returns {Promise<object>}  The tls block installed on the device
    */
   async registerDomain(token, prefix, { ip = null, newCertificate = true, pollInterval = 4_000, pollTimeout = 240_000, onPending = null, signal = null } = {}) {
+    token = await this.#auto(token, 'registerDomain');   // DEV-535: none passed - the SDK picks it
     let genuine, csr = null;
     if (newCertificate) {
       const req = await this.#req('POST', `${this.#baseUrl}/api/system/config`, { gen_csr: true }, token);
@@ -3530,6 +3763,7 @@ export class HEM {
    * @returns {Promise<{ok: boolean, keyProven: boolean, text: string, [k: string]: any}>}
    */
   async verifyLogFile(token, id) {
+    token = await this.#auto(token, 'verifyLogFile');   // DEV-535: none passed - the SDK picks it
     const nonce = crypto.getRandomValues(new Uint8Array(32));
     const loggerKey = await this.getLoggerKey(token, { nonce });
     const keyProven = await verifyLoggerKey(loggerKey, nonce);

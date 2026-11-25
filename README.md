@@ -54,9 +54,18 @@ import { HEM, HemError } from './hem-sdk.js';
 const hem = new HEM('https://abc.ence.do');
 
 const health = await hem.hemCheckin();                      // once, first; { status, newfws?, newuis? }
-const token  = await hem.authorizePassword('my-password', 'keymgmt:list');
-const { list, total } = await hem.listKeys(token);            // one page, and how many keys there are
+await hem.authorizePassword('my-password', 'keymgmt:list');  // remembered for this device boot
+const { list, total } = await hem.listKeys();                 // the SDK picks the token (DEV-535)
 ```
+
+A method called without a token picks one itself: any cached token holding a
+scope the call accepts (`REQUIRED_SCOPES`), otherwise a new one for the first
+of them - with the password remembered for this device boot, or the
+`authorize(scope)` callback given to the constructor (where a UI asks for the
+password or the phone). A token passed is used as it is; `null` means no token.
+Tokens of a previous device boot are dropped: the SDK reads the uptime in
+`/api/system/status` (at most every 10 s, when a cached token is about to be
+used), and a token it picked that the device refuses with 401 is replaced once.
 
 ## Device and broker
 
@@ -119,7 +128,9 @@ Full signatures are in [`hem-sdk.browser.d.ts`](./hem-sdk.browser.d.ts).
 
 ## Scopes
 
-Every JWT is issued for a scope that authorizes a class of operations:
+Every JWT is issued for a scope that authorizes a class of operations. The SDK
+knows them per method (`REQUIRED_SCOPES`, DEV-535); a caller needs them only to
+ask for a token up front:
 
 | Scope | Authorizes |
 |-------|------------|

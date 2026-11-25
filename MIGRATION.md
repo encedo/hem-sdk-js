@@ -1,5 +1,26 @@
 # Upgrading the SDK
 
+## The SDK picks the token (2026-11-25, DEV-535)
+
+Nothing breaks: a token passed is used as before.
+
+- A token-protected method may be called **without** the token
+  (`hem.reboot()`, `hem.exdsaSign(undefined, kid, data)`): the SDK uses any
+  cached token holding a scope the call accepts (`REQUIRED_SCOPES`, exported),
+  otherwise obtains one for the first scope - with the password remembered for
+  this device boot, or `new HEM(url, { authorize: (scope) => token })`, where a
+  UI asks the person. Without either: `auth_password_required`. `null` still
+  means no token (an unpersonalised upgrade, a token-less search).
+- Tokens of a previous device boot are dropped: `getStatus()` (the SDK calls it
+  itself at most every 10 s before handing out a cached token) compares the
+  uptime with each token's age, also for `authorizePassword` with a password
+  typed - which used to return the cached token of the old boot (seen on a PPA
+  after a reboot, 2026-11-25: the next call got 401).
+- A token the SDK picked that the device refuses with 401 is dropped and the
+  request sent once more with a new one.
+- What to do: nothing; to stop naming scopes, drop the token argument and give
+  the constructor an `authorize` callback.
+
 ## Attest: the attest.encedo.com paths moved to /v1/device/* (2026-11-25)
 
 attest.encedo.com serves two branches of the Encedo Root CA since 2026-11-25:

@@ -81,7 +81,12 @@ here**, never in a downstream copy.
   (DEV-532: the remembered password as K_s = X25519(user_sk, spk), a
   non-extractable HMAC key bound to `eid` + `spk`, i.e. one device boot, plus
   the optional `keyCacheTtl` deadline; never the X25519 private key).
-  `clearCache()` / `clearKeys()` drop them. `authorizeMaster` and
+  `clearCache()` / `clearKeys()` drop them. DEV-535: `REQUIRED_SCOPES` (method
+  -> accepted scopes, the first is asked for) and `#auto` let a method run
+  without a token; `#bootCheck` / `#observeUptime` drop tokens and the
+  remembered key of a previous device boot (uptime from `/api/system/status`
+  against each token's `issuedAt`); `#req` renews a picked token once on 401
+  (`#picked`, `#renewed`). `authorizeMaster` and
   `setUserPassword` never read or write `#sessionKey`.
 - Password / master login, `initialize` and `setUserPassword` against an
   `http://` base URL throw `plain_http_login` unless

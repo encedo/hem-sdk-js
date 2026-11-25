@@ -221,6 +221,9 @@ export interface HemCipherResult {
   tag: Uint8Array | null;
 }
 
+/** DEV-535: the scopes each token-protected method accepts; the first is the one asked for when none is cached. An inner array: one token holding all of them. */
+export declare const REQUIRED_SCOPES: Readonly<Record<string, Array<string | string[]> | ((...args: any[]) => Array<string | string[]>)>>;
+
 export declare class HEM {
   constructor(hsmUrl: string, opts?: {
     broker?: string | Broker;
@@ -237,6 +240,8 @@ export declare class HEM {
      * before any request (a cached token is still returned).
      */
     allowPlainHttpLogin?: boolean;
+    /** DEV-535: a token for `scope` when a method is called without one and none is cached or remembered: ask for the password or the phone. */
+    authorize?: (scope: string | string[]) => Promise<string>;
   });
 
   /** The Broker this instance uses for every api.encedo.com call. */
@@ -301,16 +306,16 @@ export declare class HEM {
   authorizeMaster(mnemonic: string, scope: HemScope, opts?: { expSeconds?: number; legacy?: boolean; ctx?: string | null } | null): Promise<string>;
 
   /** Broker MAC data for the paired-authenticator calls; listExtAuth / deleteExtAuth do the round trip. */
-  getExtAuthMac(token: string): Promise<ExtAuthMac>;
+  getExtAuthMac(token?: string | null): Promise<ExtAuthMac>;
   /** Authenticators paired with the device. Scope: system:config. */
-  listExtAuth(token: string): Promise<Array<{ pid: string; [key: string]: unknown }>>;
+  listExtAuth(token?: string | null): Promise<Array<{ pid: string; [key: string]: unknown }>>;
   /** Unpair one authenticator on the broker; its keychain entry ('RVhUQUlE' + pid) is deleted with deleteKey(). */
-  deleteExtAuth(token: string, pid: string): Promise<unknown>;
+  deleteExtAuth(token: string | null | undefined, pid: string): Promise<unknown>;
   /** Whether any authenticator is paired. No token needed. */
   hasExtAuth(): Promise<boolean>;
 
   /** Pair a mobile external authenticator. token needs the 'system:config' scope. */
-  registerExtAuth(token: string, opts?: {
+  registerExtAuth(token?: string | null, opts?: {
     /**
      * Called with (qrText, qrPayload). qrText is the exact JSON string to encode
      * into the QR code scanned by the mobile authenticator app.
@@ -322,87 +327,87 @@ export declare class HEM {
   } & PollOpts): Promise<unknown>;
 
   /** Scope: keymgmt:list. `returnPubkey` needs the `pubkey_in_list` policy. */
-  listKeys(token: string, opts?: { offset?: number; limit?: number; returnPubkey?: boolean }): Promise<HemKeyPage>;
+  listKeys(token?: string | null, opts?: { offset?: number; limit?: number; returnPubkey?: boolean }): Promise<HemKeyPage>;
   /**
    * Keys whose description matches `pattern` (bytes, or a string as UTF-8). Scope: keymgmt:search,
    * keymgmt:list or auth:ext:pair; null for an anonymous prefix search of at least 6 bytes.
    */
-  searchKeys(token: string | null, pattern: string | Uint8Array, opts?: {
+  searchKeys(token: string | null | undefined, pattern: string | Uint8Array, opts?: {
     match?: 'prefix' | 'suffix' | 'contains'; offset?: number; limit?: number;
     type?: string | null; mode?: HemKeyMode | null; returnPubkey?: boolean;
   }): Promise<HemKeyPage>;
   /** Every key of listKeys(), across pages: `for await`, or `Array.fromAsync(...)`. Scope: keymgmt:list. */
-  listKeysAll(token: string, opts?: { returnPubkey?: boolean }): AsyncGenerator<HemKey, void, undefined>;
+  listKeysAll(token?: string | null, opts?: { returnPubkey?: boolean }): AsyncGenerator<HemKey, void, undefined>;
   /** Every match of searchKeys(), across pages (until a page comes back empty). Scope: as searchKeys. */
-  searchKeysAll(token: string | null, pattern: string | Uint8Array, opts?: {
+  searchKeysAll(token: string | null | undefined, pattern: string | Uint8Array, opts?: {
     match?: 'prefix' | 'suffix' | 'contains'; type?: string | null; mode?: HemKeyMode | null; returnPubkey?: boolean;
   }): AsyncGenerator<HemKey, void, undefined>;
   /** Metadata and public part of one key; never private material. Scope: keymgmt:get, keymgmt:gen or keymgmt:use:<kid>. */
-  getKeyPublicInfo(token: string, kid: string): Promise<HemKey>;
+  getKeyPublicInfo(token: string | null | undefined, kid: string): Promise<HemKey>;
   /** Generate a key inside the HEM. Scope: keymgmt:gen. Label 1..64 ASCII, descr up to 128 bytes. */
-  createKeyPair(token: string, label: string, type: string, opts?: { descr?: Uint8Array | string | null; mode?: HemKeyMode | null; returnPubkey?: boolean }): Promise<HemKey>;
+  createKeyPair(token: string | null | undefined, label: string, type: string, opts?: { descr?: Uint8Array | string | null; mode?: HemKeyMode | null; returnPubkey?: boolean }): Promise<HemKey>;
   /** Store a public key (exact size for the type). Scope: keymgmt:imp. */
-  importPublicKey(token: string, label: string, type: string, pubkey: Uint8Array, opts?: { descr?: Uint8Array | string | null; mode?: HemKeyMode | null }): Promise<{ kid: string }>;
+  importPublicKey(token: string | null | undefined, label: string, type: string, pubkey: Uint8Array, opts?: { descr?: Uint8Array | string | null; mode?: HemKeyMode | null }): Promise<{ kid: string }>;
   /** Derive from ECDH with a peer (extKid / pubkey) or, with no peer, from an HMAC parent `kid`. Scope: keymgmt:derive or keymgmt:gen. */
-  deriveKey(token: string, label: string, type: string, kid: string, opts?: HemPeerKeyOpts & {
+  deriveKey(token: string | null | undefined, label: string, type: string, kid: string, opts?: HemPeerKeyOpts & {
     hkdfSalt?: Uint8Array | string | null; descr?: Uint8Array | string | null; mode?: HemKeyMode | null; returnPubkey?: boolean;
   }): Promise<HemKey>;
   /** Change the label, the description or both (firmware with DEV-519): label null = kept; descr not given = kept, null / '' = removed. Scope: keymgmt:upd. */
-  updateKey(token: string, kid: string, label: string | null, descr?: Uint8Array | string | null): Promise<void>;
+  updateKey(token: string | null | undefined, kid: string, label: string | null, descr?: Uint8Array | string | null): Promise<void>;
   /**
    * ECDSA (raw r ‖ s) or EdDSA signature. `data` is bytes or UTF-8 text; for alg 'ECDSA' the digest.
    * `ctx` (1..255 B) for Ed25519ctx / Ed25519ph / Ed448; `det` for RFC 6979 ECDSA.
    */
-  exdsaSign(token: string, kid: string, data: Uint8Array | string, opts?: { alg?: string; ctx?: Uint8Array | string | null; det?: boolean } | null): Promise<Uint8Array>;
+  exdsaSign(token: string | null | undefined, kid: string, data: Uint8Array | string, opts?: { alg?: string; ctx?: Uint8Array | string | null; det?: boolean } | null): Promise<Uint8Array>;
   /** The device's `verified`: false for an invalid signature. Other errors throw. */
-  exdsaVerify(token: string, kid: string, data: Uint8Array | string, sig: Uint8Array, opts?: { alg?: string; ctx?: Uint8Array | string | null } | null): Promise<boolean>;
+  exdsaVerify(token: string | null | undefined, kid: string, data: Uint8Array | string, sig: Uint8Array, opts?: { alg?: string; ctx?: Uint8Array | string | null } | null): Promise<boolean>;
   /**
    * ECDH with a peer - `extKid` (stored) or `pubkey` (raw bytes), exactly one, as deriveKey names it.
    * No alg: the raw secret (needs the `raw_ecdh_enabled` policy); 'SHA2-*' / 'SHA3-*': its digest;
    * 'HKDF-SHA2-*': HKDF with hkdfSalt / hkdfCtx (info, not 'encedo-...') / hkdfLen (16..128).
    */
-  ecdh(token: string, kid: string, opts: HemPeer & {
+  ecdh(token: string | null | undefined, kid: string, opts: HemPeer & {
     alg?: string | null; hkdfSalt?: Uint8Array | string | null; hkdfCtx?: Uint8Array | string | null; hkdfLen?: number | null;
   }): Promise<Uint8Array>;
   /** One ECDH, 1..8 HKDF outputs; the shared secret never leaves the device. */
-  ecdhHkdf(token: string, kid: string, opts: HemPeer & {
+  ecdhHkdf(token: string | null | undefined, kid: string, opts: HemPeer & {
     alg?: 'HKDF-SHA2-256' | 'HKDF-SHA2-384' | 'HKDF-SHA2-512'; items: HemHkdfItem[];
   }): Promise<Uint8Array[]>;
 
   /** `alg` is required with a peer (extKid / pubkey). */
-  hmacHash(token: string, kid: string, data: Uint8Array | string, opts?: HemPeerKeyOpts & { alg?: string | null } | null): Promise<Uint8Array>;
+  hmacHash(token: string | null | undefined, kid: string, data: Uint8Array | string, opts?: HemPeerKeyOpts & { alg?: string | null } | null): Promise<Uint8Array>;
   /** The device's `verified`: false for a wrong MAC. Other errors throw. */
-  hmacVerify(token: string, kid: string, data: Uint8Array | string, mac: Uint8Array, opts?: HemPeerKeyOpts & { alg?: string | null } | null): Promise<boolean>;
+  hmacVerify(token: string | null | undefined, kid: string, data: Uint8Array | string, mac: Uint8Array, opts?: HemPeerKeyOpts & { alg?: string | null } | null): Promise<boolean>;
   /** 'AES128-CBC' ... 'AES256-GCM', 'CHACHA20-POLY1305'. */
-  cipherEncrypt(token: string, kid: string, data: Uint8Array | string, alg: string, opts?: HemCipherOpts): Promise<HemCipherResult>;
-  cipherDecrypt(token: string, kid: string, ciphertext: Uint8Array, alg: string, opts?: HemCipherOpts): Promise<Uint8Array>;
+  cipherEncrypt(token: string | null | undefined, kid: string, data: Uint8Array | string, alg: string, opts?: HemCipherOpts): Promise<HemCipherResult>;
+  cipherDecrypt(token: string | null | undefined, kid: string, ciphertext: Uint8Array, alg: string, opts?: HemCipherOpts): Promise<Uint8Array>;
   /** AES key wrap (RFC 3394); data 16..2048 B, a multiple of 8. */
-  cipherWrap(token: string, kid: string, data: Uint8Array, opts?: HemWrapOpts): Promise<Uint8Array>;
-  cipherUnwrap(token: string, kid: string, wrapped: Uint8Array, opts?: HemWrapOpts): Promise<Uint8Array>;
+  cipherWrap(token: string | null | undefined, kid: string, data: Uint8Array, opts?: HemWrapOpts): Promise<Uint8Array>;
+  cipherUnwrap(token: string | null | undefined, kid: string, wrapped: Uint8Array, opts?: HemWrapOpts): Promise<Uint8Array>;
   /** To a key made in the HEM or an imported public key. */
-  mlkemEncaps(token: string, kid: string): Promise<{ alg: string; ss: Uint8Array; ct: Uint8Array }>;
-  mlkemDecaps(token: string, kid: string, ct: Uint8Array): Promise<Uint8Array>;
+  mlkemEncaps(token: string | null | undefined, kid: string): Promise<{ alg: string; ss: Uint8Array; ct: Uint8Array }>;
+  mlkemDecaps(token: string | null | undefined, kid: string, ct: Uint8Array): Promise<Uint8Array>;
   /** `mode`: 'ML-DSA' (default), 'HashML-DSA-SHA256/384/512' (data = digest), 'ML-DSA-mu' (data = μ, no ctx). */
-  mldsaSign(token: string, kid: string, data: Uint8Array | string, opts?: { ctx?: Uint8Array | string | null; mode?: string | null }): Promise<Uint8Array>;
+  mldsaSign(token: string | null | undefined, kid: string, data: Uint8Array | string, opts?: { ctx?: Uint8Array | string | null; mode?: string | null }): Promise<Uint8Array>;
   /** X-Wing (ML-KEM-768 + X25519) to an MLKEM768 key and a CURVE25519 key; one token with both scopes. */
-  xwingEncaps(token: string, kid: string, opts: { extKid: string }): Promise<{ alg: string; ss: Uint8Array; ct: Uint8Array }>;
-  xwingDecaps(token: string, kid: string, ct: Uint8Array, opts: { extKid: string }): Promise<Uint8Array>;
+  xwingEncaps(token: string | null | undefined, kid: string, opts: { extKid: string }): Promise<{ alg: string; ss: Uint8Array; ct: Uint8Array }>;
+  xwingDecaps(token: string | null | undefined, kid: string, ct: Uint8Array, opts: { extKid: string }): Promise<Uint8Array>;
   /** HPKE (RFC 9180) Base, single shot, to a key in the HEM or to { pubkey, kem } outside it. */
   hpkeSeal(token: string, recipient: { kid: string; extKid?: string | null } | { pubkey: Uint8Array; kem: HemHpkeKem },
     data: Uint8Array | string, opts?: HemHpkeOpts): Promise<{ enc: Uint8Array; ct: Uint8Array; suite: string; kem: string; kdf: string; aead: string }>;
   /** Open with a key pair that has the HPKE flag; suite, info and aad must be the sealer's. */
   hpkeOpen(token: string, kid: string, enc: Uint8Array, ct: Uint8Array, opts?: HemHpkeOpts & { extKid?: string | null }): Promise<Uint8Array>;
   /** HKDF or SP 800-108 (counter) from a stored HMAC SHA2 key; 16..128 bytes out. */
-  kdf(token: string, kid: string, alg: 'HKDF' | 'SP800-108', len: number, opts?: { salt?: Uint8Array | string | null; info?: Uint8Array | string | null }): Promise<Uint8Array>;
+  kdf(token: string | null | undefined, kid: string, alg: 'HKDF' | 'SP800-108', len: number, opts?: { salt?: Uint8Array | string | null; info?: Uint8Array | string | null }): Promise<Uint8Array>;
   /** TOTP / HOTP code of a stored SHA1 seed; keep `step` to refuse replays. */
-  otp(token: string, kid: string, opts?: HemOtpOpts): Promise<{ code: string; step: number }>;
-  otpVerify(token: string, kid: string, code: string, opts?: HemOtpOpts & { window?: number | null }): Promise<{ verified: boolean; step?: number }>;
+  otp(token: string | null | undefined, kid: string, opts?: HemOtpOpts): Promise<{ code: string; step: number }>;
+  otpVerify(token: string | null | undefined, kid: string, code: string, opts?: HemOtpOpts & { window?: number | null }): Promise<{ verified: boolean; step?: number }>;
   /** 1..8192 bytes from the device DRBG; any valid token (none before personalisation). */
   random(token: string | null, n?: number): Promise<Uint8Array>;
   /** The device's `verified`: false for an invalid signature. Other errors throw. */
-  mldsaVerify(token: string, kid: string, data: Uint8Array | string, sign: Uint8Array, opts?: { ctx?: Uint8Array | string | null; mode?: string | null }): Promise<boolean>;
+  mldsaVerify(token: string | null | undefined, kid: string, data: Uint8Array | string, sign: Uint8Array, opts?: { ctx?: Uint8Array | string | null; mode?: string | null }): Promise<boolean>;
 
-  deleteKey(token: string, kid: string): Promise<void>;
+  deleteKey(token: string | null | undefined, kid: string): Promise<void>;
 
   /** No token needed; a valid one adds sd_csd / sd_cid on an initialised PPA. */
   getVersion(opts?: { timeoutMs?: number; signal?: AbortSignal; token?: string | null }): Promise<{
@@ -411,54 +416,54 @@ export declare class HEM {
   }>;
   getStatus(opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<Record<string, unknown>>;
   /** Scope: system:config, logger:get or auth:ext:pair. */
-  getConfig(token: string): Promise<Record<string, unknown>>;
+  getConfig(token?: string | null): Promise<Record<string, unknown>>;
   /** Change the everyday password. Sends the key it derives to, plus a proof of ECDH; the 24 words are untouched.
    *  A password-issued token (role U) needs `currentPassword` (firmware DEV-519); a token of the 24 words (role M) does not.
    *  Against an `http://` base URL without `allowPlainHttpLogin`: `plain_http_login`, nothing sent. */
-  setUserPassword(token: string, newPassword: string, opts?: { currentPassword?: string }): Promise<unknown>;
-  setConfig(token: string, cfg: Record<string, unknown>): Promise<{ updated: boolean }>;
+  setUserPassword(token: string | null | undefined, newPassword: string, opts?: { currentPassword?: string }): Promise<unknown>;
+  setConfig(token: string | null | undefined, cfg: Record<string, unknown>): Promise<{ updated: boolean }>;
   /** Key storage reclaim report, a dry run. Scope: system:config. */
-  defragCheck(token: string): Promise<{ used: number; keys: number; deleted: number; deleted_size: number; invalid: number;
+  defragCheck(token?: string | null): Promise<{ used: number; keys: number; deleted: number; deleted_size: number; invalid: number;
     duplicates: number; reclaimable: boolean; reclaimable_size: number; reserved: string }>;
   /** Start the reclaim at the next boot; `started`: the device restarts in ~2 s. 409 (report in err.data): unreadable records. */
-  defragStart(token: string): Promise<{ started: boolean; report: Record<string, unknown> | null }>;
+  defragStart(token?: string | null): Promise<{ started: boolean; report: Record<string, unknown> | null }>;
   /** Before personalisation, no token: start HTTPS (`tls`) and, on an EPA, derive the attestation key (`att`). Once per power-up each. */
   /** `att.crt`: the HEM attestation certificate (DER, ≤2048 B); the device answers `match`.
    *  In practice: sent by the host system (OpenWrt inject) while its firewall keeps the external interface closed; no application reaches a module in that state. */
   bootstrap(parts: { tls?: Record<string, unknown> | null; att?: { seed: Uint8Array; epoch: number; crt?: Uint8Array | null } | null }): Promise<{ csr: Uint8Array | null; match: boolean | null }>;
 
   /** Scope: system:config, system:upgrade or system:shutdown (none before personalisation). */
-  reboot(token: string | null): Promise<unknown>;
+  reboot(token?: string | null): Promise<unknown>;
   /** Scope: system:config or system:shutdown. */
-  shutdown(token: string): Promise<unknown>;
+  shutdown(token?: string | null): Promise<unknown>;
   /** Scope: system:config (none before personalisation). 409 while a run is in progress. */
-  selftest(token: string | null): Promise<unknown>;
+  selftest(token?: string | null): Promise<unknown>;
 
   /** Restarts the device into the bootloader's USB mode. Scope: system:upgrade or system:config. In practice: service and recovery. */
-  rebootToUsbMode(token: string | null): Promise<void>;
+  rebootToUsbMode(token?: string | null): Promise<void>;
   /** Sent as firmware.bin or firmware.hex (Intel HEX told by its first byte, or `format`). */
-  uploadFirmware(token: string | null, bytes: Uint8Array, opts?: {
+  uploadFirmware(token: string | null | undefined, bytes: Uint8Array, opts?: {
     format?: 'bin' | 'hex';
     /** (loaded, total) in bytes; browser only. */
     onProgress?: (loaded: number, total: number) => void;
     signal?: AbortSignal;
   }): Promise<void>;
   /** null while the device is still checking (it answers 201/202); true once it passed (200, no body); 406 thrown when it failed. Scope: system:upgrade or system:config. */
-  checkFirmware(token: string, opts?: { signal?: AbortSignal }): Promise<true | null>;
+  checkFirmware(token?: string | null, opts?: { signal?: AbortSignal }): Promise<true | null>;
   /** Poll checkFirmware() until done. Rejects with `timeout`, `aborted`, or the device's 4xx. */
-  waitFirmwareCheck(token: string, opts?: PollOpts): Promise<true>;
+  waitFirmwareCheck(token?: string | null, opts?: PollOpts): Promise<true>;
   /** Scope: system:upgrade or system:config. */
-  installFirmware(token: string): Promise<unknown>;
+  installFirmware(token?: string | null): Promise<unknown>;
   /** Sent as webroot.tar, the only name the device takes. */
-  uploadUi(token: string | null, bytes: Uint8Array, opts?: {
+  uploadUi(token: string | null | undefined, bytes: Uint8Array, opts?: {
     onProgress?: (loaded: number, total: number) => void;
     signal?: AbortSignal;
   }): Promise<void>;
   /** As checkFirmware(); the device reports the result once, the next call starts a new check. */
-  checkUi(token: string, opts?: { signal?: AbortSignal }): Promise<true | null>;
-  waitUiCheck(token: string, opts?: PollOpts): Promise<true>;
+  checkUi(token?: string | null, opts?: { signal?: AbortSignal }): Promise<true | null>;
+  waitUiCheck(token?: string | null, opts?: PollOpts): Promise<true>;
   /** Scope: system:upgrade or system:config. */
-  installUi(token: string): Promise<unknown>;
+  installUi(token?: string | null): Promise<unknown>;
 
   /** Scope: storage:disk<N> - the disk is the one in the scope. */
   lockStorage(token: string): Promise<unknown>;
@@ -466,13 +471,13 @@ export declare class HEM {
   unlockStorage(token: string, opts?: { mode?: 'ro' | 'rw' | null }): Promise<void>;
 
   /** The device log key; with `nonce` (32..64 bytes) its signature proves possession now. Scope: logger:get. */
-  getLoggerKey(token: string, opts?: { nonce?: Uint8Array | null }): Promise<{ key: string; nonce: string; nonce_signed: string }>;
+  getLoggerKey(token?: string | null, opts?: { nonce?: Uint8Array | null }): Promise<{ key: string; nonce: string; nonce_signed: string }>;
   /** Downloadable log files (the one being written is `current`, not listed). Scope: logger:get. */
-  listLogFiles(token: string, opts?: { offset?: number; limit?: number }): Promise<{
+  listLogFiles(token?: string | null, opts?: { offset?: number; limit?: number }): Promise<{
     id: string[]; offset: number; total: number; listed: number; oldest?: string; newest?: string; current?: string;
   }>;
   /** One log file as text; the one being written is HTTP 409. Scope: logger:get. */
-  getLogFile(token: string, id: string): Promise<string>;
+  getLogFile(token: string | null | undefined, id: string): Promise<string>;
 
   /** Install the certificate Broker.provisioning() issued (PPA). 406: a certificate is already stored (or not for this chip); 409: initialised.
    *  In practice: a factory step (PPA production); a module in the field already has its certificate. */
@@ -481,9 +486,9 @@ export declare class HEM {
    *  In practice: the factory flow in one call (attestation, broker, install). */
   provision(token?: string | null): Promise<Record<string, unknown> | null>;
   /** Register `<prefix>.ence.do` and install the TLS block. Scope: system:config. */
-  registerDomain(token: string, prefix: string, opts?: { ip?: string | null; newCertificate?: boolean; pollInterval?: number; pollTimeout?: number; onPending?: (status: string) => void; signal?: AbortSignal }): Promise<Record<string, unknown>>;
+  registerDomain(token: string | null | undefined, prefix: string, opts?: { ip?: string | null; newCertificate?: boolean; pollInterval?: number; pollTimeout?: number; onPending?: (status: string) => void; signal?: AbortSignal }): Promise<Record<string, unknown>>;
   /** Prove the log key with a fresh nonce, fetch one file and verify it. Scope: logger:get. */
-  verifyLogFile(token: string, id: string): Promise<LogVerification & { keyProven: boolean; text: string }>;
+  verifyLogFile(token: string | null | undefined, id: string): Promise<LogVerification & { keyProven: boolean; text: string }>;
 
   clearCache(): void;
 

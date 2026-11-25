@@ -20,6 +20,36 @@ Conventions:
 - Binary inputs/outputs are `Uint8Array`. The SDK handles base64 internally.
 - `*Verify` methods resolve to `true` or throw `HemError` on an invalid result.
 - A JWT `token` is scoped — see the scope table in the README.
+- The examples below pass a token, as every call allowed before DEV-535. It may
+  be left out (`undefined`): the SDK picks one - next section.
+
+## 0. Without tokens: the SDK picks them (DEV-535)
+
+```js
+// A UI: the SDK asks here when it has nothing cached and nothing remembered.
+const hem = new HEM('https://abc.ence.do', {
+  authorize: async (scope) => {
+    const password = await askPassword(`Allow ${scope}?`);   // or: hem.authorizeRemote(scope)
+    return hem.authorizePassword(password, scope);
+  },
+});
+
+await hem.hemCheckin();                                   // first: sets the clock
+await hem.authorizePassword('my-password', 'keymgmt:list');   // remembered for this device boot
+
+const { list } = await hem.listKeys();                    // keymgmt:list - cached
+const pub = await hem.getKeyPublicInfo(undefined, kid);   // keymgmt:get / gen / use:<kid> - any cached one
+const sig = await hem.exdsaSign(undefined, kid, data);    // keymgmt:use:<kid> - new, with the remembered password
+await hem.reboot();                                       // system:config - new
+// After the reboot the tokens and the remembered password are of the old boot:
+// the SDK drops them (uptime from /api/system/status, or a 401 on a token it
+// picked) and the next call goes to `authorize` - the password is asked again.
+```
+
+Which scopes each method accepts: `REQUIRED_SCOPES` (exported). Any cached
+token holding one of them is used; with none, the first is asked for. A token
+passed is used as it is, and `null` means no token (an unpersonalised upgrade,
+a token-less search).
 
 ---
 
