@@ -3553,7 +3553,7 @@ class HEM {
 //   1_ext  attest.verifyDevice(): the device certificate (`crt` of
 //          HEM.getAttestation()) carries the same key and chains to the Encedo
 //          Root CA, pinned here by its SHA-256. The CA certificates come from
-//          attest.encedo.com/v1/pki (or are passed in); offline once fetched.
+//          attest.encedo.com/v1/device/pki (or are passed in); offline once fetched.
 //   2      attest.validate(): attest.encedo.com checks token and device
 //          against the issued-certificate registry and the revocation lists.
 //
@@ -4048,7 +4048,7 @@ class Attest {
   async validate(jwt, { crt = null } = {}) {
     const body = { jwt: attestationText(jwt) };
     if (crt) body.crt = crt instanceof Uint8Array ? toB64(crt) : crt;
-    return this.#req('POST', '/v1/validate', body);
+    return this.#req('POST', '/v1/device/validate', body);
   }
 
   /**
@@ -4060,7 +4060,7 @@ class Attest {
    */
   async skidKnown(skid) {
     if (!/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(skid)) throw new HemError('skidKnown: 40 or 64 hex characters', { code: 'invalid_arg' });
-    return (await this.#req('GET', `/v1/skid/${skid.toLowerCase()}`))?.known === true;
+    return (await this.#req('GET', `/v1/device/skid/${skid.toLowerCase()}`))?.known === true;
   }
 
   /**
@@ -4071,7 +4071,7 @@ class Attest {
    * @returns {Promise<Array<{subject: string, issuer: string, not_after: number, sha256: string, pem: string}>>}
    */
   async pki() {
-    if (!this.#cas) this.#cas = (await this.#req('GET', '/v1/pki'))?.certificates ?? [];
+    if (!this.#cas) this.#cas = (await this.#req('GET', '/v1/device/pki'))?.certificates ?? [];
     return this.#cas;
   }
 }

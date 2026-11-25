@@ -1,5 +1,19 @@
 # Upgrading the SDK
 
+## Attest: the attest.encedo.com paths moved to /v1/device/* (2026-11-25)
+
+attest.encedo.com serves two branches of the Encedo Root CA since 2026-11-25:
+devices under `/v1/device/*` and firmware releases under `/v1/firmware/*`. The
+old paths `/v1/validate`, `/v1/skid/<hex>` and `/v1/pki` are gone (404).
+
+- `attest.validate()` -> `POST /v1/device/validate`, `attest.skidKnown()` ->
+  `GET /v1/device/skid/<hex>`, `attest.pki()` -> `GET /v1/device/pki` (the device
+  CAs only). Same requests and answers, no signature changes.
+- What to do: update the SDK. An older SDK gets 404 from these three calls
+  (`HemError`); `verifyDevice` without `cas` then fails as its CA list cannot be
+  fetched (encedo-oidc reports `ca_unavailable`). A caller that called the
+  service directly changes the three paths.
+
 ## verifyDevice: the device certificate must come from a device CA (2026-11-25)
 
 The Encedo Root CA has a second branch since 2026-11-25: the Encedo Signer CA,

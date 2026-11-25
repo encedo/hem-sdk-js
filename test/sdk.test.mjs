@@ -188,9 +188,9 @@ async function handle(req, res) {
   if (path.startsWith('/dev/api/logger/')) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(state.logText); }
 
   // ---- attest.encedo.com -------------------------------------------------------
-  if (path === '/att/v1/validate') return json(res, 200, { status: 'valid', expired: false });
-  if (path.startsWith('/att/v1/skid/')) return json(res, 200, { known: true });
-  if (path === '/att/v1/pki') {
+  if (path === '/att/v1/device/validate') return json(res, 200, { status: 'valid', expired: false });
+  if (path.startsWith('/att/v1/device/skid/')) return json(res, 200, { known: true });
+  if (path === '/att/v1/device/pki') {
     const PKIs = JSON.parse(readFileSync(new URL('./attest-test-pki.json', import.meta.url), 'utf8'));
     return json(res, 200, { certificates: [PKIs.root, PKIs.attestation, PKIs.custody].map((pem) => ({ subject: 'CN', issuer: 'CN', not_after: 0, sha256: '', pem })) });
   }
@@ -1296,11 +1296,11 @@ test('Attest.verifyDevice: the certificate holds the token key, comes from a dev
   assert.equal((await attest.verifyDevice(r.point, tampered, { cas, ...pin })).reason, 'signature');
   assert.equal((await attest.verifyDevice(r.point, 'not a certificate', { cas })).reason, 'certificate');
 
-  // Without cas the CA certificates come from attest.encedo.com /v1/pki, once.
+  // Without cas the CA certificates come from attest.encedo.com /v1/device/pki, once.
   const before = mockLog().length;
   assert.equal((await attest.verifyDevice(r.point, PKI.device, pin)).ok, true);
   await attest.verifyDevice(r.point, PKI.device, pin);
-  assert.equal(mockLog().slice(before).filter((l) => l.path === '/att/v1/pki').length, 1);
+  assert.equal(mockLog().slice(before).filter((l) => l.path === '/att/v1/device/pki').length, 1);
 });
 
 // A minimal X.509 writer for the CAs this test makes while it runs (nothing kept): DER, ECDSA P-256.
@@ -1355,7 +1355,7 @@ test('Attest level 2: validate and skidKnown at attest.encedo.com', async () => 
   assert.deepEqual(await attest.validate({ attestation: 'J.W.T' }, { crt: new Uint8Array([1, 2]) }), { status: 'valid', expired: false });
   assert.deepEqual(mockLog().at(-1).body, { jwt: 'J.W.T', crt: b64([1, 2]) });
   assert.equal(await attest.skidKnown('ABCDEF0123456789abcdef0123456789abcdef01'), true);
-  assert.equal(mockLog().at(-1).path, '/att/v1/skid/abcdef0123456789abcdef0123456789abcdef01');
+  assert.equal(mockLog().at(-1).path, '/att/v1/device/skid/abcdef0123456789abcdef0123456789abcdef01');
   await assert.rejects(attest.skidKnown('xyz'), (e) => e.code === 'invalid_arg');
 });
 
