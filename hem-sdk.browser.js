@@ -1355,11 +1355,8 @@ function scopesFor(name, args) {
 
 // DEV-535: a token is good for one device boot. Before a cached one is used the
 // boot is checked at most this often: the spk of a login challenge (GET
-// /api/auth/token) - a new one is a new boot. An uptime from /api/system/status,
-// whenever the application reads it, is a second sign: shorter than a token's
-// age means the device rebooted since it was issued.
+// /api/auth/token) - a new one is a new boot.
 const BOOT_CHECK_MS = 10_000;
-const BOOT_SLACK_MS = 3_000;   // uptime is whole seconds, plus the request's own time
 
 class HEM {
   #baseUrl;
@@ -1370,7 +1367,7 @@ class HEM {
   #authorize = null;       // the caller's way to get a token for a scope: (scope) => Promise<string>
   #picked = new Map();     // token the SDK picked -> the scopes it was for (a 401 asks again)
   #renewed = new Map();    // token refused with 401 -> its replacement, for the same call's next request
-  #seenAt = 0;             // ms: the device last showed its boot - a challenge's spk, a status, a token it issued
+  #seenAt = 0;             // ms: the device last showed its boot - a challenge's spk, or a token it issued
   #bootSpk = null;         // the spk of the boot the cached tokens belong to (a new one = a reboot)
   // DEV-532: the remembered password is the session secret of one device boot,
   // not the X25519 key the password derives to:
@@ -1504,22 +1501,6 @@ class HEM {
     this.#bootSpk = spk;
   }
 
-  /**
-   * An uptime the device reported: tokens issued and a password remembered
-   * before its last boot are worthless - dropped, so the next call asks again
-   * instead of being refused.
-   */
-  #observeUptime(uptime) {
-    if (!Number.isFinite(uptime) || uptime < 0) return;
-    const now = Date.now();
-    this.#seenAt = now;
-    const bootedAt = now - uptime * 1000 - BOOT_SLACK_MS;
-    const before = this.#tokenCache.length;
-    this.#tokenCache = this.#tokenCache.filter(e => e.issuedAt >= bootedAt);
-    if (this.#sessionKey && this.#sessionKey.at < bootedAt) this.#sessionKey = null;
-    if (this.#tokenCache.length !== before && this.#debug) console.log('[HEM] the device rebooted: tokens of the previous boot dropped');
-  }
-
   // -- Token Cache -------------------------------------------------------------
 
   // A token carries one scope or an array of them (DEV-436). The device grants
@@ -1531,8 +1512,7 @@ class HEM {
     const payload = jwtParse(jwt);
     const exp = payload?.exp ?? (Math.floor(Date.now() / 1000) + 300);
     const granted = payload?.scope ?? scope;
-    // issuedAt (this machine's clock): a device uptime shorter than the token's age means it rebooted since (DEV-535)
-    this.#tokenCache.push({ scope: granted, scopes: scopeList(granted), ctx, token: jwt, exp, issuedAt: Date.now() });
+    this.#tokenCache.push({ scope: granted, scopes: scopeList(granted), ctx, token: jwt, exp });
     this.#seenAt = Date.now();   // a token just issued shows the device's current boot as well as /status does
     this.#cachePurge();
   }
@@ -1718,7 +1698,6 @@ class HEM {
         iss: derived.pubkeyB64,
         ks: await sessionHmacKey(derived.privKey, challenge.spk),
         until: this.#keyCacheTtl > 0 ? typedAt + this.#keyCacheTtl * 1000 : null,
-        at: typedAt,   // DEV-535: dropped when the device reports an uptime shorter than its age
       };
       derived = null;   // the X25519 private key is not kept anywhere
       // Note: JS strings are immutable — the password primitive cannot be zeroed here.
@@ -3208,9 +3187,7 @@ class HEM {
    * @returns {Promise<object>}
    */
   async getStatus(opts = {}) {
-    const status = await this.#req('GET', `${this.#baseUrl}/api/system/status`, null, null, opts);
-    this.#observeUptime(status?.uptime);   // DEV-535: a reboot since a token was issued drops it
-    return status;
+    return this.#req('GET', `${this.#baseUrl}/api/system/status`, null, null, opts);
   }
 
   /**

@@ -83,10 +83,9 @@ here**, never in a downstream copy.
   the optional `keyCacheTtl` deadline; never the X25519 private key).
   `clearCache()` / `clearKeys()` drop them. DEV-535: `REQUIRED_SCOPES` (method
   -> accepted scopes, the first is asked for) and `#auto` let a method run
-  without a token; `#bootCheck` / `#observeUptime` drop tokens and the
+  without a token; `#bootCheck` drops tokens and the
   remembered key of a previous device boot: `#seeSpk` (a new `spk` in a login
-  challenge, `#bootSpk`) and `#observeUptime` (uptime from `/api/system/status`
-  against each token's `issuedAt`); `#req` renews a picked token once on 401
+  challenge, `#bootSpk`; no uptime heuristics - owner, 2026-11-25); `#req` renews a picked token once on 401
   (`#picked`, `#renewed`). `authorizeMaster` and
   `setUserPassword` never read or write `#sessionKey`.
 - Password / master login, `initialize` and `setUserPassword` against an

@@ -42,8 +42,7 @@ const pub = await hem.getKeyPublicInfo(undefined, kid);   // keymgmt:get / gen /
 const sig = await hem.exdsaSign(undefined, kid, data);    // keymgmt:use:<kid> - new, with the remembered password
 await hem.reboot();                                       // system:config - new
 // After the reboot the tokens and the remembered password are of the old boot:
-// the SDK drops them (a new spk in the login challenge, an uptime from
-// /api/system/status, or a 401 on a token it
+// the SDK drops them (a new spk in the login challenge, or a 401 on a token it
 // picked) and the next call goes to `authorize` - the password is asked again.
 ```
 

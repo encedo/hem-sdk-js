@@ -1609,19 +1609,16 @@ test('a token passed is used as it is; null still means no token', async () => {
   assert.equal(state.log.at(-1).auth, null);
 });
 
-test('a reboot seen in /status drops the tokens of the previous boot - even for authorizePassword with the password typed', async () => {
+test('after a reboot authorizePassword with the password typed gets a new token, not the cached one of the old boot (DEV-535)', async () => {
   const hem = mk();
   await hem.authorizePassword('correct horse', 'system:config');
-  await hem.getStatus();                                // up for a while: nothing dropped
-  assert.equal(hem.tokens.length, 1);
-  // A real reboot takes seconds; the SDK allows 3 s for the uptime's whole seconds.
-  await new Promise((r) => setTimeout(r, 3500));
-  await rebootMock();
-  await hem.getStatus();                                // the uptime is now shorter than the token's age
-  assert.equal(hem.tokens.length, 0, 'dropped');
+  await hem.getStatus();
+  assert.equal(hem.tokens.length, 1, 'a status changes nothing: the boot is told by the spk alone');
+  await rebootMock();                                   // a real reboot takes longer than the 10 s check interval
+  await new Promise((r) => setTimeout(r, 10_500));
   const posts = authPosts().length;
   const token = await hem.authorizePassword('correct horse', 'system:config');
-  assert.equal(authPosts().length, posts + 1, 'a new token, not the cached one (2026-11-25, Manager sign-in after a reboot)');
+  assert.equal(authPosts().length, posts + 1, 'a new token (2026-11-25, Manager sign-in after a reboot)');
   await hem.getConfig(token);
 });
 
