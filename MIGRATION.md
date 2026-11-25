@@ -11,9 +11,10 @@ Nothing breaks: a token passed is used as before.
   this device boot, or `new HEM(url, { authorize: (scope) => token })`, where a
   UI asks the person. Without either: `auth_password_required`. `null` still
   means no token (an unpersonalised upgrade, a token-less search).
-- Tokens of a previous device boot are dropped: `getStatus()` (the SDK calls it
-  itself at most every 10 s before handing out a cached token) compares the
-  uptime with each token's age, also for `authorizePassword` with a password
+- Tokens of a previous device boot are dropped: a new `spk` in a login
+  challenge (`GET /api/auth/token`, which the SDK asks itself at most every
+  10 s before handing out a cached token) is a new boot, and so is an uptime in
+  `getStatus()` shorter than a token's age - also for `authorizePassword` with a password
   typed - which used to return the cached token of the old boot (seen on a PPA
   after a reboot, 2026-11-25: the next call got 401).
 - A token the SDK picked that the device refuses with 401 is dropped and the

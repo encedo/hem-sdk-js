@@ -1353,8 +1353,10 @@ function scopesFor(name, args) {
   return typeof entry === 'function' ? entry(...args) : entry;
 }
 
-// DEV-535: a token is good for one device boot. A cached one is checked against
-// /api/system/status at most this often: an uptime shorter than the token's
+// DEV-535: a token is good for one device boot. Before a cached one is used the
+// boot is checked at most this often: the spk of a login challenge (GET
+// /api/auth/token) - a new one is a new boot. An uptime from /api/system/status,
+// whenever the application reads it, is a second sign: shorter than a token's
 // age means the device rebooted since it was issued.
 const BOOT_CHECK_MS = 10_000;
 const BOOT_SLACK_MS = 3_000;   // uptime is whole seconds, plus the request's own time
@@ -1368,7 +1370,8 @@ class HEM {
   #authorize = null;       // the caller's way to get a token for a scope: (scope) => Promise<string>
   #picked = new Map();     // token the SDK picked -> the scopes it was for (a 401 asks again)
   #renewed = new Map();    // token refused with 401 -> its replacement, for the same call's next request
-  #seenAt = 0;             // ms: the device last showed its boot - /api/system/status, or a token it issued
+  #seenAt = 0;             // ms: the device last showed its boot - a challenge's spk, a status, a token it issued
+  #bootSpk = null;         // the spk of the boot the cached tokens belong to (a new one = a reboot)
   // DEV-532: the remembered password is the session secret of one device boot,
   // not the X25519 key the password derives to:
   // { eid, spk, iss: base64 user_pk, ks: HMAC CryptoKey (non-extractable), until: ms | null }
@@ -1466,15 +1469,39 @@ class HEM {
   }
 
   /**
-   * Did the device reboot since the cached tokens were issued? Asks
-   * /api/system/status when the device has shown nothing of its boot (a status,
-   * a new token) for BOOT_CHECK_MS and there is something to lose; a device
-   * that does not answer leaves the cache alone.
+   * Did the device reboot since the cached tokens were issued? Asks for the
+   * login challenge (GET /api/auth/token, no token, nothing kept on the device:
+   * its jti is an HMAC of the time) when the device has shown nothing of its
+   * boot for BOOT_CHECK_MS and there is something to lose: a new `spk` is a
+   * new boot, every token of the old one is worthless (owner, 2026-11-25). A
+   * device that does not answer leaves the cache alone.
    */
   async #bootCheck() {
     if (!this.#tokenCache.length && !this.#sessionKey) return;
     if (Date.now() - this.#seenAt < BOOT_CHECK_MS) return;
-    try { await this.getStatus({ timeoutMs: 5000 }); } catch (e) { if (!(e instanceof HemError)) throw e; }
+    try {
+      const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`, null, null, { timeoutMs: 5000 });
+      this.#seeSpk(challenge?.spk);
+    } catch (e) { if (!(e instanceof HemError)) throw e; }
+  }
+
+  /**
+   * The device's `spk`, from a login challenge: the X25519 key it makes at
+   * power-up, so another one than the cached tokens were issued under means it
+   * rebooted - they and the password remembered for the old boot are dropped.
+   */
+  #seeSpk(spk) {
+    if (typeof spk !== 'string' || !spk) return;
+    this.#seenAt = Date.now();
+    if (this.#bootSpk && spk !== this.#bootSpk) {
+      const dropped = this.#tokenCache.length;
+      this.#tokenCache = [];
+      this.#picked.clear();
+      this.#renewed.clear();
+      if (this.#sessionKey && this.#sessionKey.spk !== spk) this.#sessionKey = null;
+      if (dropped && this.#debug) console.log('[HEM] the device rebooted (a new spk): tokens of the previous boot dropped');
+    }
+    this.#bootSpk = spk;
   }
 
   /**
@@ -1671,6 +1698,7 @@ class HEM {
 
     // Phase 1 -- get challenge (always needed for fresh jti + spk)
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
+    this.#seeSpk(challenge?.spk);   // DEV-535: a new spk drops the tokens of the old boot
     // { eid: string (stable salt), spk: base64 (device X25519 pubkey), jti: string (nonce) }
 
     // Sign with the password, or with what a previous call kept. Whether to keep
@@ -1752,6 +1780,7 @@ class HEM {
     seed.fill(0);
 
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
+    this.#seeSpk(challenge?.spk);   // DEV-535: a new spk drops the tokens of the old boot
     // DEV-532: the same K_s signing path as a password, used for this call only -
     // the master key's session key is never written to #sessionKey.
     const session = { iss: keys.pubkeyB64, ks: await sessionHmacKey(keys.privKey, challenge.spk) };
@@ -2215,6 +2244,7 @@ class HEM {
    */
   async hasExtAuth() {
     const challenge = await this.#req('GET', `${this.#baseUrl}/api/auth/token`);
+    this.#seeSpk(challenge?.spk);   // DEV-535: a new spk drops the tokens of the old boot
     if (!challenge.eid) throw new HemError('No eid in auth challenge', { code: 'auth_failed' });
     const session = await this.#broker.session(challenge.eid);
     return Boolean(session.paired);

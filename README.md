@@ -63,9 +63,11 @@ scope the call accepts (`REQUIRED_SCOPES`), otherwise a new one for the first
 of them - with the password remembered for this device boot, or the
 `authorize(scope)` callback given to the constructor (where a UI asks for the
 password or the phone). A token passed is used as it is; `null` means no token.
-Tokens of a previous device boot are dropped: the SDK reads the uptime in
-`/api/system/status` (at most every 10 s, when a cached token is about to be
-used), and a token it picked that the device refuses with 401 is replaced once.
+Tokens of a previous device boot are dropped: before a cached token is used
+(at most every 10 s) the SDK reads the `spk` of a login challenge
+(`GET /api/auth/token`, no token) - the device makes a new one at every
+power-up; an uptime from `/api/system/status` shorter than a token's age says
+the same. A token it picked that the device refuses with 401 is replaced once.
 
 ## Device and broker
 

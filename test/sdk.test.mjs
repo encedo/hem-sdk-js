@@ -1635,3 +1635,25 @@ test('a picked token refused with 401 (a reboot the SDK did not see) is renewed 
   assert.equal(config.eid, state.eid);
   assert.deepEqual(asked, ['system:config'], 'the remembered password was of the old boot: the callback was asked');
 });
+
+test('a new spk in a login challenge is a new boot: the tokens of the old one are dropped (DEV-535)', async () => {
+  const hem = mk();
+  await hem.authorizePassword('correct horse', 'system:config');
+  await rebootMock();                                   // new spk
+  await hem.authorizePassword('correct horse', 'keymgmt:list');   // asks for a challenge: sees the new spk
+  assert.deepEqual(hem.tokens.map((t) => t.scope), ['keymgmt:list'], 'the system:config token of the old boot is gone');
+});
+
+test('before a cached token is used the SDK asks for the spk itself (at most every 10 s), so no request goes out with a token of the old boot (DEV-535)', async () => {
+  const asked = [];
+  const hem = mk({ authorize: async (scope) => { asked.push(scope); return hem.authorizePassword('correct horse', scope); } });
+  await hem.authorizePassword('correct horse', 'system:config');
+  await rebootMock();
+  await new Promise((r) => setTimeout(r, 10_500));
+  const mark = state.log.length;
+  assert.equal((await hem.getConfig()).eid, state.eid);
+  const after = state.log.slice(mark).map((e) => `${e.method} ${e.path}`);
+  assert.equal(after[0], 'GET /dev/api/auth/token', 'the challenge first: its spk is new');
+  assert.ok(!state.log.slice(mark).some((e) => e.path === '/dev/api/system/config' && e.auth && jwtParse(e.auth.replace(/^Bearer /, ''))?.boot !== state.boot), 'no token of the old boot sent');
+  assert.deepEqual(asked, ['system:config'], 'the remembered password was of the old boot: asked again');
+});
