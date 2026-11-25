@@ -19,6 +19,9 @@ Nothing breaks: a token passed is used as before.
   after a reboot, 2026-11-25: the next call got 401).
 - A token the SDK picked that the device refuses with 401 is dropped and the
   request sent once more with a new one.
+- `authorize` is also called when the device refuses the login challenge with
+  403 - after a boot its clock is not set until a check-in, which is the
+  application's to make (a broker call): check in there, then log in.
 - What to do: nothing; to stop naming scopes, drop the token argument and give
   the constructor an `authorize` callback.
 

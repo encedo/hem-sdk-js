@@ -109,6 +109,7 @@ async function handle(req, res) {
     return json(res, 200, state.diagBuild ? { genuine: 'GEN', crt: 'CERT', csr: 'CSR', key: 'KEY' } : { genuine: 'GEN', crt: 'CERT' });
   }
   if (path === '/dev/api/system/config/provisioning') { state.provisioned = true; return json(res, 200, { installed: true }); }
+  if (path === '/dev/api/auth/token' && state.clockUnset) return json(res, 403, { error: 'the clock is not set' });   // DEV-535: a PPA after a boot, until the check-in
   if (path === '/dev/api/auth/token' && req.method === 'GET') return json(res, 200, { eid: state.eid, spk: state.spkB64, jti: 'jti-1' });   // no genuine: only auth/init has one
   if (path === '/dev/api/auth/token' && req.method === 'POST') {
     const { ok, payload } = await verifyEjwt(body.auth);
@@ -1653,4 +1654,19 @@ test('before a cached token is used the SDK asks for the spk itself (at most eve
   assert.equal(after[0], 'GET /dev/api/auth/token', 'the challenge first: its spk is new');
   assert.ok(!state.log.slice(mark).some((e) => e.path === '/dev/api/system/config' && e.auth && jwtParse(e.auth.replace(/^Bearer /, ''))?.boot !== state.boot), 'no token of the old boot sent');
   assert.deepEqual(asked, ['system:config'], 'the remembered password was of the old boot: asked again');
+});
+
+test('a device that refuses a challenge with 403 (no clock after a boot) hands the token over to authorize, which can check in first (DEV-535)', async () => {
+  const asked = [];
+  const hem = mk({ authorize: async (scope) => { asked.push(scope); state.clockUnset = false; return hem.authorizePassword('correct horse', scope); } });
+  await hem.authorizePassword('correct horse', 'keymgmt:list');   // a password remembered
+  state.clockUnset = true;
+  try {
+    const keys = await hem.listKeys(undefined, { offset: 0 });       // cached: no challenge needed
+    assert.ok(keys.list);
+    await hem.getConfig();                                           // a new token: the challenge gets 403
+    assert.deepEqual(asked, ['system:config'], 'the callback was asked (and set the clock, as a check-in does)');
+  } finally {
+    state.clockUnset = false;
+  }
 });

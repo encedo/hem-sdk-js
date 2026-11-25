@@ -1456,7 +1456,10 @@ export class HEM {
     try {
       return await this.authorizePassword(null, scope);
     } catch (e) {
-      if (!(e instanceof HemError) || e.code !== 'auth_password_required' || !this.#authorize) throw e;
+      // 403: the device gives no token now - after a boot its clock is not set
+      // until the check-in (a broker call, so the application's: the callback).
+      const handOver = e instanceof HemError && (e.code === 'auth_password_required' || e.code === 'http_403');
+      if (!handOver || !this.#authorize) throw e;
     }
     const token = await this.#authorize(scope);
     if (typeof token !== 'string' || !token) {
