@@ -108,7 +108,7 @@ export interface HemKey {
   label: string;
   /** The key type alone: 'SECP256R1', 'AES256', 'GENERIC_DER', ... */
   type: string;
-  /** Device flags: 'ATT' (made inside the HEM), 'PKEY' (private half stored), 'ECDH', 'ExDSA', 'CERT', 'PQC', 'HPKE'. */
+  /** Device flags: 'ATT' (made inside the HEM), 'PKEY' (private half stored), 'ECDH', 'ECDH_RAW', 'ExDSA', 'CERT', 'PQC', 'HPKE'. */
   flags: string[];
   /** The description field (up to 128 bytes), or null when it is empty. */
   description: Uint8Array | null;
@@ -137,8 +137,12 @@ export interface HemKeyPage {
   invalid: number;
 }
 
-/** 'ECDH', 'ExDSA', 'ECDH,ExDSA' or 'HPKE'; checked against the key type before the request (`bad_mode`). */
-export type HemKeyMode = 'ECDH' | 'ExDSA' | 'ECDH,ExDSA' | 'HPKE';
+/**
+ * 'ECDH', 'ExDSA', 'ECDH,ExDSA', 'HPKE', or 'ECDH_RAW' / 'ECDH_RAW,ExDSA' (as 'ECDH', and ecdh() may
+ * return this key's raw secret without the `raw_ecdh_enabled` policy); checked against the key type
+ * before the request (`bad_mode`). Import takes neither 'HPKE' nor 'ECDH_RAW'.
+ */
+export type HemKeyMode = 'ECDH' | 'ExDSA' | 'ECDH,ExDSA' | 'HPKE' | 'ECDH_RAW' | 'ECDH_RAW,ExDSA';
 
 /**
  * Peer-key selector shared by the /api/crypto/* endpoints. Setting either one

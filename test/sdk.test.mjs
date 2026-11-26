@@ -871,18 +871,27 @@ test('key modes are checked against the type, as the device would', async () => 
     assert.deepEqual(Object.keys(sent()).sort(), ['label', 'type'], `${type}: nothing it did not ask for`);
   }
   const ok = [['SECP256R1', 'ECDH,ExDSA'], ['SECP384R1', 'HPKE'], ['SECP256K1', 'ExDSA'], ['ED25519', 'ECDH'],
-    ['CURVE25519', 'HPKE'], ['CURVE448', 'ECDH'], ['MLKEM1024', 'HPKE']];
+    ['CURVE25519', 'HPKE'], ['CURVE448', 'ECDH'], ['MLKEM1024', 'HPKE'],
+    // DEV-520: ECDH_RAW on every type that agrees keys, with ',ExDSA' where the plain mode takes it
+    ['SECP256R1', 'ECDH_RAW'], ['SECP256K1', 'ECDH_RAW,ExDSA'], ['ED25519', 'ECDH_RAW'], ['CURVE25519', 'ECDH_RAW'], ['CURVE448', 'ECDH_RAW']];
   for (const [type, mode] of ok) {
     await hem.createKeyPair(token, 'k', type, { mode });
     assert.equal(sent().mode, mode, `${type} + ${mode}`);
   }
-  const bad = [['SECP256K1', 'HPKE'], ['ED25519', 'HPKE'], ['CURVE25519', 'ExDSA'], ['ED448', 'ECDH'], ['MLDSA65', 'HPKE'], ['AES256', 'ECDH']];
+  const bad = [['SECP256K1', 'HPKE'], ['ED25519', 'HPKE'], ['CURVE25519', 'ExDSA'], ['ED448', 'ECDH'], ['MLDSA65', 'HPKE'], ['AES256', 'ECDH'],
+    ['CURVE448', 'ECDH_RAW,ExDSA'], ['ED448', 'ECDH_RAW'], ['MLKEM768', 'ECDH_RAW'], ['AES256', 'ECDH_RAW']];
   for (const [type, mode] of bad) {
     await assert.rejects(hem.createKeyPair(token, 'k', type, { mode }), (e) => e.code === 'bad_mode', `${type} + ${mode}`);
     await assert.rejects(hem.deriveKey(token, 'k', type, 'K1', { mode }), (e) => e.code === 'bad_mode');
   }
   await assert.rejects(hem.importPublicKey(token, 'k', 'CURVE25519', new Uint8Array(32), { mode: 'HPKE' }), (e) => e.code === 'bad_mode',
     'a public key needs no HPKE flag to be sealed to');
+  for (const mode of ['ECDH_RAW', 'ECDH_RAW,ExDSA']) {
+    await assert.rejects(hem.importPublicKey(token, 'k', 'SECP256R1', new Uint8Array(33), { mode }), (e) => e.code === 'bad_mode',
+      'the raw secret needs the private key: import refuses ECDH_RAW');
+  }
+  await hem.deriveKey(token, 'k', 'CURVE448', 'K1', { pubkey: new Uint8Array(56), mode: 'ECDH_RAW' });
+  assert.equal(sent('derive').mode, 'ECDH_RAW', 'derive takes ECDH_RAW too');
 
   const created = await hem.createKeyPair(token, 'signing', 'ED25519', { descr: 'git', returnPubkey: true });
   assert.deepEqual(sent(), { type: 'ED25519', label: 'signing', descr: b64(Buffer.from('git')), return_pubkey: true });

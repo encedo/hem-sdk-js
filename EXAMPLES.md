@@ -355,6 +355,10 @@ const key = await hem.createKeyPair(genToken, 'My signing key', 'ED25519', { des
 // The NIST curves can sign AND agree, so they are told which; HPKE makes an HPKE-only key pair.
 const nist = await hem.createKeyPair(genToken, 'Work P-384', 'SECP384R1', { mode: 'ECDH,ExDSA', returnPubkey: true });
 const hpke = await hem.createKeyPair(genToken, 'Inbox', 'CURVE25519', { mode: 'HPKE' });
+// ECDH_RAW (firmware DEV-520): as ECDH, and ecdh() without `alg` returns this key's raw
+// secret also on a device without the raw_ecdh_enabled policy. What is derived from such a
+// key is only as secret as that raw secret - use it where the protocol needs the raw value.
+const raw = await hem.createKeyPair(genToken, 'Ceremony', 'CURVE448', { mode: 'ECDH_RAW', returnPubkey: true });
 
 // Derive (scope: keymgmt:derive) from ECDH with a peer key ...
 const derived = await hem.deriveKey(genToken, 'Shared with Bob', 'AES256', myX25519Kid, { pubkey: bobX25519 /* Uint8Array */ });

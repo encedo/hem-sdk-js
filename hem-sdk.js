@@ -1136,7 +1136,7 @@ const b64OrNull = (v) => (typeof v === 'string' && v ? fromB64(v) : null);
  * @property {string} kid            32 hex characters
  * @property {string} label
  * @property {string} type           The key type, e.g. 'SECP256R1', 'AES256', 'GENERIC_DER'
- * @property {string[]} flags        Device flags: 'ATT' (made inside the HEM), 'PKEY'
+ * @property {string[]} flags        Device flags ('ECDH_RAW' follows 'ECDH' on a key of that mode): 'ATT' (made inside the HEM), 'PKEY'
  *                                   (private half stored), 'ECDH', 'ExDSA', 'CERT', 'PQC', 'HPKE'
  * @property {Uint8Array|null} description
  * @property {number|null} created   Unix seconds
@@ -1255,22 +1255,30 @@ function checkKid(op, kid) {
  * - CURVE25519 / CURVE448 agree keys; 'HPKE' makes them HPKE-only instead.
  * - ML-KEM: 'HPKE' makes an HPKE-only key.
  * - Everything else (ED448, ML-DSA, HMAC, OTP, AES) takes no mode.
+ * - 'ECDH_RAW' (DEV-520) is 'ECDH' plus leave for ecdh() to return the raw
+ *   secret of this key on a device without the `raw_ecdh_enabled` policy:
+ *   every type that agrees keys takes it, with ',ExDSA' where the plain mode
+ *   does. What is derived from such a key, or encrypted with it as the main
+ *   key, is only as secret as that raw secret (API reference, crypto/ecdh).
  *
- * Import takes no 'HPKE': a public key needs no flag to be sealed to.
+ * Import takes no 'HPKE' (a public key needs no flag to be sealed to) and no
+ * 'ECDH_RAW' (the raw secret needs the private key); the device answers 400.
  */
-const NIST_MODES = ['ECDH', 'ExDSA', 'ECDH,ExDSA'];
+const NIST_MODES = ['ECDH', 'ExDSA', 'ECDH,ExDSA', 'ECDH_RAW', 'ECDH_RAW,ExDSA'];
 const KEY_MODES = {
   SECP256R1: [...NIST_MODES, 'HPKE'], SECP384R1: [...NIST_MODES, 'HPKE'], SECP521R1: [...NIST_MODES, 'HPKE'],
   SECP256K1: NIST_MODES,
-  ED25519: ['ExDSA', 'ECDH', 'ECDH,ExDSA'],
-  CURVE25519: ['ECDH', 'HPKE'], CURVE448: ['ECDH', 'HPKE'],
+  ED25519: ['ExDSA', 'ECDH', 'ECDH,ExDSA', 'ECDH_RAW', 'ECDH_RAW,ExDSA'],
+  CURVE25519: ['ECDH', 'ECDH_RAW', 'HPKE'], CURVE448: ['ECDH', 'ECDH_RAW', 'HPKE'],
   MLKEM512: ['HPKE'], MLKEM768: ['HPKE'], MLKEM1024: ['HPKE'],
 };
+/** What an import refuses (400): a flag that only a private key can have. */
+const NO_IMPORT_MODES = ['HPKE', 'ECDH_RAW', 'ECDH_RAW,ExDSA'];
 
 /** Throw `bad_mode` before the request when a mode does not fit the key type. */
 function checkMode(type, mode, { importing = false } = {}) {
   if (!mode) return;
-  const allowed = (KEY_MODES[type] ?? []).filter(m => !(importing && m === 'HPKE'));
+  const allowed = (KEY_MODES[type] ?? []).filter(m => !(importing && NO_IMPORT_MODES.includes(m)));
   if (allowed.includes(mode)) return;
   throw new HemError(
     allowed.length
@@ -2253,8 +2261,10 @@ export class HEM {
    * @param {object} [opts]
    * @param {Uint8Array|string} [opts.descr]  Description, up to 128 bytes
    * @param {string} [opts.mode]  What the key may do, see KEY_MODES: 'ECDH',
-   *   'ExDSA', 'ECDH,ExDSA' or 'HPKE'. Only the types that can do more than one
-   *   thing take one; a mode that does not fit the type throws `bad_mode`.
+   *   'ExDSA', 'ECDH,ExDSA', 'HPKE', or 'ECDH_RAW' / 'ECDH_RAW,ExDSA' (as
+   *   'ECDH', and ecdh() may return this key's raw secret without the device
+   *   policy). Only the types that can do more than one thing take one; a mode
+   *   that does not fit the type throws `bad_mode`.
    * @param {boolean} [opts.returnPubkey=false]  Return the public key with the answer
    * @returns {Promise<KeyEntry>}  The key as stored; `pubkey` only when asked for
    */
@@ -2429,7 +2439,9 @@ export class HEM {
    * @param {number} [opts.offset=0]  Matches to skip
    * @param {number} [opts.limit=15]
    * @param {string} [opts.type]  Only keys of this type, e.g. 'ED25519'
-   * @param {string} [opts.mode]  Only keys with these flags: 'ECDH', 'ExDSA', 'ECDH,ExDSA', 'HPKE'
+   * @param {string} [opts.mode]  Only keys with these flags: 'ECDH', 'ExDSA', 'ECDH,ExDSA', 'HPKE',
+   *   'ECDH_RAW', 'ECDH_RAW,ExDSA'. Every flag named must be set: 'ECDH' lists the ECDH_RAW keys too,
+   *   'ECDH_RAW' only them
    * @param {boolean} [opts.returnPubkey=false]  Add public keys (`pubkey_in_search` policy)
    * @returns {Promise<{list: KeyEntry[], total: number, listed: number, deleted: number, invalid: number, offset: number}>}
    */
@@ -2591,7 +2603,8 @@ export class HEM {
    *
    * Without `alg` the raw secret comes back, as long as the curve (X25519 /
    * P-256 / secp256k1 32 B, P-384 48, P-521 66, X448 56) - and only on a
-   * device personalised with the `raw_ecdh_enabled` policy (else 403). `alg`
+   * device personalised with the `raw_ecdh_enabled` policy or for a key of
+   * mode 'ECDH_RAW' (else 403). `alg`
    * 'SHA2-256' ... 'SHA3-512' returns its digest; 'HKDF-SHA2-256/384/512'
    * runs HKDF over it with `hkdfSalt`, `hkdfCtx` (info) and `hkdfLen`; the
    * three are not sent with any other `alg`.

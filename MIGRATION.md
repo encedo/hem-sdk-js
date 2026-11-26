@@ -1,5 +1,22 @@
 # Upgrading the SDK
 
+## Key mode ECDH_RAW (2026-11-26, firmware DEV-520)
+
+Nothing breaks: the SDK refused a mode the firmware has had since DEV-520.
+
+- `createKeyPair` and `deriveKey` take `mode: 'ECDH_RAW'` on every type that
+  agrees keys (SECP*, `ED25519`, `CURVE25519`, `CURVE448`) and
+  `'ECDH_RAW,ExDSA'` where `'ECDH,ExDSA'` is taken (SECP*, `ED25519`). It is
+  `'ECDH'` plus leave for `ecdh()` without `alg` to return the raw secret of
+  that key on a device without the `raw_ecdh_enabled` policy. Before, both
+  threw `bad_mode` and the key could only be made with a request written by hand.
+- `importPublicKey` refuses both with `bad_mode` (the device answers 400: the
+  raw secret needs the private key).
+- `searchKeys` / `searchKeysAll` `mode` is passed through as before; the device
+  matches every flag named, so `'ECDH'` lists the ECDH_RAW keys too and
+  `'ECDH_RAW'` only them. A key's `flags` carry `'ECDH_RAW'` after `'ECDH'`.
+- What to do: nothing.
+
 ## The SDK picks the token (2026-11-25, DEV-535)
 
 Nothing breaks: a token passed is used as before.

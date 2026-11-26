@@ -301,9 +301,11 @@ Node 22 / 24 project, `import`, `require()` and `tsc --strict` (nodenext).
   types that can do more than one thing take one (`KEY_MODES` in the source,
   from the API's key-type table): the NIST curves ECDH / ExDSA / both and
   (P-256/384/521) HPKE, ED25519 ECDH on top of signing, X25519 / X448 and
-  ML-KEM HPKE. The SDK sends one only when a caller passes it, and
+  ML-KEM HPKE; `ECDH_RAW` (firmware DEV-520, in the SDK since 2026-11-26) on
+  every type that agrees keys, with `,ExDSA` where the plain mode takes it.
+  The SDK sends one only when a caller passes it, and
   `checkMode()` throws `bad_mode` for a mode that does not fit the type before
-  the device answers a bare 400. Import takes no HPKE.
+  the device answers a bare 400. Import takes no HPKE and no ECDH_RAW.
 - `searchKeys` sends the pattern base64-encoded with the anchor on the base64
   text: `^` prefix, `$` suffix, none for anywhere. The paging of list and
   search runs on `listed`, not on the length of `list` (see `listKeys`).
